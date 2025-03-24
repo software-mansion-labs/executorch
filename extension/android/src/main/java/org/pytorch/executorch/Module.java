@@ -104,6 +104,30 @@ public class Module {
     return mNativePeer.readLogBuffer();
   }
 
+  public int getNumberOfInputs() {
+    return mNativePeer.getNumberOfInputs();
+  }
+
+  public int getInputType(int index) {
+    return mNativePeer.getInputType(index);
+  }
+
+  public long[] getInputShape(int index){
+    return mNativePeer.getInputShape(index);
+  }
+
+  public int getNumberOfOutputs() {
+    return mNativePeer.getNumberOfOutputs();
+  }
+
+  public int getOutputType(int index) {
+    return mNativePeer.getOutputType(index);
+  }
+
+  public long[] getOutputShape(int index) {
+    return mNativePeer.getOutputShape(index);
+  }
+
   /**
    * Explicitly destroys the native torch::jit::Module. Calling this method is not required, as the
    * native object will be destroyed when this object is garbage-collected. However, the timing of

@@ -24,6 +24,7 @@
 #include <executorch/extension/llm/runner/text_token_generator.h>
 #include <executorch/extension/llm/tokenizer/tokenizer.h>
 #include <executorch/extension/module/module.h>
+#include <tokenizers_cpp.h>
 
 namespace example {
 

@@ -20,6 +20,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/platform/platform.h>
 #include <executorch/runtime/platform/runtime.h>
+#include <tokenizers_cpp.h>
 
 #if defined(ET_USE_THREADPOOL)
 #include <executorch/extension/threadpool/cpuinfo_utils.h>
@@ -118,6 +119,7 @@ class ExecuTorchLlamaJni
   int model_type_category_;
   std::unique_ptr<llm::IRunner> runner_;
   std::unique_ptr<llm::MultimodalRunner> multi_modal_runner_;
+  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
 
  public:
   constexpr static auto kJavaDescriptor =

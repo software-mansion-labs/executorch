@@ -131,7 +131,6 @@ EXIR_REQUIREMENTS = [
 # TODO: Make each example publish its own requirements.txt
 EXAMPLES_REQUIREMENTS = [
     "timm==1.0.7",
-    "torchaudio==2.6.0" if USE_PYTORCH_NIGHTLY else "torchaudio",
     "torchsr==1.0.4",
     "transformers==4.47.1",
 ]

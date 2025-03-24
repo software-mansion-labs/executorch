@@ -8,6 +8,7 @@
 
 #include <cassert>
 #include <chrono>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -25,6 +26,7 @@
 #include <executorch/runtime/platform/log.h>
 #include <executorch/runtime/platform/platform.h>
 #include <executorch/runtime/platform/runtime.h>
+#include <tokenizers_cpp.h>
 
 #ifdef ET_USE_THREADPOOL
 #include <cpuinfo.h>
@@ -279,6 +281,114 @@ class ExecuTorchJni : public facebook::jni::HybridClass<ExecuTorchJni> {
     return static_cast<jint>(module_->load_method(methodName->toStdString()));
   }
 
+  jint get_number_of_inputs() {
+    const auto method_meta = module_->method_meta("forward");
+
+    if (method_meta.ok()) {
+      return static_cast<jint>(method_meta->num_inputs());
+    }
+  }
+
+  jint get_input_type(jint index) {
+    const auto method_meta = module_->method_meta("forward");
+
+    if (method_meta.ok()) {
+      const auto input_meta = method_meta->input_tensor_meta(index);
+      if (input_meta.ok()) {
+        switch (input_meta->scalar_type()) {
+          case ScalarType::Byte:
+            return static_cast<jint>(0);
+          case ScalarType::Int:
+            return static_cast<jint>(1);
+          case ScalarType::Long:
+            return static_cast<jint>(2);
+          case ScalarType::Float:
+            return static_cast<jint>(3);
+          case ScalarType::Double:
+            return static_cast<jint>(4);
+          default:
+            return static_cast<jint>(-1);
+        }
+      }
+    }
+
+    return static_cast<jint>(-1);
+  }
+
+  facebook::jni::local_ref<facebook::jni::JArrayLong> get_input_shape(
+      jint index) {
+    auto method_meta = module_->method_meta("forward");
+    if (!method_meta.ok()) {
+      return nullptr;
+    }
+
+    const auto input_meta = method_meta->input_tensor_meta(index);
+    if (!input_meta.ok()) {
+      return nullptr;
+    }
+
+    const auto shape = input_meta->sizes();
+    std::vector<jlong> jlong_shape(shape.begin(), shape.end());
+
+    auto shapeArray = facebook::jni::make_long_array(jlong_shape.size());
+    shapeArray->setRegion(0, jlong_shape.size(), jlong_shape.data());
+    return shapeArray;
+  }
+
+  jint get_number_of_outputs() {
+    const auto method_meta = module_->method_meta("forward");
+
+    if (method_meta.ok()) {
+      return static_cast<jint>(method_meta->num_outputs());
+    }
+  }
+
+  jint get_output_type(jint index) {
+    const auto method_meta = module_->method_meta("forward");
+
+    if (method_meta.ok()) {
+      const auto output_meta = method_meta->output_tensor_meta(index);
+      if (output_meta.ok()) {
+        switch (output_meta->scalar_type()) {
+          case ScalarType::Byte:
+            return static_cast<jint>(0);
+          case ScalarType::Int:
+            return static_cast<jint>(1);
+          case ScalarType::Long:
+            return static_cast<jint>(2);
+          case ScalarType::Float:
+            return static_cast<jint>(3);
+          case ScalarType::Double:
+            return static_cast<jint>(4);
+          default:
+            return static_cast<jint>(-1);
+        }
+      }
+    }
+
+    return static_cast<jint>(-1);
+  }
+
+  facebook::jni::local_ref<facebook::jni::JArrayLong> get_output_shape(
+      jint index) {
+    auto method_meta = module_->method_meta("forward");
+    if (!method_meta.ok()) {
+      return nullptr;
+    }
+
+    const auto output_meta = method_meta->output_tensor_meta(index);
+    if (!output_meta.ok()) {
+      return nullptr;
+    }
+
+    const auto shape = output_meta->sizes();
+    std::vector<jlong> jlong_shape(shape.begin(), shape.end());
+
+    auto shapeArray = facebook::jni::make_long_array(jlong_shape.size());
+    shapeArray->setRegion(0, jlong_shape.size(), jlong_shape.data());
+    return shapeArray;
+  }
+
   facebook::jni::local_ref<facebook::jni::JArrayClass<JEValue>> execute_method(
       std::string method,
       facebook::jni::alias_ref<
@@ -402,6 +512,106 @@ class ExecuTorchJni : public facebook::jni::HybridClass<ExecuTorchJni> {
         makeNativeMethod("execute", ExecuTorchJni::execute),
         makeNativeMethod("loadMethod", ExecuTorchJni::load_method),
         makeNativeMethod("readLogBuffer", ExecuTorchJni::readLogBuffer),
+        makeNativeMethod(
+            "getNumberOfInputs", ExecuTorchJni::get_number_of_inputs),
+        makeNativeMethod("getInputType", ExecuTorchJni::get_input_type),
+        makeNativeMethod("getInputShape", ExecuTorchJni::get_input_shape),
+        makeNativeMethod(
+            "getNumberOfOutputs", ExecuTorchJni::get_number_of_inputs),
+        makeNativeMethod("getOutputType", ExecuTorchJni::get_output_type),
+        makeNativeMethod("getOutputShape", ExecuTorchJni::get_output_shape),
+    });
+  }
+};
+
+std::string LoadBytesFromFile(const std::string& path) {
+  std::ifstream fs(path, std::ios::in | std::ios::binary);
+  if (fs.fail()) {
+    exit(1);
+  }
+  std::string data;
+  fs.seekg(0, std::ios::end);
+  size_t size = static_cast<size_t>(fs.tellg());
+  fs.seekg(0, std::ios::beg);
+  data.resize(size);
+  fs.read(data.data(), size);
+  return data;
+}
+
+class ExecuTorchHuggingFaceTokenizerJni
+    : public facebook::jni::HybridClass<ExecuTorchHuggingFaceTokenizerJni> {
+ private:
+  friend HybridBase;
+  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
+
+ public:
+  constexpr static auto kJavaDescriptor =
+      "Lorg/pytorch/executorch/HuggingFaceTokenizer;";
+
+  static facebook::jni::local_ref<jhybriddata> initHybrid(
+      facebook::jni::alias_ref<jclass>,
+      facebook::jni::alias_ref<jstring> jsonPath) {
+    return makeCxxInstance(jsonPath);
+  }
+
+  ExecuTorchHuggingFaceTokenizerJni(
+      facebook::jni::alias_ref<jstring> jsonPath) {
+    auto blob = LoadBytesFromFile(jsonPath->toStdString());
+    tokenizer_ = tokenizers::Tokenizer::FromBlobJSON(blob);
+  }
+
+  facebook::jni::local_ref<jlongArray> encode(
+      facebook::jni::alias_ref<jstring> text) {
+    std::vector<int32_t> encoded = tokenizer_->Encode(text->toStdString());
+    facebook::jni::local_ref<jlongArray> result =
+        facebook::jni::make_long_array(static_cast<jsize>(encoded.size()));
+    std::vector<jlong> encoded_long(encoded.begin(), encoded.end());
+    result->setRegion(0, encoded_long.size(), encoded_long.data());
+
+    return result;
+  }
+
+  facebook::jni::local_ref<jstring> decode(
+      facebook::jni::alias_ref<jlongArray> tokenIds) {
+    std::vector<jlong> token_ids_jlong(tokenIds->size());
+    std::vector<int32_t> token_ids(tokenIds->size());
+    tokenIds->getRegion(0, tokenIds->size(), token_ids_jlong.data());
+    for (int i = 0; i < tokenIds->size(); i++) {
+      token_ids[i] = token_ids_jlong[i];
+    }
+
+    std::string decoded = tokenizer_->Decode(token_ids);
+
+    return facebook::jni::make_jstring(decoded);
+  }
+
+  jint getVocabSize() {
+    return tokenizer_->GetVocabSize();
+  }
+
+  facebook::jni::alias_ref<jstring> idToToken(jint id) {
+    return facebook::jni::make_jstring(tokenizer_->IdToToken(id));
+  }
+
+  jint tokenToId(facebook::jni::alias_ref<jstring> token) {
+    return tokenizer_->TokenToId(token->toStdString());
+  }
+
+  static void registerNatives() {
+    registerHybrid({
+        makeNativeMethod(
+            "initHybrid", ExecuTorchHuggingFaceTokenizerJni::initHybrid),
+        makeNativeMethod(
+            "encodeNative", ExecuTorchHuggingFaceTokenizerJni::encode),
+        makeNativeMethod(
+            "decodeNative", ExecuTorchHuggingFaceTokenizerJni::decode),
+        makeNativeMethod(
+            "getVocabSizeNative",
+            ExecuTorchHuggingFaceTokenizerJni::getVocabSize),
+        makeNativeMethod(
+            "idToTokenNative", ExecuTorchHuggingFaceTokenizerJni::idToToken),
+        makeNativeMethod(
+            "tokenToIdNative", ExecuTorchHuggingFaceTokenizerJni::tokenToId),
     });
   }
 };
@@ -417,5 +627,6 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
   return facebook::jni::initialize(vm, [] {
     executorch::extension::ExecuTorchJni::registerNatives();
     register_natives_for_llama();
+    executorch::extension::ExecuTorchHuggingFaceTokenizerJni::registerNatives();
   });
 }

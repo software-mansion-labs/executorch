@@ -69,6 +69,8 @@ add_subdirectory(
   ${EXECUTORCH_ROOT}/extension/llm/third-party/abseil-cpp
   ${CMAKE_CURRENT_BINARY_DIR}/abseil-cpp
 )
+add_subdirectory(${EXECUTORCH_ROOT}/../tokenizers-cpp tokenizers EXCLUDE_FROM_ALL)
+
 add_subdirectory(
   ${EXECUTORCH_ROOT}/extension/llm/third-party/re2
   ${CMAKE_CURRENT_BINARY_DIR}/re2
@@ -76,7 +78,7 @@ add_subdirectory(
 set(CMAKE_POSITION_INDEPENDENT_CODE ${_pic_flag})
 
 set(llama_runner_deps executorch extension_data_loader extension_module
-                      extension_tensor re2::re2
+                      extension_tensor re2::re2 tokenizers_cpp
 )
 
 target_link_libraries(llama_runner PUBLIC ${llama_runner_deps})
@@ -84,4 +86,6 @@ target_link_libraries(llama_runner PUBLIC ${llama_runner_deps})
 target_include_directories(
   llama_runner INTERFACE ${_common_include_directories} ${EXECUTORCH_ROOT}
 )
+target_include_directories(llama_runner PRIVATE ${EXECUTORCH_ROOT}/../tokenizers-cpp/include/tokenizers-cpp)
+
 target_compile_options(llama_runner PUBLIC ${_preprocessor_flag})
