@@ -524,7 +524,7 @@ class ExecuTorchJni : public facebook::jni::HybridClass<ExecuTorchJni> {
   }
 };
 
-std::string LoadBytesFromFile(const std::string& path) {
+std::string loadBytesFromFile(const std::string& path) {
   std::ifstream fs(path, std::ios::in | std::ios::binary);
   if (fs.fail()) {
     exit(1);
@@ -556,28 +556,28 @@ class ExecuTorchHuggingFaceTokenizerJni
 
   ExecuTorchHuggingFaceTokenizerJni(
       facebook::jni::alias_ref<jstring> jsonPath) {
-    auto blob = LoadBytesFromFile(jsonPath->toStdString());
+    auto blob = loadBytesFromFile(jsonPath->toStdString());
     tokenizer_ = tokenizers::Tokenizer::FromBlobJSON(blob);
   }
 
-  facebook::jni::local_ref<jlongArray> encode(
+  facebook::jni::local_ref<jintArray> encode(
       facebook::jni::alias_ref<jstring> text) {
     std::vector<int32_t> encoded = tokenizer_->Encode(text->toStdString());
-    facebook::jni::local_ref<jlongArray> result =
-        facebook::jni::make_long_array(static_cast<jsize>(encoded.size()));
-    std::vector<jlong> encoded_long(encoded.begin(), encoded.end());
+    facebook::jni::local_ref<jintArray> result =
+        facebook::jni::make_int_array(static_cast<jsize>(encoded.size()));
+    std::vector<jint> encoded_long(encoded.begin(), encoded.end());
     result->setRegion(0, encoded_long.size(), encoded_long.data());
 
     return result;
   }
 
   facebook::jni::local_ref<jstring> decode(
-      facebook::jni::alias_ref<jlongArray> tokenIds) {
-    std::vector<jlong> token_ids_jlong(tokenIds->size());
+      facebook::jni::alias_ref<jintArray> tokenIds) {
+    std::vector<jint> token_ids_jint(tokenIds->size());
     std::vector<int32_t> token_ids(tokenIds->size());
-    tokenIds->getRegion(0, tokenIds->size(), token_ids_jlong.data());
+    tokenIds->getRegion(0, tokenIds->size(), token_ids_jint.data());
     for (int i = 0; i < tokenIds->size(); i++) {
-      token_ids[i] = token_ids_jlong[i];
+      token_ids[i] = token_ids_jint[i];
     }
 
     std::string decoded = tokenizer_->Decode(token_ids);

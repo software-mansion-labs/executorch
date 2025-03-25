@@ -36,11 +36,11 @@ public class HuggingFaceTokenizer {
     mHybridData.resetNative();
   }
 
-  public long[] encode(String text) {
+  public int[] encode(String text) {
     return encodeNative(text);
   };
 
-  public String decode(long[] tokenIds) {
+  public String decode(int[] tokenIds) {
     return decodeNative(tokenIds);
   };
 
@@ -57,10 +57,10 @@ public class HuggingFaceTokenizer {
   };
 
   @DoNotStrip
-  private native long[] encodeNative(String text);
+  private native int[] encodeNative(String text);
 
   @DoNotStrip
-  private native String decodeNative(long[] tokenIds);
+  private native String decodeNative(int[] tokenIds);
   
   @DoNotStrip 
   private native int getVocabSizeNative();
