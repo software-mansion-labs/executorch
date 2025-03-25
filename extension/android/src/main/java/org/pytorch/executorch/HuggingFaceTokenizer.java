@@ -30,7 +30,7 @@ public class HuggingFaceTokenizer {
 
   public HuggingFaceTokenizer(String jsonPath) {
         mHybridData = initHybrid(jsonPath);
-}
+  }
 
   public void resetNative() {
     mHybridData.resetNative();

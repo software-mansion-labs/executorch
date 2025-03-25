@@ -297,15 +297,15 @@ class ExecuTorchJni : public facebook::jni::HybridClass<ExecuTorchJni> {
       if (input_meta.ok()) {
         switch (input_meta->scalar_type()) {
           case ScalarType::Byte:
-            return static_cast<jint>(0);
-          case ScalarType::Int:
             return static_cast<jint>(1);
-          case ScalarType::Long:
-            return static_cast<jint>(2);
-          case ScalarType::Float:
+          case ScalarType::Int:
             return static_cast<jint>(3);
-          case ScalarType::Double:
+          case ScalarType::Long:
             return static_cast<jint>(4);
+          case ScalarType::Float:
+            return static_cast<jint>(6);
+          case ScalarType::Double:
+            return static_cast<jint>(7);
           default:
             return static_cast<jint>(-1);
         }
@@ -351,15 +351,15 @@ class ExecuTorchJni : public facebook::jni::HybridClass<ExecuTorchJni> {
       if (output_meta.ok()) {
         switch (output_meta->scalar_type()) {
           case ScalarType::Byte:
-            return static_cast<jint>(0);
-          case ScalarType::Int:
             return static_cast<jint>(1);
-          case ScalarType::Long:
-            return static_cast<jint>(2);
-          case ScalarType::Float:
+          case ScalarType::Int:
             return static_cast<jint>(3);
-          case ScalarType::Double:
+          case ScalarType::Long:
             return static_cast<jint>(4);
+          case ScalarType::Float:
+            return static_cast<jint>(6);
+          case ScalarType::Double:
+            return static_cast<jint>(7);
           default:
             return static_cast<jint>(-1);
         }
