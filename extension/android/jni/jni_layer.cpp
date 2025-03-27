@@ -572,7 +572,8 @@ class ExecuTorchHuggingFaceTokenizerJni
   }
 
   facebook::jni::local_ref<jstring> decode(
-      facebook::jni::alias_ref<jintArray> tokenIds) {
+      facebook::jni::alias_ref<jintArray> tokenIds,
+      jboolean skipSpecialTokens) {
     std::vector<jint> token_ids_jint(tokenIds->size());
     std::vector<int32_t> token_ids(tokenIds->size());
     tokenIds->getRegion(0, tokenIds->size(), token_ids_jint.data());
@@ -580,7 +581,7 @@ class ExecuTorchHuggingFaceTokenizerJni
       token_ids[i] = token_ids_jint[i];
     }
 
-    std::string decoded = tokenizer_->Decode(token_ids);
+    std::string decoded = tokenizer_->Decode(token_ids, skipSpecialTokens);
 
     return facebook::jni::make_jstring(decoded);
   }

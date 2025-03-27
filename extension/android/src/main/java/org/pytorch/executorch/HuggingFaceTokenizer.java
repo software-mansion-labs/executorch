@@ -41,7 +41,11 @@ public class HuggingFaceTokenizer {
   };
 
   public String decode(int[] tokenIds) {
-    return decodeNative(tokenIds);
+    return decode(tokenIds, false);
+  };
+
+  public String decode(int[] tokenIds, boolean skipSpecialTokens) {
+    return decodeNative(tokenIds, skipSpecialTokens);
   };
 
   public int getVocabSize() {
@@ -60,7 +64,7 @@ public class HuggingFaceTokenizer {
   private native int[] encodeNative(String text);
 
   @DoNotStrip
-  private native String decodeNative(int[] tokenIds);
+  private native String decodeNative(int[] tokenIds, boolean skipSpecialTokens);
   
   @DoNotStrip 
   private native int getVocabSizeNative();
