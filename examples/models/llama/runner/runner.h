@@ -22,7 +22,6 @@
 #include <executorch/extension/llm/runner/text_decoder_runner.h>
 #include <executorch/extension/llm/runner/text_prefiller.h>
 #include <executorch/extension/llm/runner/text_token_generator.h>
-#include <executorch/extension/llm/tokenizer/tokenizer.h>
 #include <executorch/extension/module/module.h>
 #include <tokenizers_cpp.h>
 
@@ -57,7 +56,7 @@ class ET_EXPERIMENTAL Runner : public executorch::extension::llm::IRunner {
   // model
   std::unique_ptr<::executorch::extension::Module> module_;
   std::string tokenizer_path_;
-  std::unique_ptr<::executorch::extension::llm::Tokenizer> tokenizer_;
+  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
   std::unordered_map<std::string, int64_t> metadata_;
   std::unique_ptr<::executorch::extension::llm::TextDecoderRunner>
       text_decoder_runner_;

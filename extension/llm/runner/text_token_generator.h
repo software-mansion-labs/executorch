@@ -11,8 +11,9 @@
 
 #include <executorch/extension/llm/runner/stats.h>
 #include <executorch/extension/llm/runner/text_decoder_runner.h>
-#include <executorch/extension/llm/tokenizer/tokenizer.h>
 #include <executorch/extension/tensor/tensor.h>
+#include <tokenizers_cpp.h>
+#include <iostream>
 
 namespace executorch {
 namespace extension {
@@ -21,7 +22,7 @@ namespace llm {
 class ET_EXPERIMENTAL TextTokenGenerator {
  public:
   TextTokenGenerator(
-      Tokenizer* tokenizer,
+      tokenizers::Tokenizer* tokenizer,
       TextDecoderRunner* text_decoder_runner,
       bool use_kv_cache,
       std::unique_ptr<std::unordered_set<uint64_t>>&& eos_ids,
@@ -106,7 +107,17 @@ class ET_EXPERIMENTAL TextTokenGenerator {
       }
 
       // print the token as string, decode it with the Tokenizer object
-      token_callback(ET_UNWRAP(tokenizer_->decode(prev_token, cur_token)));
+
+      std::string prev_decoded = tokenizer_->Decode(
+          std::vector<int32_t>{static_cast<int32_t>(prev_token)});
+      std::string merged_decoded = tokenizer_->Decode(
+          std::vector<int32_t>{
+              static_cast<int32_t>(prev_token),
+              static_cast<int32_t>(cur_token)});
+
+      std::string new_part = merged_decoded.substr(prev_decoded.size());
+
+      token_callback(new_part);
 
       if (should_stop_) {
         break;
@@ -130,7 +141,7 @@ class ET_EXPERIMENTAL TextTokenGenerator {
   }
 
  private:
-  Tokenizer* tokenizer_;
+  tokenizers::Tokenizer* tokenizer_;
   TextDecoderRunner* text_decoder_runner_;
   std::unique_ptr<std::unordered_set<uint64_t>> eos_ids_;
   bool use_kv_cache_;

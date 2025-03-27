@@ -44,7 +44,7 @@ target_include_directories(
 add_library(extension_llm_runner STATIC ${_extension_llm_runner__srcs})
 
 set(runner_deps executorch extension_data_loader extension_module
-                extension_tensor
+                extension_tensor tokenizers_cpp
 )
 
 target_link_libraries(extension_llm_runner PUBLIC ${runner_deps})
