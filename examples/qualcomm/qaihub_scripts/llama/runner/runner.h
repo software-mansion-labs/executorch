@@ -101,7 +101,7 @@ class Runner {
   std::vector<std::string> method_names_;
   std::string tokenizer_path_;
   float temperature_;
-  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
+  std::unique_ptr<tokenizers::Tokenizer2> tokenizer_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
   Stats stats_;
   std::unique_ptr<Memory> io_mem_;

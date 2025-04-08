@@ -22,10 +22,6 @@ import org.pytorch.executorch.annotations.Experimental;
  */
 @Experimental
 public class LlmModule {
-
-  public static final int MODEL_TYPE_TEXT = 1;
-  public static final int MODEL_TYPE_TEXT_VISION = 2;
-
   static {
     if (!NativeLoader.isInitialized()) {
       NativeLoader.init(new SystemDelegate());
@@ -34,16 +30,15 @@ public class LlmModule {
   }
 
   private final HybridData mHybridData;
-  private static final int DEFAULT_SEQ_LEN = 128;
-  private static final boolean DEFAULT_ECHO = true;
+  private static final int DEFAULT_SEQ_LEN = 2048;
+  private static final boolean DEFAULT_ECHO = false;
 
   @DoNotStrip
-  private static native HybridData initHybrid(
-      int modelType, String modulePath, String tokenizerPath, float temperature, String dataPath);
+  private static native HybridData initHybrid(String modulePath, String tokenizerPath, float temperature, String dataPath);
 
   /** Constructs a LLM Module for a model with given model path, tokenizer, temperature. */
   public LlmModule(String modulePath, String tokenizerPath, float temperature) {
-    mHybridData = initHybrid(MODEL_TYPE_TEXT, modulePath, tokenizerPath, temperature, null);
+    mHybridData = initHybrid(modulePath, tokenizerPath, temperature, null);
   }
 
   /**
@@ -51,12 +46,7 @@ public class LlmModule {
    * path.
    */
   public LlmModule(String modulePath, String tokenizerPath, float temperature, String dataPath) {
-    mHybridData = initHybrid(MODEL_TYPE_TEXT, modulePath, tokenizerPath, temperature, dataPath);
-  }
-
-  /** Constructs a LLM Module for a model with given path, tokenizer, and temperature. */
-  public LlmModule(int modelType, String modulePath, String tokenizerPath, float temperature) {
-    mHybridData = initHybrid(modelType, modulePath, tokenizerPath, temperature, null);
+    mHybridData = initHybrid(modulePath, tokenizerPath, temperature, dataPath);
   }
 
   public void resetNative() {
@@ -129,64 +119,6 @@ public class LlmModule {
       int seqLen,
       LlmCallback llmCallback,
       boolean echo);
-
-  /**
-   * Prefill an LLaVA Module with the given images input.
-   *
-   * @param image Input image as a byte array
-   * @param width Input image width
-   * @param height Input image height
-   * @param channels Input image number of channels
-   * @param startPos The starting position in KV cache of the input in the LLM.
-   * @return The updated starting position in KV cache of the input in the LLM.
-   * @throws RuntimeException if the prefill failed
-   */
-  public long prefillImages(int[] image, int width, int height, int channels, long startPos) {
-    long[] nativeResult = prefillImagesNative(image, width, height, channels, startPos);
-    if (nativeResult[0] != 0) {
-      throw new RuntimeException("Prefill failed with error code: " + nativeResult[0]);
-    }
-    return nativeResult[1];
-  }
-
-  // returns a tuple of (status, updated startPos)
-  private native long[] prefillImagesNative(
-      int[] image, int width, int height, int channels, long startPos);
-
-  /**
-   * Prefill an LLaVA Module with the given text input.
-   *
-   * @param prompt The text prompt to LLaVA.
-   * @param startPos The starting position in KV cache of the input in the LLM. It's passed as
-   *     reference and will be updated inside this function.
-   * @param bos The number of BOS (begin of sequence) token.
-   * @param eos The number of EOS (end of sequence) token.
-   * @return The updated starting position in KV cache of the input in the LLM.
-   * @throws RuntimeException if the prefill failed
-   */
-  public long prefillPrompt(String prompt, long startPos, int bos, int eos) {
-    long[] nativeResult = prefillPromptNative(prompt, startPos, bos, eos);
-    if (nativeResult[0] != 0) {
-      throw new RuntimeException("Prefill failed with error code: " + nativeResult[0]);
-    }
-    return nativeResult[1];
-  }
-
-  // returns a tuple of (status, updated startPos)
-  private native long[] prefillPromptNative(String prompt, long startPos, int bos, int eos);
-
-  /**
-   * Generate tokens from the given prompt, starting from the given position.
-   *
-   * @param prompt The text prompt to LLaVA.
-   * @param seqLen The total sequence length, including the prompt tokens and new tokens.
-   * @param startPos The starting position in KV cache of the input in the LLM.
-   * @param callback callback object to receive results.
-   * @param echo indicate whether to echo the input prompt or not.
-   * @return The error code.
-   */
-  public native int generateFromPos(
-      String prompt, int seqLen, long startPos, LlmCallback callback, boolean echo);
 
   /** Stop current generate() before it finishes. */
   @DoNotStrip

@@ -129,7 +129,7 @@ class ET_EXPERIMENTAL MultimodalRunner {
   std::unique_ptr<ImagePrefiller> image_prefiller_;
   std::unique_ptr<TextTokenGenerator> text_token_generator_;
   std::string tokenizer_path_;
-  std::unique_ptr<::tokenizers::Tokenizer> tokenizer_;
+  std::unique_ptr<::tokenizers::Tokenizer2> tokenizer_;
 
   // stats
   Stats stats_;

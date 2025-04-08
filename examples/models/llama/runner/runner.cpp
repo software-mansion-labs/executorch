@@ -10,13 +10,10 @@
 // The module takes in a string as input and emits a string as output.
 
 #include <executorch/examples/models/llama/runner/runner.h>
-
-#include <ctime>
-
 #include <executorch/extension/llm/runner/util.h>
-
-#include <executorch/examples/models/llama/tokenizer/llama_tiktoken.h>
-#include <pytorch/tokenizers/llama2c_tokenizer.h>
+#include <ctime>
+#include <fstream>
+#include <iostream>
 
 namespace example {
 
@@ -25,6 +22,20 @@ using ::executorch::runtime::Error;
 using ::executorch::runtime::Result;
 
 namespace llm = ::executorch::extension::llm;
+
+std::string loadBytesFromFile(const std::string& path) {
+  std::ifstream fs(path, std::ios::in | std::ios::binary);
+  if (fs.fail()) {
+    throw std::runtime_error("Failed to open tokenizer file");
+  }
+  std::string data;
+  fs.seekg(0, std::ios::end);
+  size_t size = static_cast<size_t>(fs.tellg());
+  fs.seekg(0, std::ios::beg);
+  data.resize(size);
+  fs.read(data.data(), size);
+  return data;
+}
 
 namespace {
 static constexpr auto kEnableDynamicShape = "enable_dynamic_shape";
@@ -77,32 +88,15 @@ Error Runner::load() {
     return Error::Ok;
   }
   ET_CHECK_OK_OR_RETURN_ERROR(module_->load_method("forward"));
-  // load tokenizer. Assuming tiktoken is the default tokenizer
-  tokenizer_ = nullptr;
-  tokenizer_ = get_tiktoken_for_llama();
-  ::tokenizers::Error err = tokenizer_->load(tokenizer_path_);
-  // Rely on tiktoken to throw error if the artifact is incompatible. Then we
-  // fallback to BPE tokenizer.
-  if (err != ::tokenizers::Error::Ok) {
-    ET_LOG(
-        Info,
-        "Failed to load %s as a Tiktoken artifact, trying BPE tokenizer",
-        tokenizer_path_.c_str());
-    tokenizer_.reset();
-    tokenizer_ = std::make_unique<::tokenizers::Llama2cTokenizer>();
-    err = tokenizer_->load(tokenizer_path_);
-    ET_CHECK_TK_OK_OR_RETURN_ERROR(
-        err,
-        "Failed to load %s as a llama2.c tokenizer artifact",
-        tokenizer_path_.c_str());
-  }
+  // load tokenizer.
+
+  auto blob = loadBytesFromFile(tokenizer_path_);
+  tokenizer_ = tokenizers::Tokenizer::FromBlobJSON(blob);
 
   ET_LOG(Info, "Reading metadata from model");
 
-  metadata_[kBosId] = tokenizer_->bos_tok();
-  auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>(
-      std::unordered_set<uint64_t>{tokenizer_->eos_tok()});
-  metadata_[kVocabSize] = tokenizer_->vocab_size();
+  auto eos_ids = std::make_unique<std::unordered_set<uint64_t>>();
+  metadata_[kVocabSize] = tokenizer_->GetVocabSize();
 
   const auto method_names =
       ET_UNWRAP(module_->method_names(), "Failed reading method names");
@@ -110,7 +104,6 @@ Error Runner::load() {
   for (auto& pair : metadata_) {
     const auto& method_name = pair.first;
     auto& value = pair.second;
-
     if (method_names.count(method_name)) {
       value = ET_UNWRAP(module_->get(method_name))
                   .toScalar()
@@ -207,16 +200,11 @@ Error Runner::generate(
       ? seq_len
       : metadata_.at(kMaxContextLen);
 
-  ::tokenizers::Result<std::vector<uint64_t>> encode_res = tokenizer_->encode(
-      prompt,
-      /* bos */ 0,
-      /* eos */ 0);
-
-  ET_CHECK_TK_OK_OR_RETURN_ERROR(
-      encode_res.error(), "Failed to encode prompt %s", prompt.c_str());
+  std::vector<int32_t> prompt_tokens = tokenizer_->Encode(prompt);
+  std::vector<uint64_t> prompt_tokens_uint64(
+      prompt_tokens.begin(), prompt_tokens.end());
 
   // encode the (string) prompt into tokens sequence
-  std::vector<uint64_t> prompt_tokens = encode_res.get();
   int num_prompt_tokens = prompt_tokens.size();
 
   ET_CHECK_MSG(num_prompt_tokens >= 1, "Expected at least 1 prompt token");
@@ -241,24 +229,24 @@ Error Runner::generate(
     wrapped_callback(prompt);
   }
   int64_t pos = 0;
-  auto prefill_res = text_prefiller_->prefill(prompt_tokens, pos);
+  auto prefill_res = text_prefiller_->prefill(prompt_tokens_uint64, pos);
   stats_.first_token_ms = llm::time_in_ms();
   stats_.prompt_eval_end_ms = llm::time_in_ms();
   ET_CHECK_OK_OR_RETURN_ERROR(prefill_res.error());
   uint64_t cur_token = prefill_res.get();
 
   // print the first token from prefill. No prev_token so use cur_token for it.
-  wrapped_callback(
-      ET_UNWRAP_TOKENIZER(tokenizer_->decode(cur_token, cur_token)));
+  wrapped_callback(tokenizer_->Decode(
+      std::vector<int32_t>{static_cast<int32_t>(cur_token)}));
   RUNNER_ET_LOG(
       warmup,
       "RSS after prompt prefill: %f MiB (0 if unsupported)",
       llm::get_rss_bytes() / 1024.0 / 1024.0);
 
   // start the main loop
-  prompt_tokens.push_back(cur_token);
+  prompt_tokens_uint64.push_back(cur_token);
   int64_t num_generated_tokens = ET_UNWRAP(text_token_generator_->generate(
-      prompt_tokens, num_prompt_tokens, seq_len, wrapped_callback));
+      prompt_tokens_uint64, num_prompt_tokens, seq_len, wrapped_callback));
 
   stats_.inference_end_ms = llm::time_in_ms();
   if (!warmup) {

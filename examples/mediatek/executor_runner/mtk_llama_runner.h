@@ -30,7 +30,7 @@ using example::LlamaModelPaths;
 using example::LlamaRuntime;
 using executorch::runtime::Error;
 using executorch::runtime::Result;
-using tokenizers::Tokenizer;
+using tokenizers::Tokenizer2;
 
 class MTKLlamaRunner : public executorch::extension::llm::IRunner {
  public:

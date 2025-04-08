@@ -107,7 +107,7 @@ class Runner {
   float logits_scale_;
   int32_t logits_offset_;
   float temperature_;
-  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
+  std::unique_ptr<tokenizers::Tokenizer2> tokenizer_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
   Stats stats_;
   std::unique_ptr<IoMgrBase> io_mgr_;

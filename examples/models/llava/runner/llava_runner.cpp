@@ -62,13 +62,13 @@ Error LlavaRunner::load() {
   image_prefiller_->load();
 
   // Load the text token generator
-  text_token_generator_ = std::make_unique<llm::TextTokenGenerator>(
-      tokenizer_.get(),
-      text_decoder_runner_.get(),
-      /*use_kv_cache=*/true,
-      std::make_unique<std::unordered_set<uint64_t>>(
-          std::unordered_set<uint64_t>{tokenizer_->eos_tok()}),
-      &stats_);
+  // text_token_generator_ = std::make_unique<llm::TextTokenGenerator>(
+  //     tokenizer_.get(),
+  //     text_decoder_runner_.get(),
+  //     /*use_kv_cache=*/true,
+  //     std::make_unique<std::unordered_set<uint64_t>>(
+  //         std::unordered_set<uint64_t>{tokenizer_->eos_tok()}),
+  //     &stats_);
 
   stats_.model_load_end_ms = llm::time_in_ms();
   return Error::Ok;
@@ -115,11 +115,11 @@ Error LlavaRunner::generate_from_pos(
   stats_.num_prompt_tokens = start_pos;
 
   // Generate tokens
-  int64_t num_generated_tokens = ET_UNWRAP(text_token_generator_->generate(
-      {prefill_next_token}, start_pos, seq_len, token_callback));
+  // int64_t num_generated_tokens = ET_UNWRAP(text_token_generator_->generate(
+  //     {prefill_next_token}, start_pos, seq_len, token_callback));
 
   // Bookkeeping
-  stats_.num_generated_tokens = num_generated_tokens;
+  // stats_.num_generated_tokens = num_generated_tokens;
   if (stats_callback) {
     stats_callback(stats_);
   }

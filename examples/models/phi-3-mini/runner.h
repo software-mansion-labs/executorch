@@ -43,7 +43,7 @@ class Runner {
   uint64_t run_model_step(uint64_t token);
 
   std::unique_ptr<executorch::extension::Module> module_;
-  std::unique_ptr<tokenizers::Tokenizer> tokenizer_;
+  std::unique_ptr<tokenizers::Tokenizer2> tokenizer_;
   std::unique_ptr<executorch::extension::llm::Sampler> sampler_;
 };
 

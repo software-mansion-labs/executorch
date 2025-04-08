@@ -113,4 +113,28 @@ public class Module {
   public void destroy() {
     mNativePeer.resetNative();
   }
+
+  public int getNumberOfInputs() {
+     return mNativePeer.getNumberOfInputs();
+  }
+ 
+   public int getInputType(int index) {
+     return mNativePeer.getInputType(index);
+  }
+ 
+   public long[] getInputShape(int index){
+     return mNativePeer.getInputShape(index);
+  }
+ 
+   public int getNumberOfOutputs() {
+     return mNativePeer.getNumberOfOutputs();
+  }
+ 
+   public int getOutputType(int index) {
+     return mNativePeer.getOutputType(index);
+  }
+ 
+   public long[] getOutputShape(int index) {
+     return mNativePeer.getOutputShape(index);
+  }
 }
