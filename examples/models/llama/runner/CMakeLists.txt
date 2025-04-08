@@ -70,7 +70,7 @@ add_subdirectory(
   ${CMAKE_CURRENT_BINARY_DIR}/abseil-cpp
 )
 
-add_subdirectory(/Users/norbertklockiewicz/Desktop/work/swm_ai/react-native-executorch/third-party/tokenizers-cpp tokenizers EXCLUDE_FROM_ALL)
+add_subdirectory(${EXECUTORCH_ROOT}/../tokenizers-cpp tokenizers EXCLUDE_FROM_ALL)
 
 add_subdirectory(
   ${EXECUTORCH_ROOT}/extension/llm/tokenizers/third-party/re2
@@ -88,7 +88,7 @@ target_include_directories(
   llama_runner
   INTERFACE ${_common_include_directories}
 )
-target_include_directories(llama_runner PRIVATE /Users/norbertklockiewicz/Desktop/work/swm_ai/react-native-executorch/third-party/tokenizers-cpp/include/tokenizers-cpp)
+target_include_directories(llama_runner PRIVATE ${EXECUTORCH_ROOT}/../tokenizers-cpp/include/tokenizers-cpp)
 target_include_directories(
   llama_runner
   PUBLIC ${EXECUTORCH_ROOT}/extension/llm/tokenizers/include

@@ -3,7 +3,6 @@
   <h1 align="center">ExecuTorch: A powerful on-device AI Framework</h1>
 </div>
 
-
 <div align="center">
   <a href="https://github.com/pytorch/executorch/graphs/contributors"><img src="https://img.shields.io/github/contributors/pytorch/executorch?style=for-the-badge&color=blue" alt="Contributors"></a>
   <a href="https://github.com/pytorch/executorch/stargazers"><img src="https://img.shields.io/github/stars/pytorch/executorch?style=for-the-badge&color=blue" alt="Stargazers"></a>
@@ -12,12 +11,40 @@
   <hr>
 </div>
 
+## IMPORTANT - Building android aar
+
+To build android lib there are some changes required to one of the third party libraries. You have to modify those files:
+
+- extension/llm/tokenizers/include/pytorch/tokenizers/bpe_tokenizer_base.h
+- extension/llm/tokenizers/include/pytorch/tokenizers/llama2c_tokenizer.h
+- extension/llm/tokenizers/include/pytorch/tokenizers/sentencepiece.h
+- extension/llm/tokenizers/include/pytorch/tokenizers/tokenizer.h
+- extension/llm/tokenizers/src/llama2c_tokenizer.cpp
+
+In those file you need to change every occurance of Tokenizer class name to Tokenizer2
+
+For example from this:
+
+```
+class BPETokenizerBase : public Tokenizer {}
+```
+
+To this:
+
+```
+class BPETokenizerBase : public Tokenizer2 {}
+```
+
+##
+
 **ExecuTorch** is an end-to-end solution for on-device inference and training. It powers much of Meta's on-device AI experiences across Facebook, Instagram, Meta Quest, Ray-Ban Meta Smart Glasses, WhatsApp, and more.
 
 It supports a wide range of models including LLMs (Large Language Models), CV (Computer Vision), ASR (Automatic Speech Recognition), and TTS (Text to Speech).
 
 Platform Support:
+
 - Operating Systems:
+
   - iOS
   - Mac
   - Android
@@ -46,6 +73,7 @@ Key value propositions of ExecuTorch are:
   capabilities such as CPUs, NPUs, and DSPs.
 
 ## Getting Started
+
 To get started you can:
 
 - Visit the [Step by Step Tutorial](https://pytorch.org/executorch/main/index.html) on getting things running locally and deploy a model to a device
@@ -60,7 +88,6 @@ us improve our technology. Check out the [Discussion Board](https://github.com/p
 ## Contributing
 
 We welcome contributions. To get started review the [guidelines](CONTRIBUTING.md) and chat with us on [Discord](https://discord.gg/Dh43CKSAdc)
-
 
 ## Directory Structure
 
@@ -122,4 +149,5 @@ executorch
 ```
 
 ## License
+
 ExecuTorch is BSD licensed, as found in the LICENSE file.
