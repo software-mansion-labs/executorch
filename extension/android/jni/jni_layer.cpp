@@ -591,7 +591,8 @@ class ExecuTorchHuggingFaceTokenizerJni
   }
 
   facebook::jni::alias_ref<jstring> idToToken(jint id) {
-    return facebook::jni::make_jstring(tokenizer_->IdToToken(id));
+    int32_t id_int32 = static_cast<int32_t>(id);
+    return facebook::jni::make_jstring(tokenizer_->IdToToken(id_int32));
   }
 
   jint tokenToId(facebook::jni::alias_ref<jstring> token) {
