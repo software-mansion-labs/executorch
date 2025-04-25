@@ -216,7 +216,7 @@ Error Runner::generate(
   } else if (num_prompt_tokens >= seq_len) {
     ET_LOG(Error,
            "num_prompt_tokens %d >= seq_len %d, Sequence length exceeded - "
-           "please increate the seq_len value papsed to generate()!",
+           "please increase the seq_len value passed to generate()!",
            num_prompt_tokens, seq_len);
     return Error::InvalidArgument;
   }
