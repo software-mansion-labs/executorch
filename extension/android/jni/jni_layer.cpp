@@ -628,6 +628,7 @@ void register_natives_for_llm() {}
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* vm, void*) {
   return facebook::jni::initialize(vm, [] {
     executorch::extension::ExecuTorchJni::registerNatives();
+    executorch::extension::ExecuTorchHuggingFaceTokenizerJni::registerNatives();
     register_natives_for_llm();
   });
 }
