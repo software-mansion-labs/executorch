@@ -208,6 +208,9 @@ size_t XNNWeightsCache::look_up_or_insert(
 
   if (offset != SIZE_MAX) {
     void* saved_ptr = context->offset_to_addr(context, offset);
+    if (ptr == nullptr) {
+      ptr = saved_ptr;
+    }
     if (0 == memcmp(ptr, saved_ptr, size)) {
       return offset;
     }
