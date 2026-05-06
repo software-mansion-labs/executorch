@@ -132,8 +132,29 @@ if(TARGET xnnpack_backend)
 endif()
 
 if(TARGET vulkan_backend)
-  executorch_target_link_options_shared_lib(vulkan_backend)
-  list(APPEND link_libraries vulkan_backend)
+  if(EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED)
+    # Build vulkan_backend as a standalone shared library that React Native
+    # Executorch can ship as an opt-in artifact (libvulkan_executorch_backend.so).
+    # The .so links only vulkan_backend (with --whole-archive so its
+    # register_backend static initializer fires) plus executorch_core/vulkan_schema.
+    # Kernel registration libs (optimized_native_cpu_ops_lib, custom_ops, etc.)
+    # stay in libexecutorch_jni.so to avoid duplicate Kernel registration when
+    # both .so are loaded together (Error::RegistrationAlreadyRegistered, 0x16).
+    add_library(vulkan_executorch_backend SHARED
+      ${EXECUTORCH_ROOT}/extension/android/jni/jni_noop.cpp
+    )
+    executorch_target_link_options_shared_lib(vulkan_backend)
+    target_link_options_gc_sections(vulkan_executorch_backend)
+    target_link_libraries(vulkan_executorch_backend
+      PRIVATE vulkan_backend vulkan_schema executorch_core log
+    )
+    set_target_properties(
+      vulkan_executorch_backend PROPERTIES LINK_FLAGS "-Wl,-rpath='$ORIGIN'"
+    )
+  else()
+    executorch_target_link_options_shared_lib(vulkan_backend)
+    list(APPEND link_libraries vulkan_backend)
+  endif()
 endif()
 
 if(EXECUTORCH_BUILD_KERNELS_LLM)
