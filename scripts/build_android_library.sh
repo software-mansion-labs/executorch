@@ -69,7 +69,13 @@ build_android_native_library() {
   # Copy artifacts to ABI specific directory
   local SO_STAGE_DIR="cmake-out-android-so/${ANDROID_ABI}"
   mkdir -p ${SO_STAGE_DIR}
-  cp "${CMAKE_OUT}"/extension/android/*.so "${SO_STAGE_DIR}/libexecutorch.so"
+  cp "${CMAKE_OUT}"/extension/android/libexecutorch_jni.so "${SO_STAGE_DIR}/libexecutorch.so"
+
+  # Copy standalone Vulkan backend shared library if built. Used by React
+  # Native Executorch as an opt-in artifact when the app enables Vulkan.
+  if [ -f "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so ]; then
+    cp "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so "${SO_STAGE_DIR}/"
+  fi
 
   # Copy QNN related so library
   if [ -n "$QNN_SDK_ROOT" ] && [ "$ANDROID_ABI" == "arm64-v8a" ]; then
