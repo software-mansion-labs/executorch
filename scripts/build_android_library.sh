@@ -77,6 +77,11 @@ build_android_native_library() {
     cp "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so "${SO_STAGE_DIR}/"
   fi
 
+  # Same for XNNPACK as a standalone shared library.
+  if [ -f "${CMAKE_OUT}"/extension/android/libxnnpack_executorch_backend.so ]; then
+    cp "${CMAKE_OUT}"/extension/android/libxnnpack_executorch_backend.so "${SO_STAGE_DIR}/"
+  fi
+
   # Copy QNN related so library
   if [ -n "$QNN_SDK_ROOT" ] && [ "$ANDROID_ABI" == "arm64-v8a" ]; then
     cp "${CMAKE_OUT}"/lib/executorch/backends/qualcomm/libqnn_executorch_backend.so ${SO_STAGE_DIR}
