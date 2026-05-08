@@ -163,13 +163,16 @@ create_xcframework() {
         done
     fi
 
-    echo -e "\nDeleting intermediate libraries:"
-    for merged_lib in "${merged_libs[@]}"; do
-        if [[ -f "${merged_lib}" ]]; then
-            echo "Deleting ${merged_lib}"
-            rm "${merged_lib}"
-        fi
-    done
+    # Keep merged .a files around — react-native-executorch's
+    # third-party/ios/ExecutorchLib/build.sh repackages them into its own
+    # xcframeworks, so we need them after this script finishes.
+    # echo -e "\nDeleting intermediate libraries:"
+    # for merged_lib in "${merged_libs[@]}"; do
+    #     if [[ -f "${merged_lib}" ]]; then
+    #         echo "Deleting ${merged_lib}"
+    #         rm "${merged_lib}"
+    #     fi
+    # done
 }
 
 # Create an XCFramework for each target library.
