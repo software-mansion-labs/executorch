@@ -48,7 +48,8 @@
         "DEPLOYMENT_TARGET": "12.0",
         "CMAKE_MACOSX_BUNDLE": "OFF",
         "XNNPACK_ENABLE_ARM_SME": "OFF",
-        "XNNPACK_ENABLE_ARM_SME2": "OFF"
+        "XNNPACK_ENABLE_ARM_SME2": "OFF",
+        "FLATCC_ALLOW_WERROR": "OFF"
       },
       "condition": {
         "lhs": "${hostSystemName}",
@@ -68,7 +69,8 @@
         "DEPLOYMENT_TARGET": "17.0",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0",
         "XNNPACK_ENABLE_ARM_SME": "OFF",
-        "XNNPACK_ENABLE_ARM_SME2": "OFF"
+        "XNNPACK_ENABLE_ARM_SME2": "OFF",
+        "FLATCC_ALLOW_WERROR": "OFF"
       },
       "condition": {
         "lhs": "${hostSystemName}",
@@ -88,7 +90,8 @@
         "DEPLOYMENT_TARGET": "17.0",
         "CMAKE_OSX_DEPLOYMENT_TARGET": "12.0",
         "XNNPACK_ENABLE_ARM_SME": "OFF",
-        "XNNPACK_ENABLE_ARM_SME2": "OFF"
+        "XNNPACK_ENABLE_ARM_SME2": "OFF",
+        "FLATCC_ALLOW_WERROR": "OFF"
       },
       "condition": {
         "lhs": "${hostSystemName}",
