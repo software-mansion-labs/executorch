@@ -92,6 +92,7 @@ ExternalProject_Add(
              -DFLATCC_REFLECTION=OFF
              -DFLATCC_DEBUG_CLANG_SANITIZE=OFF
              -DFLATCC_INSTALL=ON
+             -DFLATCC_ALLOW_WERROR=OFF
              -DCMAKE_POLICY_VERSION_MINIMUM=3.5
              -DCMAKE_INSTALL_PREFIX:PATH=<INSTALL_DIR>
              -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -117,6 +118,7 @@ set(FLATCC_TEST OFF CACHE BOOL "")
 set(FLATCC_REFLECTION OFF CACHE BOOL "")
 set(FLATCC_DEBUG_CLANG_SANITIZE OFF CACHE BOOL "")
 set(FLATCC_INSTALL OFF CACHE BOOL "")
+set(FLATCC_ALLOW_WERROR OFF CACHE BOOL "")
 add_subdirectory(flatcc)
 # Unfortunately flatcc writes libs directly in to the source tree [1]. So to
 # ensure the target lib is created last, force flatcc_cli to build first.
