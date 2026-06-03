@@ -163,13 +163,31 @@ inline void exec_expand_dims(
     const ExpandDimsNode& n,
     ExecutionState& st,
     StreamOrDevice s) {
-  st.set_tensor(n.out, expand_dims(st.const_tensor_ref(n.x), n.axis, s));
+  const auto& x = st.const_tensor_ref(n.x);
+  // A 0-dim (scalar) input with axis > 0 can occur when an upstream MLX op
+  // fully reduced a tensor the exporter treated as rank>=1. expand_dims rejects
+  // a non-zero axis on a scalar, so promote the scalar to rank-1 first; the
+  // resulting axis is then valid and matches the traced (>=1-dim) shape.
+  if (x.ndim() == 0 && n.axis != 0) {
+    st.set_tensor(n.out, expand_dims(expand_dims(x, 0, s), n.axis, s));
+    return;
+  }
+  st.set_tensor(n.out, expand_dims(x, n.axis, s));
 }
 
 inline void exec_tile(const TileNode& n, ExecutionState& st, StreamOrDevice s) {
   const auto& x = st.const_tensor_ref(n.x);
   auto reps = resolve_ints(n.reps, st);
   st.set_tensor(n.out, tile(x, reps, s));
+}
+
+// Index tensors must be integral; an upstream dtype/layout copy can leave them
+// as float, which MLX gather/take/take_along_axis reject. Cast if needed.
+inline array as_int_indices(const array& idx, StreamOrDevice s) {
+  if (issubdtype(idx.dtype(), integer)) {
+    return idx;
+  }
+  return astype(idx, int32, s);
 }
 
 inline void exec_take_along_axis(
@@ -179,7 +197,10 @@ inline void exec_take_along_axis(
   st.set_tensor(
       n.out,
       take_along_axis(
-          st.const_tensor_ref(n.x), st.const_tensor_ref(n.indices), n.axis, s));
+          st.const_tensor_ref(n.x),
+          as_int_indices(st.const_tensor_ref(n.indices), s),
+          n.axis,
+          s));
 }
 
 inline void exec_take(const TakeNode& n, ExecutionState& st, StreamOrDevice s) {
@@ -199,7 +220,7 @@ inline void exec_take(const TakeNode& n, ExecutionState& st, StreamOrDevice s) {
       break;
     }
     case 2: { // Tid (tensor of indices)
-      const auto& indices = st.const_tensor_ref(n.index.tid);
+      const auto indices = as_int_indices(st.const_tensor_ref(n.index.tid), s);
       st.set_tensor(n.out, take(x, indices, axis, s));
       break;
     }
@@ -786,7 +807,7 @@ exec_gather(const GatherNode& n, ExecutionState& st, StreamOrDevice s) {
   std::vector<array> indices;
   indices.reserve(n.indices.size());
   for (auto tid : n.indices) {
-    indices.push_back(st.const_tensor_ref(tid));
+    indices.push_back(as_int_indices(st.const_tensor_ref(tid), s));
   }
 
   st.set_tensor(n.out, gather(x, indices, n.axes, slice_sizes, s));
@@ -1715,6 +1736,13 @@ exec_cumsum(const CumsumNode& n, ExecutionState& st, StreamOrDevice s) {
 }
 
 inline void
+exec_cummax(const CumMaxNode& n, ExecutionState& st, StreamOrDevice s) {
+  const auto& x = st.const_tensor_ref(n.x);
+  st.set_tensor(
+      n.out, cummax(x, n.axis, /*reverse=*/false, /*inclusive=*/true, s));
+}
+
+inline void
 exec_stack(const StackNode& n, ExecutionState& st, StreamOrDevice s) {
   std::vector<array> tensors;
   for (auto tid : n.tensors) {
@@ -2218,6 +2246,9 @@ class Interpreter {
         break;
       case OpCode::CUMSUM:
         ops::exec_cumsum(std::get<CumsumNode>(instr.node), st, s);
+        break;
+      case OpCode::CUM_MAX:
+        ops::exec_cummax(std::get<CumMaxNode>(instr.node), st, s);
         break;
       case OpCode::STACK:
         ops::exec_stack(std::get<StackNode>(instr.node), st, s);
