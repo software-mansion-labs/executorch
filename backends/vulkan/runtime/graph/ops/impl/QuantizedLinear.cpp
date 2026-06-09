@@ -83,6 +83,39 @@ static CoopmatTileDims coopmat_tile_dims(const std::string& kernel_name) {
   return {kCoopmatTileM, kCoopmatTileN, kCoopmatTileK, kCoopmatInvocations};
 }
 
+// Resize for add_linear_qa_qw_node.  Unlike resize_linear_qw_node, the
+// args layout has packed_int_input at args[1].refs.at(0) (NOT fp_input),
+// and the weight_data is taken from a captured ValueRef.  The output's M
+// dim is determined by fp_input (from resize_args) and the N dim is
+// determined by weight_data.
+void resize_linear_qa_qw_node(
+    ComputeGraph* graph,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& extra_args) {
+  ValueRef output = args.at(0).refs.at(0);
+  ValueRef fp_input = extra_args.at(0);
+  ValueRef weight_data = extra_args.at(1);
+
+  std::vector<int64_t> mat1_sizes = graph->sizes_of(fp_input);
+  std::vector<int64_t> mat2_sizes = graph->sizes_of(weight_data);
+
+  const int64_t out_cols = utils::val_at(-2, mat1_sizes);
+  const int64_t out_rows = utils::val_at(-2, mat2_sizes);
+
+  std::vector<int64_t> new_out_sizes(3);
+  if (mat1_sizes.size() == 2) {
+    new_out_sizes.resize(2);
+    new_out_sizes.at(0) = out_cols;
+    new_out_sizes.at(1) = out_rows;
+  } else {
+    new_out_sizes.at(0) = mat1_sizes.at(0);
+    new_out_sizes.at(1) = out_cols;
+    new_out_sizes.at(2) = out_rows;
+  }
+
+  graph->virtual_resize(output, new_out_sizes);
+}
+
 utils::uvec3 quantized_linear_global_wg_size(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
@@ -227,9 +260,14 @@ vkapi::ShaderInfo pick_linear_qw_shader(
   const ValueRef output = args.at(0).refs.at(0);
   const ValueRef fp_input = args.at(1).refs.at(0);
   const ValueRef packed_int_weight = args.at(1).refs.at(1);
+  // iter145: scale tensor at refs[2] (weight-only-quant binding order:
+  //   {fp_input, packed_weight, packed_weight_scales, packed_bias}).
+  const ValueRef packed_weight_scales = args.at(1).refs.at(2);
 
   const bool weight_is_4bit = resize_args.at(0) != kDummyValueRef;
   const bool is_gemv_case = is_gemv(graph, fp_input);
+  const bool scale_is_fp32 =
+      weight_is_4bit && graph->dtype_of(packed_weight_scales) == vkapi::kFloat;
 
   // Use the coopmat shader for 4-bit, non-gemv, buffer-output, half-dtype
   // dispatches when shape alignment allows; tiled remains the fallback.
@@ -268,6 +306,11 @@ vkapi::ShaderInfo pick_linear_qw_shader(
   } else {
     kernel_name += "_tiled";
   }
+  // iter145: insert _scalefp32 BEFORE the storage-type suffixes so the
+  // generated variant name matches the yaml entries.
+  if (scale_is_fp32) {
+    kernel_name += "_scalefp32";
+  }
   add_storage_type_suffix(kernel_name, graph->storage_type_of(output));
   add_storage_type_suffix(
       kernel_name, graph->storage_type_of(packed_int_weight));
@@ -288,9 +331,16 @@ vkapi::ShaderInfo pick_linear_dqa_qw_shader(
   (void)int_input;
   const ValueRef input_zp = args.at(1).refs.at(4);
   const ValueRef int_weight = args.at(1).refs.at(5);
+  // iter145: scale tensor at refs[7] (dynamic-quant-act binding order:
+  //   {fp_input, packed_int_input, int_input_sums, packed_input_scale,
+  //    packed_input_zp, packed_weight, packed_weight_sums,
+  //    packed_weight_scales, packed_bias}).
+  const ValueRef packed_weight_scales = args.at(1).refs.at(7);
 
   const bool weight_is_4bit = resize_args.at(0) != kDummyValueRef;
   const bool is_gemv_case = is_gemv(graph, fp_input);
+  const bool scale_is_fp32 =
+      weight_is_4bit && graph->dtype_of(packed_weight_scales) == vkapi::kFloat;
 
   // Use the coopmat<int8> shader for 4-bit dq8ca dispatches when the device
   // enumerates VK_COMPONENT_TYPE_SINT8_KHR in its cooperative matrix property
@@ -318,6 +368,11 @@ vkapi::ShaderInfo pick_linear_dqa_qw_shader(
 
   std::string kernel_name = "linear_dq8ca_q4gsw";
   kernel_name += is_gemv_case ? "_coop" : "_tiled";
+  // Insert _scalefp32 before the storage-type suffixes, to match the shader
+  // variant names declared in the yaml.
+  if (scale_is_fp32) {
+    kernel_name += "_scalefp32";
+  }
   add_storage_type_suffix(kernel_name, graph->storage_type_of(out));
   add_storage_type_suffix(kernel_name, graph->storage_type_of(int_weight));
   add_dtype_suffix(kernel_name, graph->dtype_of(out));

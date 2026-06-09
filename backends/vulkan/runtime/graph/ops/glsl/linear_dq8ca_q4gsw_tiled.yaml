@@ -7,6 +7,7 @@
 linear_dq8ca_q4gsw_tiled:
   parameter_names_with_default_values:
     DTYPE: float
+    SCALE_DTYPE: half
     IO_STORAGE: texture3d
     WEIGHT_STORAGE: texture2d
     PACKED_INT8_INPUT_STORAGE: buffer
@@ -31,3 +32,17 @@ linear_dq8ca_q4gsw_tiled:
     - NAME: linear_dq8ca_q4gsw_tiled_buffer_buffer
       IO_STORAGE: buffer
       WEIGHT_STORAGE: buffer
+    # iter145 SCALE_DTYPE=float variants.
+    - NAME: linear_dq8ca_q4gsw_tiled_scalefp32_texture3d_texture2d
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_tiled_scalefp32_texture3d_buffer
+      WEIGHT_STORAGE: buffer
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_tiled_scalefp32_buffer_texture2d
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: texture2d
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_tiled_scalefp32_buffer_buffer
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: buffer
+      SCALE_DTYPE: float

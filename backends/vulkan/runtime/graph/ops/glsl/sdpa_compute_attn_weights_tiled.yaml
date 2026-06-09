@@ -6,12 +6,12 @@
 
 sdpa_compute_attn_weights_tiled:
   parameter_names_with_default_values:
-    IN_DTYPE: float
-    OUT_DTYPE: float
+    DTYPE: float
     IO_STORAGE: texture3d
     K_CACHE_STORAGE: texture3d
-    MODE: llm
-    HAS_BIAS: false
+    HAS_MASK: 0
+    MASK_PER_HEAD: 0
+    HAS_SOFTCAP: 0
     TILE_M4: 1
     TILE_K4: 1
     TILE_N4: 1
@@ -22,39 +22,32 @@ sdpa_compute_attn_weights_tiled:
         - parameter_values: [texture3d, texture3d]
         - parameter_values: [buffer, texture3d]
         - parameter_values: [buffer, buffer]
-    combination1:
-      parameter_names: [IN_DTYPE, OUT_DTYPE]
-      combos:
-        - parameter_values: [float, float]
-          suffix: float
-        - parameter_values: [half, half]
-          suffix: half
+    DTYPE:
+      - VALUE: float
+      - VALUE: half
   shader_variants:
-    - NAME: sdpa_compute_attn_weights_tiled
-    - NAME: fused_sdpa_qk_tiled
-      MODE: fused
-      OUT_DTYPE: float
-      generate_variant_forall:
-        combination:
-          parameter_names: [IO_STORAGE, K_CACHE_STORAGE]
-          combos:
-            - parameter_values: [texture3d, texture3d]
-            - parameter_values: [buffer, texture3d]
-            - parameter_values: [buffer, buffer]
-        IN_DTYPE:
-          - VALUE: float
-          - VALUE: half
-    - NAME: fused_sdpa_qk_tiled_bias
-      MODE: fused
-      OUT_DTYPE: float
-      HAS_BIAS: true
-      generate_variant_forall:
-        combination:
-          parameter_names: [IO_STORAGE, K_CACHE_STORAGE]
-          combos:
-            - parameter_values: [texture3d, texture3d]
-            - parameter_values: [buffer, texture3d]
-            - parameter_values: [buffer, buffer]
-        IN_DTYPE:
-          - VALUE: float
-          - VALUE: half
+    # Existing variants preserved (Llama text decode + vision iter185).
+    - NAME: sdpa_compute_attn_weights_tiled_nomask
+      HAS_MASK: 0
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 0
+    - NAME: sdpa_compute_attn_weights_tiled_mask
+      HAS_MASK: 1
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 0
+    # Audio extension (Phase 2B): softcap on the broadcast-mask path.
+    - NAME: sdpa_compute_attn_weights_tiled_mask_softcap
+      HAS_MASK: 1
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 1
+    # Audio extension: per-head mask (matrix_bd + pad combined).
+    - NAME: sdpa_compute_attn_weights_tiled_mask_phmask
+      HAS_MASK: 1
+      MASK_PER_HEAD: 1
+      HAS_SOFTCAP: 0
+    # Audio extension: per-head mask + softcap (full audio recipe — replaces
+    # the buggy gemma fork's multi-row tiled shader for the audio path).
+    - NAME: sdpa_compute_attn_weights_tiled_mask_phmask_softcap
+      HAS_MASK: 1
+      MASK_PER_HEAD: 1
+      HAS_SOFTCAP: 1

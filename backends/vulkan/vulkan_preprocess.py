@@ -107,6 +107,9 @@ def parse_compile_spec(compile_specs: List[CompileSpec]) -> Dict[str, Any]:
         if spec.key == "skip_tag_memory_metadata":
             options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
 
+        if spec.key == "skip_memory_planning":
+            options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
+
         if spec.key == "downcast_64_bit":
             options[spec.key] = bool.from_bytes(spec.value, byteorder="little")
 

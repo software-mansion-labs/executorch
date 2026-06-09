@@ -505,7 +505,12 @@ def define_explicit_type_extensions(dtypes: Union[str, List[str]]):
     return out_str
 
 
-def define_required_extensions(storage_type: str, dtypes: Union[str, List[str]]):
+def define_required_extensions(storage_type, dtypes=None):
+    # Backward-compat: when called with one arg, treat it as `dtypes` and
+    # assume buffer storage path emits the extensions.
+    if dtypes is None:
+        dtypes = storage_type
+        storage_type = "buffer"
     out_str = "\n"
     dtype_list = dtypes if isinstance(dtypes, list) else [dtypes]
 

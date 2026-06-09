@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-sdpa_compute_attn_weights_coop:
+gemma_sdpa_compute_attn_weights_coop:
   parameter_names_with_default_values:
     DTYPE: float
     IO_STORAGE: texture3d
@@ -25,28 +25,23 @@ sdpa_compute_attn_weights_coop:
       - VALUE: float
       - VALUE: half
   shader_variants:
-    # Existing variants preserved (Llama text decode + vision iter185).
-    - NAME: sdpa_compute_attn_weights_coop_nomask
+    - NAME: gemma_sdpa_compute_attn_weights_coop_nomask
       HAS_MASK: 0
       MASK_PER_HEAD: 0
       HAS_SOFTCAP: 0
-    - NAME: sdpa_compute_attn_weights_coop_mask
+    - NAME: gemma_sdpa_compute_attn_weights_coop_mask
       HAS_MASK: 1
       MASK_PER_HEAD: 0
       HAS_SOFTCAP: 0
-    # Audio extension (Phase 2B): softcap on the broadcast-mask path.
-    - NAME: sdpa_compute_attn_weights_coop_mask_softcap
+    - NAME: gemma_sdpa_compute_attn_weights_coop_mask_softcap
       HAS_MASK: 1
       MASK_PER_HEAD: 0
       HAS_SOFTCAP: 1
-    # Audio extension: per-head mask (matrix_bd + pad combined).
-    - NAME: sdpa_compute_attn_weights_coop_mask_phmask
+    - NAME: gemma_sdpa_compute_attn_weights_coop_mask_phmask
       HAS_MASK: 1
       MASK_PER_HEAD: 1
       HAS_SOFTCAP: 0
-    # Audio extension: per-head mask + softcap (full audio recipe — replaces
-    # the buggy gemma fork's coop shader for the audio path).
-    - NAME: sdpa_compute_attn_weights_coop_mask_phmask_softcap
+    - NAME: gemma_sdpa_compute_attn_weights_coop_mask_phmask_softcap
       HAS_MASK: 1
       MASK_PER_HEAD: 1
       HAS_SOFTCAP: 1

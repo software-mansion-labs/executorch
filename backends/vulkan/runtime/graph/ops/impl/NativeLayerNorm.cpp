@@ -95,12 +95,33 @@ void add_native_layer_norm_node(
     VK_THROW("native_layer_norm requires weight to be non-None");
   }
 
+  // Some models (e.g. HF Gemma4 audio_encoder) use nn.LayerNorm(bias=False).
+  // The shader unconditionally reads from a bias binding, so synthesize a
+  // zero-bias TensorRef of the same shape & dtype as weight. Math: out =
+  // (x - mean) * rstd * weight + 0 == bias-free LayerNorm.
+  ValueRef synthesized_bias = bias_data;
   if (graph.val_is_none(bias_data)) {
-    VK_THROW("native_layer_norm requires bias to be non-None");
+    const std::vector<int64_t> weight_sizes = graph.sizes_of(weight_data);
+    const vkapi::ScalarType weight_dtype = graph.dtype_of(weight_data);
+    int64_t numel = 1;
+    for (int64_t d : weight_sizes) {
+      numel *= d;
+    }
+    const size_t total_bytes =
+        static_cast<size_t>(numel) * vkapi::element_size(weight_dtype);
+    // Zero-initialized heap buffer; ownership transferred to FreeableBuffer
+    // -> TensorRef -> ComputeGraph::values_.
+    auto* zero_data = new uint8_t[total_bytes]();
+    executorch::runtime::FreeableBuffer zero_buffer(
+        zero_data, total_bytes, [](void* /*ctx*/, void* data, size_t /*size*/) {
+          delete[] static_cast<uint8_t*>(data);
+        });
+    synthesized_bias =
+        graph.add_tensorref(weight_sizes, weight_dtype, std::move(zero_buffer));
   }
 
   ValueRef arg_weight = prepack_standard_like(graph, weight_data, in);
-  ValueRef arg_bias = prepack_standard_like(graph, bias_data, in);
+  ValueRef arg_bias = prepack_standard_like(graph, synthesized_bias, in);
 
   const auto out_val = graph.get_value_list(out);
   const ValueRef out_tensor = out_val->at(0);

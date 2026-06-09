@@ -23,7 +23,7 @@ unary_op:
     - NAME: exp
       OPERATOR: exp(X)
     - NAME: gelu
-      OPERATOR: 0.5 * X * (1 + tanh(sqrt(2 / 3.141593) * (X + 0.044715 * X * X * X)))
+      OPERATOR: 0.5 * X * (1 + tanh(clamp(sqrt(2 / 3.141593) * (X + 0.044715 * X * X * X), -10.0, 10.0)))
     - NAME: neg
       OPERATOR: -X
     - NAME: sigmoid
@@ -35,7 +35,7 @@ unary_op:
     - NAME: rsqrt
       OPERATOR: (1 / sqrt(X))
     - NAME: tanh
-      OPERATOR: tanh(clamp(X, -15.0, 15.0))
+      OPERATOR: tanh(clamp(X, -10.0, 10.0))
     - NAME: hardshrink
       OPERATOR: hardshrink(X, A, B)
     - NAME: hardswish

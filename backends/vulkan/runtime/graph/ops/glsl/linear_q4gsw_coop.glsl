@@ -10,10 +10,14 @@
 
 ${define_required_extensions(IO_STORAGE, DTYPE)}
 ${define_required_extensions("buffer", DTYPE)}
+${define_required_extensions("buffer", SCALE_DTYPE)}
 
 #define PRECISION ${PRECISION}
 #define VEC4_T ${texel_load_type(DTYPE, IO_STORAGE)}
 #define T ${texel_load_component_type(DTYPE, IO_STORAGE)}
+
+$if SCALE_DTYPE == "float":
+  #define SCALE_DTYPE_FP32 1
 
 $if IO_STORAGE == "buffer":
   #define OUTPUT_BUFFER
@@ -43,13 +47,13 @@ $if DYNAMIC_QUANT_VARIANT:
   ${layout_declare_tensor(B, "r", "t_input_zp", "int8" if ZP_DTYPE_MODE == "zpint8" else DTYPE, "texture3d")}
   ${layout_declare_tensor(B, "r", "t_packed_int4_weight", "int", WEIGHT_STORAGE, is_scalar_array=False)}
   ${layout_declare_tensor(B, "r", "t_weight_sums", "int", "buffer", is_scalar_array=False)}
-  ${layout_declare_tensor(B, "r", "t_weight_scales", DTYPE, "buffer", is_scalar_array=False)}
+  ${layout_declare_tensor(B, "r", "t_weight_scales", SCALE_DTYPE, "buffer", is_scalar_array=False)}
   ${layout_declare_tensor(B, "r", "t_bias", DTYPE, "buffer", is_scalar_array=False)}
 $else:
   ${layout_declare_tensor(B, "w", "t_output", DTYPE, IO_STORAGE, is_scalar_array=False)}
   ${layout_declare_tensor(B, "r", "t_input", DTYPE, IO_STORAGE, is_scalar_array=False)}
   ${layout_declare_tensor(B, "r", "t_packed_int4_weight", "int", WEIGHT_STORAGE, is_scalar_array=False)}
-  ${layout_declare_tensor(B, "r", "t_weight_scales", DTYPE, "buffer", is_scalar_array=False)}
+  ${layout_declare_tensor(B, "r", "t_weight_scales", SCALE_DTYPE, "buffer", is_scalar_array=False)}
   ${layout_declare_tensor(B, "r", "t_bias", DTYPE, "buffer", is_scalar_array=False)}
 
 ${layout_declare_ubo(B, "ivec4", "output_sizes")}
@@ -63,13 +67,21 @@ ${layout_declare_spec_const(C, "int", "K4_per_group", "0")}
 #include "common.glslh"
 #include "linear_fp_input_tile_load.glslh"
 #include "linear_int4_weight_tile_load.glslh"
+#ifndef SCALE_DTYPE_FP32
 #include "linear_fp_weight_scales_load.glslh"
+#endif
 #include "linear_fp_output_tile_fp_int4_compute.glslh"
 #include "linear_fp_output_tile_fp_compute.glslh"
 #include "linear_fp_output_tile_store.glslh"
 #include "linear_fp_bias_load.glslh"
+// iter137 fp32-linear-acc: fp32 accumulator + fp32 partial-sums shared mem.
+#include "linear_fp32_acc.glslh"
+#ifdef SCALE_DTYPE_FP32
+// iter145 fp32-weight-scale: scales kept at fp32 precision through dequant.
+#include "linear_fp32_scale_acc.glslh"
+#endif
 
-shared FPOutTile partial_sums[WGS];
+shared LinearFPOutTileFP32 partial_sums[WGS];
 
 void main() {
   const int lid = int(gl_LocalInvocationID.z);
@@ -89,13 +101,18 @@ void main() {
     return;
   }
 
-  FPOutTile out_tile;
-  initialize(out_tile);
+  // iter137 fp32-linear-acc: fp32 accumulator across the K-dim matmul.
+  LinearFPOutTileFP32 out_tile;
+  fp32_initialize(out_tile);
 
   FPInputTile in_tile;
   Int4WeightTile int4_weight_tile;
 
+#ifdef SCALE_DTYPE_FP32
+  FPPerOutChannelScalesFP32 weight_scales_tile;
+#else
   FPPerOutChannelParams weight_scales_tile;
+#endif
   FPPerOutChannelParams weight_zeros_tile;
   weight_zeros_tile.data[0] = VEC4_T(0.0);
   weight_zeros_tile.data[1] = VEC4_T(0.0);
@@ -109,19 +126,33 @@ void main() {
     // Only update the scales/zeros if the current iteration is now working on a
     // new quantization group.
     if (group_idx != cur_group_idx) {
+#ifdef SCALE_DTYPE_FP32
+      load_weight_scales_fp32_tile_for_group(
+          weight_scales_tile, n4, group_idx, N4);
+#else
       load_weight_scales_tile_for_group(weight_scales_tile, n4, group_idx, N4);
+#endif
       cur_group_idx = group_idx;
     }
 
     load_input_tile_no_checks(in_tile, k4, 0, K4, 1);
     load_int4_weight_tile(int4_weight_tile, k4, n8, K4);
 
-    fp_accumulate_with_int4_weight(
+#ifdef SCALE_DTYPE_FP32
+    fp32_scale_fp_accumulate_with_int4_weight(
         out_tile,
         in_tile,
         int4_weight_tile,
         weight_scales_tile,
         weight_zeros_tile);
+#else
+    fp32_fp_accumulate_with_int4_weight(
+        out_tile,
+        in_tile,
+        int4_weight_tile,
+        weight_scales_tile,
+        weight_zeros_tile);
+#endif
   }
 
   partial_sums[lid] = out_tile;
@@ -129,10 +160,10 @@ void main() {
   memoryBarrierShared();
   barrier();
 
-  // Tree reduction to compute the overall result.
+  // Tree reduction to compute the overall result (fp32 partial sums).
   for (int i = WGS / 2; i > 0; i /= 2) {
     if (lid < i) {
-      accumulate_out_tile_with_out_tile(
+      fp32_accumulate_out_tile_with_out_tile(
           partial_sums[lid], partial_sums[lid + i]);
     }
     memoryBarrierShared();
@@ -142,11 +173,6 @@ void main() {
   // Only the first thread will write out result
   if (lid == 0) {
     out_tile = partial_sums[0];
-    if (apply_bias > 0) {
-      FPPerOutChannelParams bias_tile;
-      load_bias_tile(bias_tile, n4);
-      add_bias_to_out_tile(out_tile, bias_tile);
-    }
-    write_output_tile_with_checks(out_tile, n4, 0, N4, 1);
+    fp32_write_output_tile_with_checks(out_tile, n4, 0, N4, 1);
   }
 }

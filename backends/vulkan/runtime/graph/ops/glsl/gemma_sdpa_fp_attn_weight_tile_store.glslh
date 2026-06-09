@@ -1,0 +1,157 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/*
+ * Gemma4-flavored attn-weight tile store helpers.
+ *
+ * Fork of sdpa_fp_attn_weight_tile_store.glslh with two changes:
+ *   - drops the inv_scale multiply (Gemma4 uses scale = 1.0 because
+ *     QKV-norm absorbs 1/sqrt(d)).
+ *   - adds an optional additive mask path. When HAS_MASK is defined
+ *     (compiled-in via spec-const-driven preprocessor), an extra
+ *     read-only mask tensor is broadcast-added to the tile in place of
+ *     the causal -inf masking.
+ *
+ * Mask layout assumed:
+ *   shape  (1, 1, S_q, C)        — broadcast over heads
+ *   indexed by (s_idx, c_idx)
+ *   width-packed along C
+ *   dtype matches q.dtype (caller-side cast in the source transform)
+ */
+
+#ifndef GEMMA_SDPA_FP_ATTN_WEIGHT_TILE_STORE_GLSLH
+#define GEMMA_SDPA_FP_ATTN_WEIGHT_TILE_STORE_GLSLH
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "linear_fp_output_tile.glslh"
+
+T negative_infinity_val = T(-1.0 / 0.0);
+
+void store_attn_weight_c4(
+    const VEC4_T out_texel,
+    const int c4,
+    const int s,
+    const int q_h,
+    const int C4,
+    const int S,
+    const int Q_H) {
+#ifdef OUTPUT_BUFFER
+  t_attn_weights[(q_h * S * C4) + (s * C4) + c4] = out_texel;
+#else
+  imageStore(t_attn_weights, ivec3(c4, s, q_h), out_texel);
+#endif
+}
+
+void store_attn_weight_tile_no_checks(
+    const FPOutTile tile,
+    const int c4_start,
+    const int s_start,
+    const int q_h,
+    const int C4,
+    const int S,
+    const int Q_H) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      store_attn_weight_c4(
+          tile.data[s][c4], c4_start + c4, s_start + s, q_h, C4, S, Q_H);
+    }
+  }
+}
+
+void store_attn_weight_tile_with_checks(
+    const FPOutTile tile,
+    const int c4_start,
+    const int s_start,
+    const int q_h,
+    const int C4,
+    const int S,
+    const int Q_H) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      if (c4_start + c4 < C4 && s_start + s < S) {
+        store_attn_weight_c4(
+            tile.data[s][c4], c4_start + c4, s_start + s, q_h, C4, S, Q_H);
+      }
+    }
+  }
+}
+
+void set_out_tile_to_vec(out FPOutTile tile, const VEC4_T vec) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) { tile.data[s][c4] = vec; }
+  }
+}
+
+#ifdef HAS_MASK
+/*
+ * Load one scalar mask element at (s_idx, c_idx). Mask is shape
+ * (1, 1, S_q, C), width-packed along C — same packing as t_attn_weights.
+ *
+ * Mask is bound as t_attn_mask via the same storage type as attn_weights
+ * (texture3d or buffer); see the shader header.
+ */
+T load_mask_scalar(const int s_idx, const int c_idx, const int C4) {
+#ifdef MASK_BUFFER
+  const int c4 = c_idx >> 2;
+  const int c4i = c_idx & 3;
+  return t_attn_mask[(s_idx * C4) + c4][c4i];
+#else
+  const int c4 = c_idx >> 2;
+  const int c4i = c_idx & 3;
+  return VEC4_T(texelFetch(t_attn_mask, ivec3(c4, s_idx, 0), 0))[c4i];
+#endif
+}
+
+void apply_mask_only_with_mask(
+    inout FPOutTile tile,
+    const int input_pos,
+    const int c_idx_start,
+    const int s_idx_start,
+    const int C4) {
+  // Caller mask already encodes causality (sliding-window mask is
+  // built from absolute positions in gemma4.py). Skip the causal
+  // -inf branch and broadcast-add the mask instead. Scale = 1.0
+  // (Gemma uses QKV-norm), so no inv_scale multiply.
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      const int c_base = mul_4(c4);
+      [[unroll]] for (int c4i = 0; c4i < 4; ++c4i) {
+        const int c_idx = c_idx_start + c_base + c4i;
+        const int s_idx = s_idx_start + s;
+        T m = load_mask_scalar(s_idx, c_idx, C4);
+        tile.data[s][c4][c4i] = tile.data[s][c4][c4i] + m;
+      }
+    }
+  }
+}
+#endif // HAS_MASK
+
+void apply_mask_only_causal(
+    inout FPOutTile tile,
+    const int input_pos,
+    const int c_idx_start,
+    const int s_idx_start) {
+  // No mask supplied: apply causal -inf masking only. Scale = 1.0
+  // (Gemma uses QKV-norm), so no inv_scale multiply.
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      const int c_base = mul_4(c4);
+      [[unroll]] for (int c4i = 0; c4i < 4; ++c4i) {
+        const int c = c_base + c4i;
+        const int c_idx = c_idx_start + c;
+        const int s_idx = s_idx_start + s;
+        if (c_idx > s_idx + input_pos) {
+          tile.data[s][c4][c4i] = negative_infinity_val;
+        }
+      }
+    }
+  }
+}
+
+#endif // GEMMA_SDPA_FP_ATTN_WEIGHT_TILE_STORE_GLSLH
