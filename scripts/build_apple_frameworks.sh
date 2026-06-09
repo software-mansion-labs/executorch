@@ -105,6 +105,11 @@ FRAMEWORK_BACKEND_MPS="backend_mps:\
 libmpsdelegate.a,\
 :"
 
+FRAMEWORK_BACKEND_MLX="backend_mlx:\
+libmlxdelegate.a,\
+libmlx.a,\
+:"
+
 FRAMEWORK_BACKEND_XNNPACK="backend_xnnpack:\
 libXNNPACK.a,\
 libkleidiai.a,\
@@ -142,6 +147,7 @@ usage() {
   echo "  --Release            Build Release version."
   echo "  --coreml             Only build the Core ML backend."
   echo "  --llm                Only build the LLM custom kernels."
+  echo "  --mlx                Only build the MLX backend."
   echo "  --mps                Only build the Metal Performance Shaders backend."
   echo "  --optimized          Only build the Optimized kernels."
   echo "  --quantized          Only build the Quantized kernels."
@@ -160,6 +166,7 @@ set_cmake_options_override() {
     CMAKE_OPTIONS_OVERRIDE=(
       "-DEXECUTORCH_BUILD_COREML=OFF"
       "-DEXECUTORCH_BUILD_KERNELS_LLM=OFF"
+      "-DEXECUTORCH_BUILD_MLX=OFF"
       "-DEXECUTORCH_BUILD_MPS=OFF"
       "-DEXECUTORCH_BUILD_KERNELS_OPTIMIZED=OFF"
       "-DEXECUTORCH_BUILD_KERNELS_QUANTIZED=OFF"
@@ -191,6 +198,7 @@ for arg in "$@"; do
         ;;
       --coreml) set_cmake_options_override "EXECUTORCH_BUILD_COREML";;
       --llm) set_cmake_options_override "EXECUTORCH_BUILD_KERNELS_LLM" ;;
+      --mlx) set_cmake_options_override "EXECUTORCH_BUILD_MLX" ;;
       --mps) set_cmake_options_override "EXECUTORCH_BUILD_MPS" ;;
       --optimized) set_cmake_options_override "EXECUTORCH_BUILD_KERNELS_OPTIMIZED" ;;
       --quantized) set_cmake_options_override "EXECUTORCH_BUILD_KERNELS_QUANTIZED" ;;
@@ -231,6 +239,36 @@ for preset_index in "${!PRESETS[@]}"; do
           --config "${mode}"
   done
 done
+
+# Build mlx.metallib for each Apple preset when the MLX backend is enabled.
+# The CMake Xcode generator does not schedule MLX's metallib custom target, so
+# we produce it out-of-band from the MLX kernel sources. The metallib is placed
+# next to the merged libs so downstream packaging can bundle it as a resource.
+mlx_enabled=true
+if [[ ${#CMAKE_OPTIONS_OVERRIDE[@]} -gt 0 ]]; then
+  mlx_enabled=false
+  for cmake_option in "${CMAKE_OPTIONS_OVERRIDE[@]}"; do
+    [[ "$cmake_option" == "-DEXECUTORCH_BUILD_MLX=ON" ]] && mlx_enabled=true
+  done
+fi
+
+if [[ "$mlx_enabled" == true && -f "${SOURCE_ROOT_DIR}/backends/mlx/scripts/build_metallib.sh" ]]; then
+  for preset_index in "${!PRESETS[@]}"; do
+    preset="${PRESETS[$preset_index]}"
+    preset_output_dir="${OUTPUT_DIR}/${PRESETS_RELATIVE_OUT_DIR[$preset_index]}"
+    case "$preset" in
+      ios)           mlx_sdk="iphoneos";        mlx_vmin="-mios-version-min=17.0" ;;
+      ios-simulator) mlx_sdk="iphonesimulator"; mlx_vmin="-mios-simulator-version-min=17.0" ;;
+      macos)         mlx_sdk="macosx";          mlx_vmin="-mmacosx-version-min=14.0" ;;
+      *) continue ;;
+    esac
+    echo "Building mlx.metallib for preset ${preset} (sdk ${mlx_sdk})..."
+    "${SOURCE_ROOT_DIR}/backends/mlx/scripts/build_metallib.sh" \
+      --sdk "${mlx_sdk}" \
+      --version-min "${mlx_vmin}" \
+      --output "${preset_output_dir}/mlx.metallib"
+  done
+fi
 
 echo "Exporting headers"
 
@@ -316,6 +354,7 @@ for mode in "${MODES[@]}"; do
   append_framework_flag "" "$FRAMEWORK_EXECUTORCH_LLM" "$mode"
   append_framework_flag "" "$FRAMEWORK_THREADPOOL" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_COREML" "$FRAMEWORK_BACKEND_COREML" "$mode"
+  append_framework_flag "EXECUTORCH_BUILD_MLX" "$FRAMEWORK_BACKEND_MLX" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_MPS" "$FRAMEWORK_BACKEND_MPS" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_XNNPACK" "$FRAMEWORK_BACKEND_XNNPACK" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_KERNELS_LLM" "$FRAMEWORK_KERNELS_LLM" "$mode"

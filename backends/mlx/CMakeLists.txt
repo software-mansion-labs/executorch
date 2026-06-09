@@ -23,6 +23,13 @@ include(${EXECUTORCH_ROOT}/tools/cmake/Utils.cmake)
 
 set(_common_compile_options -Wall -Werror -Wno-deprecated-declarations)
 
+# The Xcode generator (used for iOS builds) enables -Wshorten-64-to-32 by
+# default, which trips -Werror on 64->32 narrowing inside ExecuTorch core
+# headers (tensor_util.h, dim_order_util.h) included by the delegate. Suppress
+# it so the iOS arm64 build is not blocked by warnings in headers we don't own.
+# No-op on the plain macOS build where the flag isn't enabled.
+list(APPEND _common_compile_options -Wno-shorten-64-to-32)
+
 # Sanitizer flags (asan + ubsan) for security hardening — CI only. Enable via:
 # cmake --preset mlx-release -DEXECUTORCH_MLX_ENABLE_SANITIZERS=ON
 option(EXECUTORCH_MLX_ENABLE_SANITIZERS
@@ -187,7 +194,45 @@ message(
 set(_mlx_patches
     ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_nax_has_include.patch
     ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_qmm_splitk_bk_align.patch
+    # iOS support: MLX gates Metal behind macOS-only checks and compiles its
+    # metallib against the macOS SDK unconditionally. These two make the Metal
+    # build reachable on iOS and let the metallib's SDK / version-min be chosen
+    # by the MLX_METAL_* variables forwarded through CMAKE_ARGS below.
+    ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_ios_enable_metal.patch
+    ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_ios_metallib.patch
 )
+
+# Select the Metal SDK used to compile mlx.metallib. MLX defaults to the macOS
+# SDK; for iOS builds (via ios.toolchain.cmake, which sets PLATFORM) the
+# metallib must be compiled against the iphoneos / iphonesimulator SDK with the
+# matching version-min flag. That version-min must use the iOS deployment
+# target (DEPLOYMENT_TARGET), NOT CMAKE_OSX_DEPLOYMENT_TARGET, which stays at a
+# macOS value (e.g. 12.0) so host tools like flatc still build.
+#
+# MLX builds in its own CMake scope under ExternalProject, so these are
+# forwarded through CMAKE_ARGS rather than set as CACHE variables here.
+set(_mlx_metal_args "")
+if(PLATFORM AND PLATFORM MATCHES "^OS")
+  # iOS device (OS64, OS64COMBINED, ...)
+  set(_mlx_metal_sdk "iphoneos")
+  set(_mlx_metal_version_min_flag "-mios-version-min")
+elseif(PLATFORM AND PLATFORM MATCHES "^SIMULATOR")
+  # iOS simulator (SIMULATORARM64, SIMULATOR64, ...)
+  set(_mlx_metal_sdk "iphonesimulator")
+  set(_mlx_metal_version_min_flag "-mios-simulator-version-min")
+endif()
+if(_mlx_metal_sdk)
+  set(_mlx_metal_args
+      -DMLX_METAL_SDK=${_mlx_metal_sdk}
+      -DMLX_METAL_VERSION_MIN_FLAG=${_mlx_metal_version_min_flag}
+      -DMLX_METAL_DEPLOYMENT_TARGET=${DEPLOYMENT_TARGET}
+  )
+  message(
+    STATUS
+      "MLX: compiling metallib with SDK '${_mlx_metal_sdk}', "
+      "version-min ${_mlx_metal_version_min_flag}=${DEPLOYMENT_TARGET}"
+  )
+endif()
 ExternalProject_Add(
   mlx_external
   SOURCE_DIR ${MLX_SOURCE_DIR}
@@ -213,6 +258,7 @@ ExternalProject_Add(
              -DMLX_BUILD_GGUF=OFF
              -DMLX_BUILD_SAFETENSORS=OFF
              -DMLX_METAL_JIT=ON
+             ${_mlx_metal_args}
   # MLX's own install() does not emit libmlx.a where we consume it or the
   # metallib at all, so skip the install step and read both from the build tree.
   INSTALL_COMMAND ""

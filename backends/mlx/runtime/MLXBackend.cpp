@@ -21,6 +21,7 @@
 
 #include <executorch/backends/mlx/runtime/backend_options.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -225,6 +226,24 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
           spec.ok() && spec.get() > 0) {
         handle->clear_cache_interval_ = spec.get();
       }
+
+      // Bound the MLX Metal buffer cache. By default MLX sizes the cache to the
+      // memory limit (~1.5x the device working set — gigabytes), so freed
+      // buffers from each distinct execute() shape accumulate in-cache instead
+      // of returning to the OS. With dynamic prefill lengths this lets the
+      // cache balloon (measured: ~290MB -> 3.5GB over a few generations, while
+      // active memory stays flat) and eventually OOM the app. Cap it once so
+      // excess is reclaimed on the next allocation; the bound still keeps
+      // enough cache for buffer reuse across same-shape calls (decode).
+      static std::once_flag cache_limit_flag;
+      std::call_once(cache_limit_flag, [] {
+        size_t limit_mb = 256;
+        if (const char* env = std::getenv("ET_MLX_CACHE_LIMIT_MB")) {
+          limit_mb = static_cast<size_t>(std::strtoul(env, nullptr, 10));
+        }
+        ::mlx::core::set_cache_limit(limit_mb * 1024 * 1024);
+        ET_LOG(Info, "MLX Metal cache limit set to %zuMB", limit_mb);
+      });
 
       if (!processed || !processed->data() || processed->size() == 0) {
         throw std::runtime_error("init: null or empty delegate payload");

@@ -1,0 +1,52 @@
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+index 8d3d8a19..31151b30 100644
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -9,6 +9,22 @@ set(BASE_HEADERS
+     logging.h
+     utils.h)
+ 
++# Select the Metal SDK, version-min flag, and deployment target. Defaults to
++# macOS; callers may set MLX_METAL_SDK (e.g. "iphoneos"),
++# MLX_METAL_VERSION_MIN_FLAG (e.g. "-mios-version-min"), and
++# MLX_METAL_DEPLOYMENT_TARGET (e.g. the iOS min) to cross-compile the metallib
++# for other Apple platforms. MLX_METAL_DEPLOYMENT_TARGET defaults to
++# CMAKE_OSX_DEPLOYMENT_TARGET so plain macOS builds are unchanged.
++if(NOT MLX_METAL_SDK)
++  set(MLX_METAL_SDK "macosx")
++endif()
++if(NOT MLX_METAL_VERSION_MIN_FLAG)
++  set(MLX_METAL_VERSION_MIN_FLAG "-mmacosx-version-min")
++endif()
++if(NOT MLX_METAL_DEPLOYMENT_TARGET)
++  set(MLX_METAL_DEPLOYMENT_TARGET "${CMAKE_OSX_DEPLOYMENT_TARGET}")
++endif()
++
+ function(build_kernel_base TARGET SRCFILE DEPS)
+   set(METAL_FLAGS
+       -x
+@@ -24,12 +40,12 @@ function(build_kernel_base TARGET SRCFILE DEPS)
+   if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND MLX_METAL_VERSION GREATER_EQUAL 320)
+     set(METAL_FLAGS ${METAL_FLAGS} -fmetal-enable-logging)
+   endif()
+-  if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
++  if(NOT MLX_METAL_DEPLOYMENT_TARGET STREQUAL "")
+     set(METAL_FLAGS ${METAL_FLAGS}
+-                    "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++                    "${MLX_METAL_VERSION_MIN_FLAG}=${MLX_METAL_DEPLOYMENT_TARGET}")
+   endif()
+   add_custom_command(
+-    COMMAND xcrun -sdk macosx metal ${METAL_FLAGS} -c ${SRCFILE}
++    COMMAND xcrun -sdk ${MLX_METAL_SDK} metal ${METAL_FLAGS} -c ${SRCFILE}
+             -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
+     DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
+     OUTPUT ${TARGET}.air
+@@ -176,7 +192,7 @@ endif()
+ 
+ add_custom_command(
+   OUTPUT ${MLX_METAL_PATH}/mlx.metallib
+-  COMMAND xcrun -sdk macosx metallib ${KERNEL_AIR} -o
++  COMMAND xcrun -sdk ${MLX_METAL_SDK} metallib ${KERNEL_AIR} -o
+           ${MLX_METAL_PATH}/mlx.metallib
+   DEPENDS ${KERNEL_AIR}
+   COMMENT "Building mlx.metallib"
