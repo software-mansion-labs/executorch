@@ -65,6 +65,7 @@ from executorch.backends.mlx.serialization.mlx_graph_schema import (
     ConvTranspose3DNode,
     CoshNode,
     CosNode,
+    CumMaxNode,
     CumsumNode,
     DequantizeNode,
     DivideNode,
@@ -943,6 +944,28 @@ def _clone_handler(P: MLXProgramBuilder, n: Node) -> Slot:
     return out
 
 
+@REGISTRY.register(
+    target=[
+        torch.ops.aten.detach.default,
+        torch.ops.aten.detach_.default,
+        torch.ops.aten.lift_fresh_copy.default,
+    ]
+)
+def _identity_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Identity passthroughs (detach / lift_fresh_copy) — no-op for MLX."""
+    args = P.args(n)
+    require_args(args, 1, 1, "aten.detach/lift_fresh_copy")
+    (x,) = args
+    out = P.make_or_get_slot(n)
+    P.emit(
+        ContiguousNode(
+            x=P.slot_to_tid(x),
+            out=P.slot_to_tid(out),
+        )
+    )
+    return out
+
+
 @REGISTRY.register(target=[torch.ops.aten.copy.default])
 def _copy_handler(P: MLXProgramBuilder, n: Node) -> Slot:
     """Handle aten.copy - copy data from src to self.
@@ -1069,6 +1092,43 @@ def _to_copy_handler(P: MLXProgramBuilder, n: Node) -> Slot:
                 out=P.slot_to_tid(out),
             )
         )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.type_as.default, torch.ops.aten.to.dtype])
+def _type_as_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.type_as(self, other) and aten.to.dtype(self, dtype).
+
+    Both are pure dtype casts. The result dtype is taken from the output
+    node's meta, so we don't need to branch on how the target was specified.
+    """
+    args = P.args(n)
+    x = args[0]
+    out = P.make_or_get_slot(n)
+    out_dtype = n.meta["val"].dtype
+    P.emit(
+        AsTypeNode(
+            x=P.slot_to_tid(x),
+            out=P.slot_to_tid(out),
+            scalar_type=torch_dtype_to_scalar_type(out_dtype),
+        )
+    )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.contiguous.default])
+def _contiguous_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.contiguous - a memory-layout no-op for MLX (always contiguous)."""
+    args = P.args(n)
+    require_args(args, 1, 1, "aten.contiguous")
+    x = args[0]
+    out = P.make_or_get_slot(n)
+    P.emit(
+        ContiguousNode(
+            x=P.slot_to_tid(x),
+            out=P.slot_to_tid(out),
+        )
+    )
     return out
 
 
@@ -2012,7 +2072,8 @@ def _getitem_handler(P: MLXProgramBuilder, n: Node) -> Slot:
 @REGISTRY.register(target=[torch.ops.aten.layer_norm.default])
 def _layer_norm_handler(P: MLXProgramBuilder, n: Node) -> Slot:
     args = P.args(n)
-    require_args(args, 2, 5, "aten.layer_norm")
+    # 6th arg is cudnn_enable (ignored on MLX).
+    require_args(args, 2, 6, "aten.layer_norm")
     require_kwargs(P.kwargs(n), set(), "aten.layer_norm")
     x, shape = args[0:2]
     if len(shape) > 1:
@@ -2585,11 +2646,6 @@ def _convolution_handler(P: MLXProgramBuilder, n: Node) -> Slot:
     transposed = raw_args[6] if len(raw_args) > 6 else False
     groups = raw_args[8] if len(raw_args) > 8 else 1
 
-    if not transposed:
-        raise ValueError(
-            "aten.convolution with transposed=False: use aten.conv{1,2,3}d instead"
-        )
-
     x_meta = x_node.meta.get("val")
     if x_meta is None:
         raise ValueError("aten.convolution: input shape metadata required")
@@ -2598,6 +2654,15 @@ def _convolution_handler(P: MLXProgramBuilder, n: Node) -> Slot:
     stride = _normalize_conv_param(raw_args[3] if len(raw_args) > 3 else 1, ndim, 1)
     padding = _normalize_conv_param(raw_args[4] if len(raw_args) > 4 else 0, ndim, 0)
     dilation = _normalize_conv_param(raw_args[5] if len(raw_args) > 5 else 1, ndim, 1)
+
+    if not transposed:
+        # Regular (non-transposed) convolution. Edge IR may route conv1d/2d/3d
+        # through the generic aten.convolution op; emit it like the conv{N}d
+        # handlers rather than rejecting.
+        return _emit_conv(
+            P, n, x_node, w_node, bias_node, stride, padding, dilation, groups, ndim
+        )
+
     output_padding = _normalize_conv_param(
         raw_args[7] if len(raw_args) > 7 else 0, ndim, 0
     )
@@ -2766,6 +2831,54 @@ def _relu_handler(P: MLXProgramBuilder, n: Node) -> Slot:
         MaximumNode(
             a=P.slot_to_tid(x),
             b=P.slot_to_tid(zero_slot),
+            out=P.slot_to_tid(out),
+        )
+    )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.leaky_relu.default])
+def _leaky_relu_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.leaky_relu(x, negative_slope=0.01).
+
+    leaky_relu(x) = where(x > 0, x, x * slope).
+    """
+    args = P.args(n)
+    require_args(args, 1, 2, "aten.leaky_relu")
+    require_kwargs(P.kwargs(n), set(), "aten.leaky_relu")
+    x = args[0]
+    slope = args[1] if len(args) > 1 else 0.01
+
+    x_meta = n.args[0].meta.get("val")
+    if x_meta is None:
+        raise ValueError("Input tensor metadata not found for leaky_relu")
+    dtype = x_meta.dtype
+
+    zero_slot = emit_lifted_constant(P, 0.0, dtype)
+    slope_slot = emit_lifted_constant(P, float(slope), dtype)
+
+    _, mask = P.make_tmp_slot()
+    P.emit(
+        GreaterNode(
+            a=P.slot_to_tid(x),
+            b=P.slot_to_tid(zero_slot),
+            out=P.slot_to_tid(mask),
+        )
+    )
+    _, scaled = P.make_tmp_slot()
+    P.emit(
+        MultiplyNode(
+            a=P.slot_to_tid(x),
+            b=P.slot_to_tid(slope_slot),
+            out=P.slot_to_tid(scaled),
+        )
+    )
+    out = P.make_or_get_slot(n)
+    P.emit(
+        WhereNode(
+            condition=P.slot_to_tid(mask),
+            x=P.slot_to_tid(x),
+            y=P.slot_to_tid(scaled),
             out=P.slot_to_tid(out),
         )
     )
@@ -3107,6 +3220,40 @@ def _where_handler(P: MLXProgramBuilder, n: Node) -> Slot:
             condition=P.slot_to_tid(condition),
             x=P.slot_to_tid(x),
             y=P.slot_to_tid(y),
+            out=P.slot_to_tid(out),
+        )
+    )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.masked_fill.Scalar])
+def _masked_fill_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle masked_fill(self, mask, value) = where(mask, value, self).
+
+    Materializes the scalar `value` as a 0-D constant (broadcast by where).
+    """
+    args = P.args(n)
+    require_args(args, 3, 3, "aten.masked_fill")
+    require_kwargs(P.kwargs(n), set(), "aten.masked_fill")
+    x, mask, value = args
+
+    out_dtype = n.meta["val"].dtype
+    _, val_slot = P.make_tmp_slot()
+    P.emit(
+        FullNode(
+            out=P.slot_to_tid(val_slot),
+            shape=[],
+            v=P.to_float_or_vid(value),
+            scalar_type=torch_dtype_to_scalar_type(out_dtype),
+        )
+    )
+
+    out = P.make_or_get_slot(n)
+    P.emit(
+        WhereNode(
+            condition=P.slot_to_tid(mask),
+            x=P.slot_to_tid(val_slot),
+            y=P.slot_to_tid(x),
             out=P.slot_to_tid(out),
         )
     )
@@ -3885,6 +4032,34 @@ def _cumsum_handler(P: MLXProgramBuilder, n: Node) -> Slot:
         )
     )
     return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.cummax.default])
+def _cummax_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.cummax(x, dim) -> (values, indices).
+
+    Only the values output (index 0) is supported; indices (index 1) are not
+    produced by MLX's cummax wrapping here.
+    """
+    if 1 in used_getitem_indices(n):
+        raise ValueError("aten.cummax indices output (index 1) is not supported")
+
+    args = P.args(n)
+    require_args(args, 2, 2, "aten.cummax")
+    require_kwargs(P.kwargs(n), set(), "aten.cummax")
+    x = args[0]
+    dim = args[1]
+
+    # cummax returns (values, indices) — allocate both slots, fill only values.
+    output_slots = P.make_or_get_slots(n)
+    P.emit(
+        CumMaxNode(
+            x=P.slot_to_tid(x),
+            out=P.slot_to_tid(output_slots[0]),
+            axis=dim,
+        )
+    )
+    return output_slots
 
 
 @REGISTRY.register(target=[torch.ops.aten.stack.default])

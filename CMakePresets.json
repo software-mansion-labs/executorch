@@ -372,6 +372,30 @@
         "ET_MLX_ENABLE_OP_LOGGING": "ON",
         "ET_MIN_LOG_LEVEL": "Debug"
       }
+    },
+    {
+      "name": "mlx-ios",
+      "displayName": "Build MLX delegate for iOS (device)",
+      "inherits": ["ios"],
+      "binaryDir": "${sourceDir}/cmake-out-mlx-ios",
+      "cacheVariables": {
+        "EXECUTORCH_BUILD_PRESET_FILE": "${sourceDir}/tools/cmake/preset/mlx.cmake",
+        "EXECUTORCH_ENABLE_LOGGING": "ON"
+      }
+    },
+    {
+      "name": "mlx-ios-release",
+      "displayName": "MLX delegate iOS (device) release build",
+      "inherits": ["mlx-ios"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/cmake-out-mlx-ios",
+        "ET_MLX_ENABLE_OP_LOGGING": "OFF",
+        "ET_MIN_LOG_LEVEL": "Error",
+        "EXECUTORCH_BUILD_KERNELS_LLM": "ON",
+        "EXECUTORCH_BUILD_KERNELS_QUANTIZED": "ON",
+        "EXECUTORCH_BUILD_KERNELS_OPTIMIZED": "ON"
+      }
     }
   ],
   "buildPresets": [
@@ -463,6 +487,16 @@
       "name": "mlx-debug-install",
       "displayName": "Build and install MLX delegate debug artifacts",
       "configurePreset": "mlx-debug",
+      "targets": [
+        "install"
+      ],
+      "jobs": 0
+    },
+    {
+      "name": "mlx-ios-release-install",
+      "displayName": "Build and install MLX delegate iOS (device) release artifacts",
+      "configurePreset": "mlx-ios-release",
+      "configuration": "Release",
       "targets": [
         "install"
       ],
@@ -607,6 +641,20 @@
         {
           "type": "build",
           "name": "mlx-debug-install"
+        }
+      ]
+    },
+    {
+      "name": "mlx-ios-release",
+      "displayName": "Configure, build and install ExecuTorch MLX delegate for iOS (device)",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "mlx-ios-release"
+        },
+        {
+          "type": "build",
+          "name": "mlx-ios-release-install"
         }
       ]
     }
