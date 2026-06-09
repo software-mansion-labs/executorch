@@ -1,0 +1,127 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/*
+ * iter145 fp32 weight-scale variant of fp32_acc.glslh.
+ *
+ * Used by the *_scalefp32_* variants of linear_q4gsw_{coop,tiled} and
+ * linear_dq8ca_q4gsw_tiled. These shaders store t_weight_scales at fp32 in the
+ * PTE (e.g. produced by torchao bf16->fp32 scale upcast). The scales are kept
+ * at fp32 precision through the dequant + matmul-accum, instead of being
+ * round-tripped through f16vec4 in FPPerOutChannelParams.
+ *
+ * Storage (input/output/weights/zeros) stays at DTYPE (fp16 typically). Only
+ * the scale tensor's value precision is widened.
+ *
+ * The accumulator is fp32 (mirrors iter137 fp32_acc.glslh).
+ *
+ * Macro Settings expected by callers:
+ *   - TILE_M, TILE_N4, TILE_K4, TILE_N8 (already required by fp32_acc.glslh)
+ *   - VEC4_T, T (storage types for input/output, from DTYPE)
+ *   - The shader must declare t_weight_scales with SCALE_DTYPE = "float", i.e.
+ *     `${layout_declare_tensor(B, "r", "t_weight_scales", "float", "buffer", is_scalar_array=False)}`
+ */
+
+#ifndef LINEAR_FP32_SCALE_ACC_GLSLH
+#define LINEAR_FP32_SCALE_ACC_GLSLH
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "linear_common.glslh"
+#include "linear_fp32_acc.glslh"
+#include "linear_fp_input_tile.glslh"
+#include "linear_fp_per_out_channel_params.glslh"
+#include "linear_int4_weight_tile.glslh"
+
+// fp32-precision scales tile (parallel to FPPerOutChannelParams which is
+// VEC4_T-typed and may therefore be f16vec4 when DTYPE = half).
+struct FPPerOutChannelScalesFP32 {
+  vec4 data[TILE_N4];
+};
+
+vec4 load_weight_scale_x4_fp32(const int n4) {
+  return t_weight_scales[n4];
+}
+
+vec4 load_scale_x4_fp32(
+    const int n4,
+    const int quant_group_idx,
+    const int N4) {
+  return t_weight_scales[quant_group_idx * N4 + n4];
+}
+
+void load_weight_scales_fp32_tile(
+    out FPPerOutChannelScalesFP32 scales,
+    const int n4_start) {
+  [[unroll]] for (int n4 = 0; n4 < TILE_N4; ++n4) {
+    scales.data[n4] = load_weight_scale_x4_fp32(n4_start + n4);
+  }
+}
+
+void load_weight_scales_fp32_tile_for_group(
+    out FPPerOutChannelScalesFP32 scales,
+    const int n4_start,
+    const int quant_group_idx,
+    const int N4) {
+  [[unroll]] for (int n4 = 0; n4 < TILE_N4; ++n4) {
+    scales.data[n4] = load_scale_x4_fp32(n4_start + n4, quant_group_idx, N4);
+  }
+}
+
+// fp32 acc + fp32 scales path for the q4gsw shaders. Mirrors
+// fp32_fp_accumulate_with_int4_weight from linear_fp32_acc.glslh, but with
+// scales at fp32 precision throughout the dequant.
+void fp32_scale_fp_accumulate_with_int4_weight(
+    inout LinearFPOutTileFP32 accum,
+    FPInputTile in_tile,
+    Int4WeightTile w_tile,
+    FPPerOutChannelScalesFP32 scales_tile,
+    FPPerOutChannelParams zeros_tile) {
+  vec4 weight_texels[2];
+  [[unroll]] for (int n8 = 0; n8 < TILE_N8; ++n8) {
+    const int n4 = mul_2(n8);
+    [[unroll]] for (int k4 = 0; k4 < TILE_K4; ++k4) {
+      [[unroll]] for (int k4i = 0; k4i < 4; ++k4i) {
+        const int base_col_1 = mul_2(k4i);
+        const int base_col_2 = base_col_1 + 1;
+        weight_texels[0] = vec4(
+            float(((w_tile.data[k4][n8][0] >> (4 * base_col_1)) & 0xF) - 8),
+            float(((w_tile.data[k4][n8][1] >> (4 * base_col_1)) & 0xF) - 8),
+            float(((w_tile.data[k4][n8][2] >> (4 * base_col_1)) & 0xF) - 8),
+            float(((w_tile.data[k4][n8][3] >> (4 * base_col_1)) & 0xF) - 8));
+        weight_texels[1] = vec4(
+            float(((w_tile.data[k4][n8][0] >> (4 * base_col_2)) & 0xF) - 8),
+            float(((w_tile.data[k4][n8][1] >> (4 * base_col_2)) & 0xF) - 8),
+            float(((w_tile.data[k4][n8][2] >> (4 * base_col_2)) & 0xF) - 8),
+            float(((w_tile.data[k4][n8][3] >> (4 * base_col_2)) & 0xF) - 8));
+
+        weight_texels[0] = fma(
+            weight_texels[0],
+            scales_tile.data[n4],
+            vec4(zeros_tile.data[n4]));
+        weight_texels[1] = fma(
+            weight_texels[1],
+            scales_tile.data[n4 + 1],
+            vec4(zeros_tile.data[n4 + 1]));
+
+        [[unroll]] for (int m = 0; m < TILE_M; ++m) {
+          accum.data[m][n4] =
+              fma(vec4(in_tile.data[m][k4][k4i]),
+                  weight_texels[0],
+                  accum.data[m][n4]);
+          accum.data[m][n4 + 1] =
+              fma(vec4(in_tile.data[m][k4][k4i]),
+                  weight_texels[1],
+                  accum.data[m][n4 + 1]);
+        }
+      }
+    }
+  }
+}
+
+#endif // LINEAR_FP32_SCALE_ACC_GLSLH

@@ -78,6 +78,35 @@ void add_split_node(
     split_offset += split_sizes[i];
   }
 
+  // Capture the split parameters for this per-output dispatch.  The
+  // resize_fn matches the DispatchNode arg layout: args[0]={out},
+  // args[1]={input}.
+  const int64_t captured_dim = dim;
+  const int64_t captured_split_size = split_sizes.at(split_idx);
+  auto resize_fn = [captured_dim, captured_split_size](
+                       ComputeGraph* g,
+                       const std::vector<ArgGroup>& args,
+                       const std::vector<ValueRef>& /*resize_args*/) {
+    const ValueRef out_ref = args.at(0).refs.at(0);
+    const ValueRef in_ref = args.at(1).refs.at(0);
+
+    std::vector<int64_t> in_sizes = g->sizes_of(in_ref);
+    const int64_t ndim = static_cast<int64_t>(in_sizes.size());
+    int64_t resolved_dim = captured_dim;
+    if (resolved_dim < 0) {
+      resolved_dim += ndim;
+    }
+    if (resolved_dim < 0) {
+      resolved_dim = 0;
+    }
+    if (resolved_dim >= ndim) {
+      resolved_dim = ndim - 1;
+    }
+    std::vector<int64_t> out_sizes = in_sizes;
+    out_sizes.at(resolved_dim) = captured_split_size;
+    g->virtual_resize(out_ref, out_sizes);
+  };
+
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
       VK_KERNEL_FROM_STR(kernel_name),
@@ -96,7 +125,7 @@ void add_split_node(
       // Resize Args
       {},
       // Resizing Logic
-      nullptr));
+      resize_fn));
 }
 
 void add_split_with_sizes_node(

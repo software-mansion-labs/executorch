@@ -9,6 +9,9 @@ sdpa_compute_attn_weights_tiled:
     DTYPE: float
     IO_STORAGE: texture3d
     K_CACHE_STORAGE: texture3d
+    HAS_MASK: 0
+    MASK_PER_HEAD: 0
+    HAS_SOFTCAP: 0
     TILE_M4: 1
     TILE_K4: 1
     TILE_N4: 1
@@ -23,4 +26,28 @@ sdpa_compute_attn_weights_tiled:
       - VALUE: float
       - VALUE: half
   shader_variants:
-    - NAME: sdpa_compute_attn_weights_tiled
+    # Existing variants preserved (Llama text decode + vision iter185).
+    - NAME: sdpa_compute_attn_weights_tiled_nomask
+      HAS_MASK: 0
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 0
+    - NAME: sdpa_compute_attn_weights_tiled_mask
+      HAS_MASK: 1
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 0
+    # Audio extension (Phase 2B): softcap on the broadcast-mask path.
+    - NAME: sdpa_compute_attn_weights_tiled_mask_softcap
+      HAS_MASK: 1
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 1
+    # Audio extension: per-head mask (matrix_bd + pad combined).
+    - NAME: sdpa_compute_attn_weights_tiled_mask_phmask
+      HAS_MASK: 1
+      MASK_PER_HEAD: 1
+      HAS_SOFTCAP: 0
+    # Audio extension: per-head mask + softcap (full audio recipe — replaces
+    # the buggy gemma fork's multi-row tiled shader for the audio path).
+    - NAME: sdpa_compute_attn_weights_tiled_mask_phmask_softcap
+      HAS_MASK: 1
+      MASK_PER_HEAD: 1
+      HAS_SOFTCAP: 1

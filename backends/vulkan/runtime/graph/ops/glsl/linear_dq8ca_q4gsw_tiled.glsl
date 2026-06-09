@@ -14,10 +14,14 @@ ${define_required_extensions(IO_STORAGE, DTYPE)}
 ${define_required_extensions("texture3d", "int8")}
 // For weight scales and bias
 ${define_required_extensions("buffer", DTYPE)}
+${define_required_extensions("buffer", SCALE_DTYPE)}
 
 #define PRECISION ${PRECISION}
 #define VEC4_T ${texel_load_type(DTYPE, IO_STORAGE)}
 #define T ${texel_load_component_type(DTYPE, IO_STORAGE)}
+
+$if SCALE_DTYPE == "float":
+  #define SCALE_DTYPE_FP32 1
 
 $if IO_STORAGE == "buffer":
   #define OUTPUT_BUFFER
@@ -49,7 +53,7 @@ ${layout_declare_tensor(B, "r", "t_int8_input_scales", DTYPE, "texture3d")}
 ${layout_declare_tensor(B, "r", "t_int8_input_zps", "int8", "texture3d")}
 ${layout_declare_tensor(B, "r", "t_packed_int4_weight", "int", WEIGHT_STORAGE, is_scalar_array=False)}
 ${layout_declare_tensor(B, "r", "t_weight_sums", "int", "buffer", is_scalar_array=False)}
-${layout_declare_tensor(B, "r", "t_weight_scales", DTYPE, "buffer", is_scalar_array=False)}
+${layout_declare_tensor(B, "r", "t_weight_scales", SCALE_DTYPE, "buffer", is_scalar_array=False)}
 ${layout_declare_tensor(B, "r", "t_bias", DTYPE, "buffer", is_scalar_array=False)}
 
 ${layout_declare_ubo(B, "ivec4", "output_sizes")}
@@ -65,7 +69,9 @@ ${layout_declare_spec_const(C, "int", "K4_per_group", "0")}
 #include "linear_int8_input_scales_zps_load.glslh"
 #include "linear_int4_weight_tile_load.glslh"
 #include "linear_int_weight_sums_load.glslh"
+#ifndef SCALE_DTYPE_FP32
 #include "linear_fp_weight_scales_load.glslh"
+#endif
 #include "linear_int8_input_sums_load.glslh"
 #include "linear_fp_output_tile_int8_int8_compute.glslh"
 #include "linear_fp_output_tile_int8_int4_compute.glslh"
@@ -73,6 +79,14 @@ ${layout_declare_spec_const(C, "int", "K4_per_group", "0")}
 #include "linear_fp_output_tile_fp_compute.glslh"
 #include "linear_fp_output_tile_store.glslh"
 #include "linear_fp_bias_load.glslh"
+// iter137 fp32-linear-acc: fp32 accumulator for int_accum -> fp32 conversion.
+#include "linear_fp32_acc.glslh"
+#include "linear_fp32_dq_acc.glslh"
+#ifdef SCALE_DTYPE_FP32
+// iter145 fp32-weight-scale: scales kept at fp32 precision through dequant.
+#include "linear_fp32_scale_acc.glslh"
+#include "linear_fp32_scale_dq_acc.glslh"
+#endif
 
 void main() {
   const int out_tile_x = int(gl_GlobalInvocationID.x);
@@ -95,8 +109,12 @@ void main() {
   const int N4 = div_up_4(output_sizes.x);
   const int N8 = div_up_8(output_sizes.x);
 
-  FPOutTile out_tile;
-  initialize(out_tile);
+  // iter137 fp32-linear-acc: fp32 accumulator for the cross-group sum of the
+  // (input_scale * weight_scale * int_accum) terms. Each group's int32 dot
+  // is already exact; the drift comes from accumulating the fp products
+  // across many groups in fp16. Promote that sum to fp32.
+  LinearFPOutTileFP32 out_tile;
+  fp32_initialize(out_tile);
 
   Int32Accum out_accum;
   initialize(out_accum);
@@ -108,7 +126,11 @@ void main() {
   Int8InputZeroPoints input_zps;
   load_int8_input_scales_and_zps(input_scales, input_zps, m4);
 
+#ifdef SCALE_DTYPE_FP32
+  FPPerOutChannelScalesFP32 weight_scales_tile;
+#else
   FPPerOutChannelParams weight_scales_tile;
+#endif
   IntPerOutChannelParams weight_sums_tile;
 
   IntPerInChannelParams int8_input_sums_tile;
@@ -129,11 +151,17 @@ void main() {
           out_accum, int8_in_tile, int4_weight_tile);
     }
 
+#ifdef SCALE_DTYPE_FP32
+    load_weight_scales_fp32_tile_for_group(
+        weight_scales_tile, n4, group_i, N4);
+#else
     load_weight_scales_tile_for_group(weight_scales_tile, n4, group_i, N4);
+#endif
     load_weight_sums_tile_for_group(weight_sums_tile, n4, group_i, N4);
     load_int8_input_sums_tile_for_group(int8_input_sums_tile, m4, group_i, M4);
 
-    accumulate_out_tile_with_int_accum_from_int4_weights(
+#ifdef SCALE_DTYPE_FP32
+    fp32_scale_accumulate_out_tile_with_int_accum_from_int4_weights(
         out_tile,
         out_accum,
         int8_input_sums_tile,
@@ -142,7 +170,18 @@ void main() {
         weight_sums_tile,
         weight_scales_tile,
         group_size);
+#else
+    fp32_accumulate_out_tile_with_int_accum_from_int4_weights(
+        out_tile,
+        out_accum,
+        int8_input_sums_tile,
+        input_scales,
+        input_zps,
+        weight_sums_tile,
+        weight_scales_tile,
+        group_size);
+#endif
   }
 
-  write_output_tile_with_checks(out_tile, n4, m, N4, M);
+  fp32_write_output_tile_with_checks(out_tile, n4, m, N4, M);
 }

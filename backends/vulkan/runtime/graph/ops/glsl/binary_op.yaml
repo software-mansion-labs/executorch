@@ -35,8 +35,13 @@ binary_op:
       MASK_PADDING: 1
     - NAME: binary_minimum
       OPERATOR: min(X, Y)
-    - NAME: binary_eq_int32
+    - NAME: binary_eq_buffer_int32
       OPERATOR: X == Y
+      STORAGE: buffer
+      DTYPE: int32
+    - NAME: binary_eq_texture3d_int32
+      OPERATOR: X == Y
+      STORAGE: texture3d
       DTYPE: int32
     - NAME: binary_eq_buffer
       OPERATOR: abs(X - Y) < 1e-5

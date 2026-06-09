@@ -28,7 +28,7 @@ $if V_CACHE_STORAGE == "buffer":
 #define TILE_K ${TILE_K4 * 4}
 #define TILE_N ${TILE_N4 * 4}
 
-${define_required_extensions(IO_STORAGE, DTYPE)}
+${define_required_extensions(DTYPE)}
 
 layout(std430) buffer;
 
@@ -46,8 +46,8 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 #include "sdpa_fp_attn_weight_tile_load.glslh"
 #include "sdpa_fp_v_cache_tile_load.glslh"
-#include "linear_fp_output_tile_fp_compute.glslh"
-#include "sdpa_fp_out_tile_store.glslh"
+// iter136 fp32-attn-acc: fp32 accumulator for attn-weights × V matmul.
+#include "sdpa_fp32_out_tile_store.glslh"
 
 /*
  * Compute SDPA output given the attention weights and v_cache tensors.
@@ -97,8 +97,8 @@ void main() {
     return;
   }
 
-  FPOutTile out_tile;
-  initialize(out_tile);
+  SDPAFPOutTileFP32 out_tile;
+  fp32_initialize(out_tile);
 
   FPInputTile attn_weight_tile;
   FPWeightTile w_tile;
@@ -127,7 +127,7 @@ void main() {
       C,
       KV_H);
 
-    fp_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
+    fp32_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
   }
   for (int c4 = C4_limit; c4 < context_texel_len; c4++) {
     const int c = mul_4(c4);
@@ -150,10 +150,10 @@ void main() {
       C,
       KV_H);
 
-    fp_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
+    fp32_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
   }
 
-  store_sdpa_out_tile_with_checks(
+  fp32_store_sdpa_out_tile_with_checks(
     out_tile,
     d4,
     s,

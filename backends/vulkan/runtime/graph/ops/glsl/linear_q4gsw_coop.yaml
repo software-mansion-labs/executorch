@@ -7,6 +7,7 @@
 linear_q4gsw_coop:
   parameter_names_with_default_values:
     DTYPE: float
+    SCALE_DTYPE: half
     IO_STORAGE: texture3d
     WEIGHT_STORAGE: texture2d
     PACKED_INPUT_STORAGE: buffer
@@ -41,3 +42,34 @@ linear_q4gsw_coop:
       IO_STORAGE: buffer
       WEIGHT_STORAGE: buffer
       DYNAMIC_QUANT_VARIANT: true
+    # iter145 SCALE_DTYPE=float variants. Match the fp16 variants 1:1 above
+    # with `_scalefp32` suffix and SCALE_DTYPE: float.
+    - NAME: linear_q4gsw_coop_scalefp32_texture3d_texture2d
+      SCALE_DTYPE: float
+    - NAME: linear_q4gsw_coop_scalefp32_texture3d_buffer
+      WEIGHT_STORAGE: buffer
+      SCALE_DTYPE: float
+    - NAME: linear_q4gsw_coop_scalefp32_buffer_texture2d
+      IO_STORAGE: buffer
+      SCALE_DTYPE: float
+    - NAME: linear_q4gsw_coop_scalefp32_buffer_buffer
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: buffer
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_coop_scalefp32_texture3d_texture2d
+      DYNAMIC_QUANT_VARIANT: true
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_coop_scalefp32_texture3d_buffer
+      WEIGHT_STORAGE: buffer
+      DYNAMIC_QUANT_VARIANT: true
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_coop_scalefp32_buffer_texture2d
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: texture2d
+      DYNAMIC_QUANT_VARIANT: true
+      SCALE_DTYPE: float
+    - NAME: linear_dq8ca_q4gsw_coop_scalefp32_buffer_buffer
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: buffer
+      DYNAMIC_QUANT_VARIANT: true
+      SCALE_DTYPE: float

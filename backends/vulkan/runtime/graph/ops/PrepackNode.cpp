@@ -70,39 +70,19 @@ api::StagingBuffer PrepackNode::create_staging_buffer(ComputeGraph* graph) {
       vkapi::CopyDirection::HOST_TO_DEVICE);
   graph->update_staging_nbytes_in_cmd(staging.buffer().mem_size_as_size_t());
   size_t nbytes = numel * vkapi::element_size(tref->dtype);
-
-  // In some cases the staging dtype will diverge from the TensorRef dtype. The
-  // most common case for this is when the tensor data is float16, but the GPU
-  // does not support 16-bit storage buffers. In these cases, the tensor data
-  // is manually casted to the staging dtype.
-  vkapi::ScalarType staging_dtype = staging.dtype();
-  vkapi::ScalarType tref_dtype = tref->dtype;
-  if (staging_dtype == tref_dtype) {
-    staging.copy_from(tref->data, nbytes);
-  } else {
-    // Hard-coded type conversion cases
-    if (tref_dtype == vkapi::kHalf && staging_dtype == vkapi::kFloat) {
-      const uint16_t* casted_data =
-          reinterpret_cast<const uint16_t*>(tref->data);
-      staging.cast_half_to_float_and_copy_from(casted_data, numel);
-    } else if (tref_dtype == vkapi::kLong && staging_dtype == vkapi::kInt) {
-      const int64_t* casted_data = reinterpret_cast<const int64_t*>(tref->data);
-      staging.cast_and_copy_from<int64_t, int32_t>(casted_data, numel);
-    } else if (tref_dtype == vkapi::kDouble && staging_dtype == vkapi::kFloat) {
-      const double* casted_data = reinterpret_cast<const double*>(tref->data);
-      staging.cast_and_copy_from<double, float>(casted_data, numel);
-    } else {
-      VK_THROW(
-          "Unsupported type conversion from ",
-          tref_dtype,
-          " to staging dtype ",
-          staging_dtype);
-    }
-  }
-
-  // Once the staging buffer is copied, if the TensorRef owns a FreeableBuffer,
-  // it can be freed.
-  tref->free_buffer();
+  staging.copy_from(tref->data, nbytes);
+  // Iter 7 fix: do NOT call tref->free_buffer() here. The same TensorRef
+  // may be referenced by multiple PrepackNodes (e.g. when a single
+  // serialized constant is consumed by two operators that each insert
+  // their own et_vk.prepack node — observed in Gemma4's tied-weight
+  // embedding/lm_head). Calling Free() here invalidates tref->data
+  // (FreeableBuffer::Free sets buffer.data_=nullptr but ALSO triggers
+  // the registered free-fn that may unmap the underlying region),
+  // while TensorRef::data remains a stale cached pointer. The next
+  // PrepackNode that holds the same tref_ then memcpy's from freed
+  // memory → SIGSEGV. Letting the buffer live until the TensorRef is
+  // destroyed (end of prepack stage) avoids the use-after-free at the
+  // cost of slightly higher peak memory during prepack.
   return staging;
 }
 

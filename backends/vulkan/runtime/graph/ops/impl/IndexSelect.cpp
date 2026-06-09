@@ -28,6 +28,38 @@ void check_index_select_args(
   VK_CHECK_COND(graph.packed_dim_of(out) == WHCN::kChannelsDim);
 }
 
+void resize_index_select_channel_node(
+    ComputeGraph* graph,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)resize_args;
+  const ValueRef out = args.at(0).refs.at(0);
+  const ValueRef in = args.at(1).refs.at(0);
+  const ValueRef idx = args.at(1).refs.at(1);
+
+  std::vector<int64_t> in_sizes = graph->sizes_of(in);
+  std::vector<int64_t> idx_sizes = graph->sizes_of(idx);
+
+  // Compute idx numel (total number of indices)
+  int64_t idx_numel = 1;
+  for (int64_t s : idx_sizes) {
+    idx_numel *= s;
+  }
+
+  // Output shape mirrors input shape with the channel dim replaced by
+  // the total number of indices selected.
+  const int64_t ndim = static_cast<int64_t>(in_sizes.size());
+  std::vector<int64_t> out_sizes = in_sizes;
+  // kChannel4D index from the back is -3 (W=-1, H=-2, C=-3, N=-4)
+  if (ndim >= 3) {
+    out_sizes.at(ndim - 3) = idx_numel;
+  } else {
+    // Fall back: treat the leading dim as channel for low-rank tensors.
+    out_sizes.at(0) = idx_numel;
+  }
+  graph->virtual_resize(out, out_sizes);
+}
+
 void add_index_select_channel_node(
     ComputeGraph& graph,
     ValueRef in,
@@ -92,6 +124,39 @@ void add_index_select_node(
   std::string kernel_name = "index_select";
   kernel_name.reserve(kShaderNameReserve);
   add_dtype_suffix(kernel_name, graph.dtype_of(out));
+
+  // Capture dim_idx by value into a lambda resize function.  dim_idx is a
+  // negative offset from the back of the tensor (e.g. kWidth4D = -1).
+  const int64_t captured_dim_idx = dim_idx;
+  auto resize_fn = [captured_dim_idx](
+                       ComputeGraph* g,
+                       const std::vector<ArgGroup>& args,
+                       const std::vector<ValueRef>& /*resize_args*/) {
+    const ValueRef out_ref = args.at(0).refs.at(0);
+    const ValueRef in_ref = args.at(1).refs.at(0);
+    const ValueRef idx_ref = args.at(1).refs.at(1);
+
+    std::vector<int64_t> in_sizes = g->sizes_of(in_ref);
+    std::vector<int64_t> idx_sizes = g->sizes_of(idx_ref);
+
+    int64_t idx_numel = 1;
+    for (int64_t s : idx_sizes) {
+      idx_numel *= s;
+    }
+
+    std::vector<int64_t> out_sizes = in_sizes;
+    const int64_t ndim = static_cast<int64_t>(in_sizes.size());
+    // dim_idx is a back-relative index (negative).
+    int64_t target = ndim + captured_dim_idx;
+    if (target < 0) {
+      target = 0;
+    }
+    if (target >= ndim) {
+      target = ndim - 1;
+    }
+    out_sizes.at(target) = idx_numel;
+    g->virtual_resize(out_ref, out_sizes);
+  };
 
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,

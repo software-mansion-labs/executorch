@@ -102,4 +102,90 @@ void apply_scale_and_mask(
   }
 }
 
+#ifdef HAS_MASK
+/*
+ * Load one scalar mask element at (s_idx, c_idx). Mask is shape
+ * (1, 1, S_q, C) [broadcast] or (1, H, S_q, C) [per-head], width-packed
+ * along C — same packing as t_attn_weights. Bound as t_attn_mask via the
+ * same storage type as attn_weights (texture3d or buffer).
+ *
+ * When MASK_PER_HEAD is defined, the caller passes q_h and the mask
+ * tensor's outer index is the head; otherwise the mask broadcasts over
+ * heads (q_h ignored, hardcoded to 0).
+ */
+T load_mask_scalar(
+    const int s_idx,
+    const int c_idx,
+    const int q_h,
+    const int S,
+    const int C4) {
+#ifdef MASK_PER_HEAD
+  const int head_idx = q_h;
+#else
+  const int head_idx = 0;
+#endif
+#ifdef MASK_BUFFER
+  const int c4 = c_idx >> 2;
+  const int c4i = c_idx & 3;
+  // Layout for shape (1, H, S, C) width-packed along C:
+  //   linear_index = ((head_idx * S) + s_idx) * C4 + c4
+  // Layout for shape (1, 1, S, C) (head_idx forced 0):
+  //   linear_index = (s_idx * C4) + c4
+  return t_attn_mask[(head_idx * S * C4) + (s_idx * C4) + c4][c4i];
+#else
+  const int c4 = c_idx >> 2;
+  const int c4i = c_idx & 3;
+  // Texture3D layout: z = head_idx (broadcast case forces 0).
+  return VEC4_T(texelFetch(t_attn_mask, ivec3(c4, s_idx, head_idx), 0))[c4i];
+#endif
+}
+
+/*
+ * Apply inv_scale, then broadcast-add the mask. Caller-supplied mask
+ * already encodes causality, so we skip the causal -inf branch.
+ *
+ * Audio extension (Phase 2B): when MASK_PER_HEAD is defined the mask is
+ * indexed by `q_h`; when HAS_SOFTCAP is defined, callers should follow
+ * this call with `apply_softcap_tile` to apply `tanh(x/cap)*cap`.
+ */
+void apply_scale_and_mask_with_mask(
+    inout FPOutTile tile,
+    const VEC4_T inv_scale_vec,
+    const int input_pos,
+    const int c_idx_start,
+    const int s_idx_start,
+    const int q_h,
+    const int S,
+    const int C4) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      tile.data[s][c4] = tile.data[s][c4] * inv_scale_vec;
+      const int c_base = mul_4(c4);
+      [[unroll]] for (int c4i = 0; c4i < 4; ++c4i) {
+        const int c_idx = c_idx_start + c_base + c4i;
+        const int s_idx = s_idx_start + s;
+        T m = load_mask_scalar(s_idx, c_idx, q_h, S, C4);
+        tile.data[s][c4][c4i] = tile.data[s][c4][c4i] + m;
+      }
+    }
+  }
+}
+
+#ifdef HAS_SOFTCAP
+/*
+ * Audio extension (Phase 2B): apply `tanh(x * inv_softcap) * softcap`
+ * elementwise. Operates in-place on the tile AFTER mask add and BEFORE
+ * the softmax dispatch. Push constants supply (softcap, inv_softcap).
+ */
+void apply_softcap_tile(inout FPOutTile tile, T softcap, T inv_softcap) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      tile.data[s][c4] = tanh(tile.data[s][c4] * VEC4_T(inv_softcap))
+                         * VEC4_T(softcap);
+    }
+  }
+}
+#endif // HAS_SOFTCAP
+#endif // HAS_MASK
+
 #endif // SDPA_FP_ATTN_WEIGHT_TILE_LOAD_GLSLH

@@ -12,7 +12,32 @@
 
 #include <executorch/backends/vulkan/runtime/graph/ops/utils/BindingUtils.h>
 
+#include <cstdio>
+#include <cstdlib>
+
 namespace vkcompute {
+
+// Iter 21 instrumentation: env-gated per-dispatch trace.
+//   ETVK_DISPATCH_TRACE=<path>  → append one tab-separated line per
+//   dispatch:  <kernel_name>\t<seq>\tW=<r,r,...>\tR=<r,r,...>
+// where <seq> is a monotonically-incrementing per-process counter and
+// W/R lists are the ValueRefs (ints) bound as kWrite / kRead.
+namespace {
+FILE* dispatch_trace_fp() {
+  static FILE* fp = []() -> FILE* {
+    const char* path = std::getenv("ETVK_DISPATCH_TRACE");
+    if (path == nullptr || *path == '\0') {
+      return nullptr;
+    }
+    FILE* f = std::fopen(path, "w");
+    if (f != nullptr) {
+      std::setvbuf(f, nullptr, _IOLBF, 0);
+    }
+    return f;
+  }();
+  return fp;
+}
+} // namespace
 
 DispatchNode::DispatchNode(
     ComputeGraph& graph,
@@ -78,6 +103,28 @@ void DispatchNode::encode(ComputeGraph* graph) {
       global_workgroup_size_,
       local_workgroup_size_,
       node_id_);
+
+  // Iter 21 trace: terse, one tab-separated line per dispatch.
+  if (FILE* fp = dispatch_trace_fp()) {
+    static thread_local uint64_t seq = 0;
+    std::fprintf(fp, "%lu\t%s", static_cast<unsigned long>(seq++),
+                 shader_.kernel_name.c_str());
+    for (const auto& g : args_) {
+      const char* tag = (g.access == vkapi::kReadWrite) ? "RW"
+                       : ((g.access & vkapi::kWrite) ? "W"
+                       : ((g.access & vkapi::kRead) ? "R" : "N"));
+      std::fprintf(fp, "\t%s=", tag);
+      bool first = true;
+      for (const auto ref : g.refs) {
+        std::fprintf(fp, "%s%d", first ? "" : ",", static_cast<int>(ref));
+        first = false;
+      }
+    }
+    std::fprintf(fp, "\twg=%u,%u,%u\n",
+                 static_cast<unsigned>(global_workgroup_size_[0]),
+                 static_cast<unsigned>(global_workgroup_size_[1]),
+                 static_cast<unsigned>(global_workgroup_size_[2]));
+  }
 
   vkapi::DescriptorSet descriptor_set = context->get_descriptor_set(
       shader_, local_workgroup_size_, spec_vars_, push_constants_offset_);

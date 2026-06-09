@@ -47,10 +47,10 @@ ${layout_declare_spec_const(C, "float", "inv_scale", "1.0")}
 
 #include "sdpa_fp_attn_weight_tile_load.glslh"
 #include "sdpa_fp_v_cache_tile_load.glslh"
-#include "linear_fp_output_tile_fp_compute.glslh"
-#include "sdpa_fp_out_tile_store.glslh"
+// iter136 fp32-attn-acc: fp32 accumulator + fp32 partial-sums shared mem.
+#include "sdpa_fp32_out_tile_store.glslh"
 
-shared FPOutTile partial_sums[NUM_WORKERS_PER_OUT];
+shared SDPAFPOutTileFP32 partial_sums[NUM_WORKERS_PER_OUT];
 
 /*
  * See the tiled variant of this shader for the implemented behavior. This
@@ -103,8 +103,8 @@ void main() {
     return;
   }
 
-  FPOutTile out_tile;
-  initialize(out_tile);
+  SDPAFPOutTileFP32 out_tile;
+  fp32_initialize(out_tile);
 
   FPInputTile attn_weight_tile;
   FPWeightTile w_tile;
@@ -134,7 +134,7 @@ void main() {
       C,
       KV_H);
 
-    fp_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
+    fp32_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
   }
   // first worker in the work group will handle final texel, which may contain
   // padding elements.
@@ -160,7 +160,7 @@ void main() {
         C,
         KV_H);
 
-      fp_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
+      fp32_accumulate_with_fp_weight(out_tile, attn_weight_tile, w_tile);
     }
   }
 
@@ -172,7 +172,7 @@ void main() {
   // Tree reduction to compute the overall result.
   for (int i = NUM_WORKERS_PER_OUT / 2; i > 0; i /= 2) {
     if (worker_id < i) {
-      accumulate_out_tile_with_out_tile(
+      fp32_accumulate_out_tile_with_out_tile(
           partial_sums[worker_id], partial_sums[worker_id + i]);
     }
     memoryBarrierShared();
@@ -182,7 +182,7 @@ void main() {
   // Only the first thread will write out the result
   if (worker_id == 0) {
     out_tile = partial_sums[0];
-    store_sdpa_out_tile_with_checks(
+    fp32_store_sdpa_out_tile_with_checks(
       out_tile,
       d4,
       s,
