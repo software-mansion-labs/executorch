@@ -1104,6 +1104,28 @@ def register_general_sdpa():
     )
 
 
+@update_features("et_vk::gemma_sdpa_with_kv_cache")
+def register_gemma_sdpa_with_kv_cache_op():
+    # Mirrors llama::sdpa_with_kv_cache (above). Cache update is internal
+    # to the op's lowering, so the partitioner sees a single fused node and
+    # never splits the cache write from the SDPA.
+    return OpFeatures(
+        inputs_storage=utils.CONTIGUOUS_ANY,
+        supports_resize=True,
+        supports_prepacking=True,
+    )
+
+
+@update_features("et_vk::gemma_custom_sdpa")
+def register_gemma_custom_sdpa_op():
+    # Read-only SDPA against an already-updated cache, used for KV-consumer
+    # layers in shared-KV groups. Mirrors llama::custom_sdpa.
+    return OpFeatures(
+        inputs_storage=utils.CONTIGUOUS_ANY,
+        supports_resize=True,
+    )
+
+
 # =============================================================================
 # RotaryEmbedding.cpp
 # =============================================================================
@@ -1674,10 +1696,10 @@ def register_native_layer_norm():
 # =============================================================================
 
 
-@update_features(exir_ops.edge.et_vk.rms_norm.default)
+@update_features(exir_ops.edge.aten.rms_norm.default)
 def register_rms_norm():
     return OpFeatures(
-        inputs_storage=utils.CONTIGUOUS_ANY,
+        inputs_storage=utils.CONTIGUOUS_BUFFER,
         inputs_dtypes=utils.FP_T,
         supports_prepacking=True,
         supports_resize=True,

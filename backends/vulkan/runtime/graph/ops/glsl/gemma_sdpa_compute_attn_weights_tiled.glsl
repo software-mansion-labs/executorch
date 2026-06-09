@@ -17,7 +17,6 @@ $if IO_STORAGE == "buffer":
   #define INPUT_BUFFER
 $if K_CACHE_STORAGE == "buffer":
   #define K_CACHE_BUFFER
-
 $if HAS_MASK == 1:
   #define HAS_MASK
 $if HAS_MASK == 1 and IO_STORAGE == "buffer":
@@ -35,7 +34,7 @@ $if HAS_SOFTCAP == 1:
 #define TILE_K ${TILE_K4 * 4}
 #define TILE_N ${TILE_N4 * 4}
 
-${define_required_extensions(DTYPE)}
+${define_required_extensions(IO_STORAGE, DTYPE)}
 
 layout(std430) buffer;
 
@@ -59,38 +58,29 @@ $if HAS_SOFTCAP == 1:
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
-${layout_declare_spec_const(C, "float", "inv_scale", "1.0")}
-
-// Gemma4 exports Q/K in DHSB layout; helpers default to DSHB.
+// Gemma4 exports Q/K in DHSB layout ([B, S, H, D]); the tile-load helpers
+// default to DSHB, which would read transposed offsets and corrupt attention.
 #define Q_LAYOUT DHSB
 #define K_LAYOUT DHSB
 #include "sdpa_fp_q_projected_tile_load.glslh"
 #include "sdpa_fp_k_cache_tile_load.glslh"
-#include "linear_fp_output_tile_fp_compute.glslh"
-#include "sdpa_fp_attn_weight_tile_store.glslh"
+// iter136 fp32-attn-acc: load fp16 storage but accumulate the QK matmul
+// in fp32. linear_fp_output_tile_fp_compute.glslh is still pulled in by
+// downstream linear shaders we don't touch.
+#include "gemma_sdpa_fp32_attn_weight_tile_store.glslh"
 
 /*
- * Compute attention weights given the q_projected and k_cache tensors.
- * q_projected has shape (batches, seq_len, num_q_heads, head_dim)
- * k_cache has shape (batches, max_context_len, num_kv_heads, head_dim)
- * output has shape (batches, num_q_heads, seq_len, context_len)
+ * Gemma4-flavored attention-weight compute (tiled variant).
  *
- * This shader also applies scales and masking to the computed attention
- * weights.
- *
- * The scale applied is 1.0 / sqrt(head_dim_length).
- *
- * The mask applied is a bit more complicated. Imagine you create a square
- * matrix of size (input_pos + seq_len, input_pos + seq_len), and then set the
- * lower triangular section of the matrix to -inf. Then, slice the matrix along
- * the row dimension starting from input_pos to input_pos + seq_len. You end up
- * with a partial mask with size (seq_len, input_pos + seq_len). This is the
- * mask that is applied to the attention weight.
- *
- * In the shader, instead of generating the mask, the index of the elment is
- * inspected to determine if it would have been masked. Given an element at
- * tensor index (n, c, h, w), it would be masked if w < h + input_pos.
- *
+ * Differences vs sdpa_compute_attn_weights_tiled:
+ *   - scale = 1.0 (Gemma4 absorbs 1/sqrt(d) into QKV-norm), so the
+ *     inv_scale spec const + multiply are gone.
+ *   - When HAS_MASK == 1 the caller provides an additive mask of shape
+ *     (1, 1, S_q, C); the tile is broadcast-added rather than relying
+ *     on the causal-only -inf masking.
+ *   - The "tile entirely in causal-mask region" short-circuit is gated
+ *     to the no-mask path; with a caller mask the mask itself encodes
+ *     causality (sliding-window mask is non-trivial).
  */
 
 void main() {
@@ -107,7 +97,7 @@ void main() {
   const int s = tile_idx_y * TILE_M;
   const int s4 = div_4(s);
 
-  // texel size of head_dim, over which the dot product is accumulated
+  // head dim and its texel size, over which the dot product is accumulated
   const int D = q_projected_sizes.x;
   const int D4 = div_up_4(q_projected_sizes.x);
   // number of Q heads
@@ -135,84 +125,45 @@ void main() {
     return;
   }
 
-  FPOutTile out_tile;
-  initialize(out_tile);
+  // iter136: fp32 accumulator across D4 dot product (head_dim ~ 512).
+  SDPAFPOutTileFP32 out_tile;
+  fp32_initialize(out_tile);
 
   FPInputTile q_tile;
   FPWeightTile w_tile;
 
 #ifdef HAS_MASK
-  // Caller mask encodes causality; skip the causal-only short-circuit.
+  // With a caller mask we always run the matmul (mask encodes causality).
   for (int d4 = 0; d4 < D4; d4++) {
     load_q_projected_tile_with_checks(
       q_tile, d4, s, q_h, D4, D, S, Q_H);
     load_k_cache_tile_with_checks(
       w_tile, d4, c, kv_h, D4, D, context_len, C, KV_H);
-    fp_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
+    fp32_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
   }
-  {
-    VEC4_T inv_scale_vec = VEC4_T(inv_scale);
-    apply_scale_and_mask_with_mask(
-      out_tile, inv_scale_vec, input_pos, c, s, q_h, S, C4);
-  }
+  fp32_apply_mask_only_with_mask(out_tile, input_pos, c, s, q_h, S, C4);
 #ifdef HAS_SOFTCAP
-  // Audio extension (Phase 2B): tanh(x/cap) * cap, applied AFTER mask add.
-  apply_softcap_tile(out_tile, T(softcap), T(inv_softcap));
+  // Audio extension (Phase 2B): tanh(x/cap) * cap, AFTER mask add.
+  fp32_apply_softcap_tile(out_tile, softcap, inv_softcap);
 #endif
 #else
-  // If the tile is completely inside the mask region, then there is no need to
-  // compute the output tile. All the elements in the output tile can be set to
-  // negative infinity.
+  // No-mask path: keep the "tile entirely in causal mask region"
+  // short-circuit.
   bool tile_in_mask_region = c > (input_pos + s + (TILE_M - 1));
   if (tile_in_mask_region) {
-    const VEC4_T negative_infinity_vec = VEC4_T(negative_infinity_val);
-    set_out_tile_to_vec(out_tile, negative_infinity_vec);
-  }
-  // Otherwise, need to actually compute output tile
-  else {
+    fp32_set_out_tile_to_vec(out_tile, vec4(fp32_negative_infinity_val));
+  } else {
     for (int d4 = 0; d4 < D4; d4++) {
       load_q_projected_tile_with_checks(
-        q_tile,
-        d4,
-        s,
-        q_h,
-        D4,
-        D,
-        S,
-        Q_H);
-
+      q_tile, d4, s, q_h, D4, D, S, Q_H);
       load_k_cache_tile_with_checks(
-        w_tile,
-        d4,
-        c,
-        kv_h,
-        D4,
-        D,
-        context_len,
-        C,
-        KV_H);
-
-
-      fp_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
+      w_tile, d4, c, kv_h, D4, D, context_len, C, KV_H);
+      fp32_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
     }
-
-    // Apply scale and mask
-    VEC4_T inv_scale_vec = VEC4_T(inv_scale);
-    apply_scale_and_mask(
-      out_tile,
-      inv_scale_vec,
-      input_pos,
-      c,
-      s);
+    fp32_apply_mask_only_causal(out_tile, input_pos, c, s);
   }
 #endif
 
-  store_attn_weight_tile_with_checks(
-    out_tile,
-    c4,
-    s,
-    q_h,
-    context_texel_len,
-    S_aligned,
-    Q_H);
+  fp32_store_attn_weight_tile_with_checks(
+    out_tile, c4, s, q_h, context_texel_len, S_aligned, Q_H);
 }

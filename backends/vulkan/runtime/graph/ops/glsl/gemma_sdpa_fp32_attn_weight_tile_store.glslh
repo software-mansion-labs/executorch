@@ -1,0 +1,155 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+/*
+ * iter136 fp32-attn-acc helpers for the gemma SDPA attn-weight tile.
+ *
+ * Mirrors gemma_sdpa_fp_attn_weight_tile_store.glslh but operates on
+ * SDPAFPOutTileFP32 (vec4 per slot). Mask is loaded as fp32 (cast-up
+ * from DTYPE storage). Final store narrows back to VEC4_T (DTYPE).
+ *
+ * Layout: same as the fp16 version.
+ *
+ * Macro Settings expected by callers (from the shader):
+ *   - HAS_MASK, OUTPUT_BUFFER, MASK_BUFFER (optional)
+ *   - VEC4_T, T (storage types from DTYPE)
+ *   - TILE_M, TILE_N4
+ */
+
+#ifndef GEMMA_SDPA_FP32_ATTN_WEIGHT_TILE_STORE_GLSLH
+#define GEMMA_SDPA_FP32_ATTN_WEIGHT_TILE_STORE_GLSLH
+
+#extension GL_EXT_control_flow_attributes : require
+
+#include "sdpa_fp32_acc.glslh"
+
+float fp32_negative_infinity_val = -1.0 / 0.0;
+
+void store_attn_weight_c4_fp32(
+    const vec4 out_fp32,
+    const int c4,
+    const int s,
+    const int q_h,
+    const int C4,
+    const int S,
+    const int Q_H) {
+#ifdef OUTPUT_BUFFER
+  t_attn_weights[(q_h * S * C4) + (s * C4) + c4] = VEC4_T(out_fp32);
+#else
+  imageStore(t_attn_weights, ivec3(c4, s, q_h), VEC4_T(out_fp32));
+#endif
+}
+
+void fp32_store_attn_weight_tile_with_checks(
+    const SDPAFPOutTileFP32 tile,
+    const int c4_start,
+    const int s_start,
+    const int q_h,
+    const int C4,
+    const int S,
+    const int Q_H) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      if (c4_start + c4 < C4 && s_start + s < S) {
+        store_attn_weight_c4_fp32(
+            tile.data[s][c4], c4_start + c4, s_start + s, q_h, C4, S, Q_H);
+      }
+    }
+  }
+}
+
+#ifdef HAS_MASK
+/*
+ * Load one scalar mask element at (s_idx, c_idx) and cast to fp32.
+ * Mask layout matches t_attn_weights (width-packed along C). May be
+ * broadcast over heads or per-head (audio path, MASK_PER_HEAD).
+ */
+float fp32_load_mask_scalar(
+    const int s_idx,
+    const int c_idx,
+    const int q_h,
+    const int S,
+    const int C4) {
+#ifdef MASK_PER_HEAD
+  const int head_idx = q_h;
+#else
+  const int head_idx = 0;
+#endif
+#ifdef MASK_BUFFER
+  const int c4 = c_idx >> 2;
+  const int c4i = c_idx & 3;
+  return float(t_attn_mask[(head_idx * S * C4) + (s_idx * C4) + c4][c4i]);
+#else
+  const int c4 = c_idx >> 2;
+  const int c4i = c_idx & 3;
+  return float(VEC4_T(texelFetch(t_attn_mask, ivec3(c4, s_idx, head_idx), 0))[c4i]);
+#endif
+}
+
+void fp32_apply_mask_only_with_mask(
+    inout SDPAFPOutTileFP32 tile,
+    const int input_pos,
+    const int c_idx_start,
+    const int s_idx_start,
+    const int q_h,
+    const int S,
+    const int C4) {
+  // Caller mask already encodes causality. Broadcast-add in fp32.
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      const int c_base = mul_4(c4);
+      [[unroll]] for (int c4i = 0; c4i < 4; ++c4i) {
+        const int c_idx = c_idx_start + c_base + c4i;
+        const int s_idx = s_idx_start + s;
+        float m = fp32_load_mask_scalar(s_idx, c_idx, q_h, S, C4);
+        tile.data[s][c4][c4i] = tile.data[s][c4][c4i] + m;
+      }
+    }
+  }
+}
+
+#ifdef HAS_SOFTCAP
+/*
+ * Audio extension (Phase 2B): apply `tanh(x * inv_softcap) * softcap`
+ * elementwise on the fp32 tile, AFTER mask-add and BEFORE softmax.
+ */
+void fp32_apply_softcap_tile(
+    inout SDPAFPOutTileFP32 tile,
+    const float softcap,
+    const float inv_softcap) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      tile.data[s][c4] = tanh(tile.data[s][c4] * vec4(inv_softcap))
+                         * vec4(softcap);
+    }
+  }
+}
+#endif // HAS_SOFTCAP
+#endif // HAS_MASK
+
+void fp32_apply_mask_only_causal(
+    inout SDPAFPOutTileFP32 tile,
+    const int input_pos,
+    const int c_idx_start,
+    const int s_idx_start) {
+  [[unroll]] for (int s = 0; s < TILE_M; ++s) {
+    [[unroll]] for (int c4 = 0; c4 < TILE_N4; ++c4) {
+      const int c_base = mul_4(c4);
+      [[unroll]] for (int c4i = 0; c4i < 4; ++c4i) {
+        const int c = c_base + c4i;
+        const int c_idx = c_idx_start + c;
+        const int s_idx = s_idx_start + s;
+        if (c_idx > s_idx + input_pos) {
+          tile.data[s][c4][c4i] = fp32_negative_infinity_val;
+        }
+      }
+    }
+  }
+}
+
+#endif // GEMMA_SDPA_FP32_ATTN_WEIGHT_TILE_STORE_GLSLH

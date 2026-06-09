@@ -17,7 +17,6 @@ $if IO_STORAGE == "buffer":
   #define INPUT_BUFFER
 $if K_CACHE_STORAGE == "buffer":
   #define K_CACHE_BUFFER
-
 $if HAS_MASK == 1:
   #define HAS_MASK
 $if HAS_MASK == 1 and IO_STORAGE == "buffer":
@@ -36,7 +35,7 @@ $if HAS_SOFTCAP == 1:
 
 #define NUM_WORKERS_PER_OUT 64
 
-${define_required_extensions(DTYPE)}
+${define_required_extensions(IO_STORAGE, DTYPE)}
 
 layout(std430) buffer;
 
@@ -60,53 +59,41 @@ $if HAS_SOFTCAP == 1:
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
-${layout_declare_spec_const(C, "float", "inv_scale", "1.0")}
-
 // Gemma4 exports Q/K in DHSB layout; helpers default to DSHB.
 #define Q_LAYOUT DHSB
 #define K_LAYOUT DHSB
 #include "sdpa_fp_q_projected_tile_load.glslh"
 #include "sdpa_fp_k_cache_tile_load.glslh"
-#include "linear_fp_output_tile_fp_compute.glslh"
-#include "sdpa_fp_attn_weight_tile_store.glslh"
+// iter136 fp32-attn-acc: fp32 accumulator + fp32 partial-sums for the
+// cooperative tree reduction (head_dim ~ 512 partials per worker, 64
+// workers per output → trees of 64 fp16 sums was a major drift point).
+#include "gemma_sdpa_fp32_attn_weight_tile_store.glslh"
 
-shared FPOutTile partial_sums[NUM_WORKERS_PER_OUT];
+shared SDPAFPOutTileFP32 partial_sums[NUM_WORKERS_PER_OUT];
 
 /*
- * See the tiled variant of this shader for the implemented behavior. This
- * shader is implements an optimization for cases where sequence length is 1; in
- * these cases, the matrix multiplication being performed is akin to gemv, which
- * benefits from using a co-operative algorithm for reduction. For this shader
- * the entire work group co-operates to compute one reduction output.
+ * Gemma4-flavored cooperative variant. See the tiled variant for the
+ * Gemma-vs-llama diff. This variant runs only when seq_len == 1 (decode).
  */
 
 void main() {
   const int worker_id = int(gl_LocalInvocationID.y);
 
   const int tile_idx_x = int(gl_GlobalInvocationID.x);
-  // idx along output num_q_heads dim
   const int q_h = int(gl_GlobalInvocationID.z);
 
-  // idx along the output context_len dim
   const int c = tile_idx_x * TILE_N;
   const int c4 = div_4(c);
 
-  // idx along the output seq_len dim. Note that for this shader seq_len will be
-  // 1.
   const int s = 0;
 
-  // texel size of head_dim, over which the dot product is accumulated
   const int D = q_projected_sizes.x;
   const int D4 = div_up_4(q_projected_sizes.x);
-  // number of Q heads
   const int Q_H = q_projected_sizes.y;
-  // sequence length
   const int S = q_projected_sizes.z;
   const int S_aligned = align_up_4(S);
 
-  // number of K/V heads
   const int KV_H = k_cache_sizes.y;
-  // Max context length
   const int C = k_cache_sizes.z;
   const int C4 = div_up_4(C);
 
@@ -115,113 +102,69 @@ void main() {
     kv_h = q_h / (Q_H / KV_H);
   }
 
-  // current context length
   const int context_len = input_pos + S;
   const int context_texel_len = div_up_4(context_len);
 
-  // bounds check
   if (c >= context_len || s >= S || q_h >= Q_H) {
     return;
   }
 
-  FPOutTile out_tile;
-  initialize(out_tile);
+  SDPAFPOutTileFP32 out_tile;
+  fp32_initialize(out_tile);
 
   FPInputTile q_tile;
   FPWeightTile w_tile;
 
 #ifdef HAS_MASK
-  bool tile_in_mask_region = false;
-#else
-  // If the tile is completely inside the mask region, then there is no need to
-  // compute the output tile. All the elements in the output tile can be set to
-  // negative infinity.
-  bool tile_in_mask_region = c > (input_pos + s + (TILE_M - 1));
-#endif
-  if (tile_in_mask_region) {
-    const VEC4_T negative_infinity_vec = VEC4_T(negative_infinity_val);
-    set_out_tile_to_vec(out_tile, negative_infinity_vec);
+  // With a caller mask, always run the matmul.
+  for (int d4 = worker_id; d4 < D4; d4 += NUM_WORKERS_PER_OUT) {
+    load_q_projected_tile_with_checks(q_tile, d4, s, q_h, D4, D, S, Q_H);
+    load_k_cache_tile_with_checks(w_tile, d4, c, kv_h, D4, D, context_len, C, KV_H);
+    fp32_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
   }
-  // Otherwise, need to actually compute output tile
-  else {
+#else
+  bool tile_in_mask_region = c > (input_pos + s + (TILE_M - 1));
+  if (tile_in_mask_region) {
+    fp32_set_out_tile_to_vec(out_tile, vec4(fp32_negative_infinity_val));
+  } else {
     for (int d4 = worker_id; d4 < D4; d4 += NUM_WORKERS_PER_OUT) {
-      load_q_projected_tile_with_checks(
-        q_tile,
-        d4,
-        s,
-        q_h,
-        D4,
-        D,
-        S,
-        Q_H);
-
-      load_k_cache_tile_with_checks(
-        w_tile,
-        d4,
-        c,
-        kv_h,
-        D4,
-        D,
-        context_len,
-        C,
-        KV_H);
-
-      fp_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
+      load_q_projected_tile_with_checks(q_tile, d4, s, q_h, D4, D, S, Q_H);
+      load_k_cache_tile_with_checks(w_tile, d4, c, kv_h, D4, D, context_len, C, KV_H);
+      fp32_accumulate_with_fp_weight(out_tile, q_tile, w_tile);
     }
   }
+#endif
 
   partial_sums[worker_id] = out_tile;
 
   memoryBarrierShared();
   barrier();
 
-  // Tree reduction to compute the overall result.
   for (int i = NUM_WORKERS_PER_OUT / 2; i > 0; i /= 2) {
     if (worker_id < i) {
-      accumulate_out_tile_with_out_tile(
+      fp32_accumulate_out_tile_with_out_tile(
           partial_sums[worker_id], partial_sums[worker_id + i]);
     }
     memoryBarrierShared();
     barrier();
   }
 
-  // Only the first thread will write out the result
   if (worker_id == 0) {
     out_tile = partial_sums[0];
-    // Apply scale and mask if the tile was not entirely in the mask region
-    if (!tile_in_mask_region) {
-      VEC4_T inv_scale_vec = VEC4_T(inv_scale);
 #ifdef HAS_MASK
-      apply_scale_and_mask_with_mask(
-        out_tile,
-        inv_scale_vec,
-        input_pos,
-        c,
-        s,
-        q_h,
-        S,
-        C4);
+    fp32_apply_mask_only_with_mask(out_tile, input_pos, c, s, q_h, S, C4);
 #ifdef HAS_SOFTCAP
-      // Audio extension (Phase 2B): tanh(x/cap) * cap, AFTER mask add.
-      apply_softcap_tile(out_tile, T(softcap), T(inv_softcap));
+    // Audio extension (Phase 2B): tanh(x/cap) * cap, AFTER mask add.
+    fp32_apply_softcap_tile(out_tile, softcap, inv_softcap);
 #endif
 #else
-      apply_scale_and_mask(
-        out_tile,
-        inv_scale_vec,
-        input_pos,
-        c,
-        s);
-#endif
+    bool tile_in_mask_region = c > (input_pos + s + (TILE_M - 1));
+    if (!tile_in_mask_region) {
+      fp32_apply_mask_only_causal(out_tile, input_pos, c, s);
     }
+#endif
 
-    store_attn_weight_tile_with_checks(
-      out_tile,
-      c4,
-      s,
-      q_h,
-      context_texel_len,
-      S_aligned,
-      Q_H);
+    fp32_store_attn_weight_tile_with_checks(
+      out_tile, c4, s, q_h, context_texel_len, S_aligned, Q_H);
   }
 }

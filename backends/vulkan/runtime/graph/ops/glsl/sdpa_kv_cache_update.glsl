@@ -83,7 +83,7 @@ void main() {
   const int c = s + input_pos; // idx along max_context_len dim
   const int C = cache_sizes.z;
 
-  if (d4 >= D4 || c >= C || h >= H) {
+  if (d4 >= D4 || c >= C || h >= H || s >= S) {
     return;
   }
 

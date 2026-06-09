@@ -21,8 +21,7 @@ namespace vkcompute {
 void resize_rms_norm_node(
     ComputeGraph* graph,
     const std::vector<ArgGroup>& args,
-    const std::vector<ValueRef>& extra_args) {
-  (void)extra_args;
+    const std::vector<ValueRef>& /*extra_args*/) {
   const ValueRef out = args.at(0).refs.at(0);
   const ValueRef in = args.at(1).refs.at(0);
   graph->virtual_resize(out, graph->sizes_of(in));
@@ -30,59 +29,67 @@ void resize_rms_norm_node(
 
 utils::uvec3 rms_norm_global_wg_size(
     ComputeGraph* graph,
-    const vkapi::ShaderInfo& shader,
+    const vkapi::ShaderInfo& /*shader*/,
     const std::vector<ArgGroup>& args,
-    const std::vector<ValueRef>& resize_args) {
-  (void)shader;
-  (void)resize_args;
+    const std::vector<ValueRef>& /*resize_args*/) {
+  // One workgroup per row. Number of rows = numel / hidden_size.
   const ValueRef in = args.at(1).refs.at(0);
-  const auto& sizes = graph->sizes_of(in);
+  const std::vector<int64_t> sizes = graph->sizes_of(in);
   const int64_t hidden = sizes.back();
   const int64_t numel = graph->numel_of(in);
-  const uint32_t num_rows = utils::safe_downcast<uint32_t>(numel / hidden);
-  return {1u, num_rows, 1u};
+  const int64_t num_rows = (hidden > 0) ? (numel / hidden) : 0;
+  return {1u, utils::safe_downcast<uint32_t>(num_rows), 1u};
 }
 
 utils::uvec3 rms_norm_local_wg_size(
-    ComputeGraph* graph,
-    const vkapi::ShaderInfo& shader,
-    const utils::uvec3& global_workgroup_size,
-    const std::vector<ArgGroup>& args,
-    const std::vector<ValueRef>& resize_args) {
-  (void)graph;
-  (void)shader;
-  (void)global_workgroup_size;
-  (void)args;
-  (void)resize_args;
+    ComputeGraph* /*graph*/,
+    const vkapi::ShaderInfo& /*shader*/,
+    const utils::uvec3& /*global_workgroup_size*/,
+    const std::vector<ArgGroup>& /*args*/,
+    const std::vector<ValueRef>& /*resize_args*/) {
+  // Must match NUM_WORKERS_PER_ROW in the shader.
   return {64u, 1u, 1u};
 }
 
 void add_rms_norm_node(
     ComputeGraph& graph,
     const ValueRef in,
+    const ValueRef normalized_shape,
     const ValueRef weight_data,
     const ValueRef eps,
     const ValueRef out) {
-  ValueRef arg_weight = prepack_standard_like(graph, weight_data, in);
+  const auto normalized_shape_dim =
+      graph.get_int_list(normalized_shape)->size();
+  if (normalized_shape_dim > 1) {
+    VK_THROW("rms_norm only supports normalized_shape with dim == 1");
+  }
+
+  const bool no_weight = graph.val_is_none(weight_data);
+
+  VK_CHECK_COND(
+      graph.is_buffer_storage(in) && graph.is_buffer_storage(out),
+      "Vulkan rms_norm only supports buffer storage");
 
   float epsilon = graph.extract_scalar<float>(eps);
 
-  const bool is_buffer = graph.is_buffer_storage(in);
+  VK_CHECK_COND(check_same_packed_dim(graph, in, out));
 
-  std::string kernel_name("rms_norm");
+  std::string kernel_name(
+      no_weight ? "rms_norm_no_weight_buffer" : "rms_norm_buffer");
   kernel_name.reserve(kShaderNameReserve);
-  add_storage_type_suffix(kernel_name, graph.storage_type_of(out));
   add_dtype_suffix(kernel_name, graph.dtype_of(out));
 
-  if (!is_buffer) {
-    VK_CHECK_COND(check_same_packed_dim(graph, in, out));
-    VK_CHECK_COND(
-        graph.packed_dim_of(in) == WHCN::kWidthDim,
-        "RmsNorm texture path requires width-packed input");
-  }
+  vkapi::ParamsBindList param_ubos = {
+      graph.meta_ubo(out),
+      graph.meta_ubo(in),
+  };
 
-  vkapi::ParamsBindList param_ubos = {graph.meta_ubo(out), graph.meta_ubo(in)};
-  vkapi::SpecVarList spec_constants = {graph.hashed_layout_of(in)};
+  std::vector<ValueRef> read_refs;
+  read_refs.push_back(in);
+  if (!no_weight) {
+    ValueRef arg_weight = prepack_standard_like(graph, weight_data, in);
+    read_refs.push_back(arg_weight);
+  }
 
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
@@ -90,26 +97,26 @@ void add_rms_norm_node(
       rms_norm_global_wg_size,
       rms_norm_local_wg_size,
       // Inputs and Outputs
-      {{out, vkapi::kWrite}, {{in, arg_weight}, vkapi::kRead}},
+      {{out, vkapi::kWrite}, {read_refs, vkapi::kRead}},
       // Shader params buffers
       param_ubos,
       // Push Constants
       {PushConstantDataInfo(&epsilon, sizeof(epsilon))},
       // Specialization Constants
-      spec_constants,
-      // Resize Args
       {},
+      // Resize Args
+      {normalized_shape},
       // Resizing Logic
       resize_rms_norm_node));
 }
 
 void rms_norm(ComputeGraph& graph, const std::vector<ValueRef>& args) {
-  // et_vk.rms_norm(input, weight, epsilon) -> output
-  return add_rms_norm_node(graph, args[0], args[1], args[2], args[3]);
+  // Signature: rms_norm(input, normalized_shape, weight, eps) -> out
+  return add_rms_norm_node(graph, args[0], args[1], args[2], args[3], args[4]);
 }
 
 REGISTER_OPERATORS {
-  VK_REGISTER_OP(et_vk.rms_norm.default, rms_norm);
+  VK_REGISTER_OP(aten.rms_norm.default, rms_norm);
 }
 
 } // namespace vkcompute
