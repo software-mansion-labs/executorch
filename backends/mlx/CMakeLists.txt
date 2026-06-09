@@ -23,6 +23,13 @@ include(${EXECUTORCH_ROOT}/tools/cmake/Utils.cmake)
 
 set(_common_compile_options -Wall -Werror -Wno-deprecated-declarations)
 
+# The Xcode generator (used for iOS builds) enables -Wshorten-64-to-32 by
+# default, which trips -Werror on 64->32 narrowing inside ExecuTorch core
+# headers (tensor_util.h, dim_order_util.h) included by the delegate. Suppress
+# it so the iOS arm64 build is not blocked by warnings in headers we don't own.
+# No-op on the plain macOS build where the flag isn't enabled.
+list(APPEND _common_compile_options -Wno-shorten-64-to-32)
+
 # Sanitizer flags (asan + ubsan) for security hardening — CI only. Enable via:
 # cmake --preset mlx-release -DEXECUTORCH_MLX_ENABLE_SANITIZERS=ON
 option(EXECUTORCH_MLX_ENABLE_SANITIZERS
@@ -215,7 +222,11 @@ set(MLX_METAL_JIT
 # Auto-apply patches to MLX submodule. Each patch is applied idempotently: `git
 # apply --check` tests whether the patch is still applicable (i.e. not yet
 # applied), and only then applies it.
-set(_mlx_patches "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_json.patch")
+set(_mlx_patches
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_json.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_ios_metallib.patch"
+    "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_ios_enable_metal.patch"
+)
 foreach(_patch IN LISTS _mlx_patches)
   if(EXISTS "${_patch}" AND EXISTS "${MLX_SOURCE_DIR}")
     get_filename_component(_patch_name "${_patch}" NAME)
@@ -235,6 +246,53 @@ foreach(_patch IN LISTS _mlx_patches)
     endif()
   endif()
 endforeach()
+
+# Select the Metal SDK used to compile mlx.metallib. The MLX submodule defaults
+# to the macOS SDK; for iOS builds (via ios.toolchain.cmake, which sets
+# PLATFORM) we must compile the metallib against the iphoneos / iphonesimulator
+# SDK and use the matching version-min flag. The metallib's version-min must use
+# the iOS deployment target (DEPLOYMENT_TARGET, set by ios.toolchain.cmake), NOT
+# CMAKE_OSX_DEPLOYMENT_TARGET — the latter stays at a macOS value (e.g. 12.0) so
+# host tools like flatc still build.
+set(_mlx_is_ios FALSE)
+if(PLATFORM AND PLATFORM MATCHES "^OS")
+  # iOS device (OS64, OS64COMBINED, ...)
+  set(MLX_METAL_SDK
+      "iphoneos"
+      CACHE STRING "" FORCE
+  )
+  set(MLX_METAL_VERSION_MIN_FLAG
+      "-mios-version-min"
+      CACHE STRING "" FORCE
+  )
+  set(MLX_METAL_DEPLOYMENT_TARGET
+      "${DEPLOYMENT_TARGET}"
+      CACHE STRING "" FORCE
+  )
+  set(_mlx_is_ios TRUE)
+elseif(PLATFORM AND PLATFORM MATCHES "^SIMULATOR")
+  # iOS simulator (SIMULATORARM64, SIMULATOR64, ...)
+  set(MLX_METAL_SDK
+      "iphonesimulator"
+      CACHE STRING "" FORCE
+  )
+  set(MLX_METAL_VERSION_MIN_FLAG
+      "-mios-simulator-version-min"
+      CACHE STRING "" FORCE
+  )
+  set(MLX_METAL_DEPLOYMENT_TARGET
+      "${DEPLOYMENT_TARGET}"
+      CACHE STRING "" FORCE
+  )
+  set(_mlx_is_ios TRUE)
+endif()
+if(_mlx_is_ios)
+  message(
+    STATUS
+      "MLX: compiling metallib with SDK '${MLX_METAL_SDK}', "
+      "version-min ${MLX_METAL_VERSION_MIN_FLAG}=${MLX_METAL_DEPLOYMENT_TARGET}"
+  )
+endif()
 
 # Add MLX subdirectory
 message(STATUS "Adding MLX from submodule: ${MLX_SOURCE_DIR}")
@@ -263,6 +321,15 @@ add_library(mlxdelegate ${_mlx_backend__srcs})
 
 # Ensure schema is generated before compiling
 add_dependencies(mlxdelegate mlx_schema)
+
+# Ensure mlx.metallib is built whenever the delegate is built. MLX wires this
+# via add_dependencies(mlx mlx-metallib), but the Xcode generator (used for
+# iOS/macOS framework builds) does not schedule that custom target unless it is
+# referenced as a build dependency of a "real" target. Depend on it explicitly
+# so the metallib is produced for every generator.
+if(TARGET mlx-metallib)
+  add_dependencies(mlxdelegate mlx-metallib)
+endif()
 
 # Add logging flag if enabled
 if(ET_MLX_ENABLE_OP_LOGGING)
