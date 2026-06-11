@@ -98,6 +98,20 @@ using NodeVariant = std::variant<
 >;
 
 // =============================================================================
+// for_each_tid: visit every Tid referenced by a node (AUTO-GENERATED)
+//
+// Used for tensor lifetime analysis: freeing temp slots after their last use
+// lets MLX reclaim intermediate buffers during graph evaluation.
+// =============================================================================
+
+{{FOR_EACH_TID_VISITORS}}
+
+template <typename F>
+inline void for_each_tid(const NodeVariant& node, F&& f) {
+  std::visit([&f](const auto& n) { for_each_tid(n, f); }, node);
+}
+
+// =============================================================================
 // Instruction
 // =============================================================================
 

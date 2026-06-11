@@ -173,6 +173,13 @@ struct ExecutionState {
   uint32_t output_end{0};
   uint32_t mutable_buffer_end{0};
 
+  // Per main-chain instruction: temp tensors whose last use is that
+  // instruction (computed at bind time). run_chain releases them as the
+  // lazy graph is built — otherwise every intermediate stays referenced
+  // until reset(), forcing MLX to keep all intermediate buffers alive
+  // through evaluation (peak = sum of all temps instead of the live set).
+  std::vector<std::vector<Tid>> main_chain_temp_free;
+
   void bind(
       const MLXProgram& prog,
       const ConstantData& const_data,
@@ -212,6 +219,63 @@ struct ExecutionState {
     input_end = static_cast<uint32_t>(ie);
     output_end = static_cast<uint32_t>(oe);
     mutable_buffer_end = static_cast<uint32_t>(me);
+
+    compute_temp_lifetimes(prog);
+  }
+
+  // For each main-chain instruction, record the temp tensors whose last
+  // reference is that instruction. Tids inside scan body chains are
+  // attributed to the enclosing SCAN instruction (the body may run many
+  // times, so its temps are only safe to release after the scan finishes).
+  void compute_temp_lifetimes(const MLXProgram& prog) {
+    main_chain_temp_free.clear();
+    if (prog.main_chain_idx >= prog.instruction_chains.size()) {
+      return;
+    }
+    const auto& main = prog.instruction_chains[prog.main_chain_idx];
+    std::unordered_map<uint32_t, size_t> last_use;
+
+    // Worklist of (instruction, top-level index) covering nested scan bodies.
+    std::vector<std::pair<const Instruction*, size_t>> work;
+    for (size_t i = 0; i < main.size(); ++i) {
+      work.emplace_back(&main[i], i);
+    }
+    while (!work.empty()) {
+      const Instruction* ins = work.back().first;
+      const size_t i = work.back().second;
+      work.pop_back();
+      for_each_tid(ins->node, [&](Tid t) {
+        if (t.idx >= mutable_buffer_end) {
+          auto it = last_use.find(t.idx);
+          if (it == last_use.end() || it->second < i) {
+            last_use[t.idx] = i;
+          }
+        }
+      });
+      if (ins->op == OpCode::SCAN) {
+        const auto& sn = std::get<ScanNode>(ins->node);
+        if (sn.body_chain_idx >= 0 &&
+            static_cast<size_t>(sn.body_chain_idx) <
+                prog.instruction_chains.size()) {
+          for (const auto& body_ins :
+               prog.instruction_chains[static_cast<size_t>(
+                   sn.body_chain_idx)]) {
+            work.emplace_back(&body_ins, i);
+          }
+        }
+      }
+    }
+
+    main_chain_temp_free.assign(main.size(), {});
+    for (const auto& [tid_idx, i] : last_use) {
+      main_chain_temp_free[i].push_back(Tid{tid_idx});
+    }
+  }
+
+  // Release a temp tensor slot (drops this state's reference; the lazy
+  // graph keeps its own references to anything still needed).
+  inline void free_temp(Tid id) {
+    tensors[tensor_index(id)] = std::nullopt;
   }
 
   // Check if a tensor ID is a mutable buffer

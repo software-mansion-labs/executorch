@@ -1588,11 +1588,13 @@ inline void exec_floor_divide(
   const array& b = st.const_tensor_ref(n.b);
 
   if (!issubdtype(a.dtype(), inexact)) {
-    // mlx::floor_divide for integer types uses C++ truncation toward zero,
-    // but PyTorch floor_divide floors toward negative infinity.
-    // Adjust: floor_div(a, b) = trunc_div(a, b) - ((a % b != 0) & (sign(a) !=
-    // sign(b)))
-    auto quot = divide(a, b, s);
+    // PyTorch integer floor_divide floors toward negative infinity. Compute it
+    // via trunc-div plus a -1 correction when the signs differ and there is a
+    // remainder. `divide` on integers truncates toward zero in MLX, so use it
+    // for the trunc quotient (not as a float divide). eval() forces the result
+    // to a concrete array so downstream ops that consume it more than once do
+    // not re-trace and re-fuse the correction subgraph.
+    auto trunc_q = floor_divide(a, b, s); // integer trunc toward zero
     auto rem = remainder(a, b, s);
     auto zero = array(0, a.dtype());
     auto has_rem = not_equal(rem, zero, s);
@@ -1600,7 +1602,9 @@ inline void exec_floor_divide(
     auto b_neg = less(b, zero, s);
     auto signs_differ = not_equal(a_neg, b_neg, s);
     auto adjust = logical_and(has_rem, signs_differ, s);
-    st.set_tensor(n.out, subtract(quot, astype(adjust, a.dtype(), s), s));
+    auto result = subtract(trunc_q, astype(adjust, a.dtype(), s), s);
+    eval(result);
+    st.set_tensor(n.out, result);
   } else {
     st.set_tensor(n.out, floor_divide(a, b, s));
   }
@@ -1845,6 +1849,12 @@ class Interpreter {
           std::to_string(prog.instruction_chains.size()) + ")");
     }
     const auto& chain = prog.instruction_chains[chain_idx];
+    // Release temps at their last use while building the main chain's lazy
+    // graph, so MLX can reclaim intermediate buffers during evaluation.
+    // Scan body chains are excluded: their temps are attributed to the
+    // enclosing SCAN instruction in the main chain.
+    const bool free_temps = chain_idx == prog.main_chain_idx &&
+        st.main_chain_temp_free.size() == chain.size();
     size_t idx = 0;
     for (const auto& instr : chain) {
       st.begin_op(idx, op_name(instr.op));
@@ -1854,6 +1864,11 @@ class Interpreter {
         dispatch(instr, st, stream);
       }
       st.end_op();
+      if (free_temps) {
+        for (Tid t : st.main_chain_temp_free[idx]) {
+          st.free_temp(t);
+        }
+      }
       ++idx;
     }
   }

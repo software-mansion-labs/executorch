@@ -986,6 +986,28 @@ def generate_cpp_loader_h(schema: FBSSchema) -> str:
         comma = "," if i < len(op_nodes) - 1 else ""
         variant_lines.append(f"    {table.name}{comma}")
 
+    visitor_lines = []
+    for table in op_nodes:
+        body = []
+        for fld in table.fields:
+            if fld.name.endswith("_is_set"):
+                continue
+            stmt = _emit_tid_visit(fld)
+            if stmt:
+                body.append(f"  {stmt}")
+        visitor_lines.append("template <typename F>")
+        if body:
+            visitor_lines.append(
+                f"inline void for_each_tid(const {table.name}& n, F&& f) {{"
+            )
+            visitor_lines.extend(body)
+            visitor_lines.append("}")
+        else:
+            visitor_lines.append(
+                f"inline void for_each_tid(const {table.name}&, F&&) {{}}"
+            )
+        visitor_lines.append("")
+
     # Read template and fill placeholders
     header = "\n".join(_file_header("//")) + "\n//\n"
     tmpl = LOADER_H_TMPL.read_text()
@@ -993,7 +1015,24 @@ def generate_cpp_loader_h(schema: FBSSchema) -> str:
     result = result.replace("{{OPCODE_ENUM_VALUES}}", "\n".join(enum_lines))
     result = result.replace("{{OP_NAME_CASES}}", "\n".join(name_lines))
     result = result.replace("{{NODE_VARIANT_TYPES}}", "\n".join(variant_lines))
+    result = result.replace("{{FOR_EACH_TID_VISITORS}}", "\n".join(visitor_lines))
     return header + result
+
+
+def _emit_tid_visit(fld: FBSField) -> Optional[str]:
+    """Return the for_each_tid statement for a field, or None if it holds no Tid."""
+    t = fld.type_str
+    if t == "Tid":
+        if fld.required:
+            return f"f(n.{fld.name});"
+        return f"if (n.{fld.name}) f(*n.{fld.name});"
+    if t == "[Tid]":
+        return f"for (const auto& t : n.{fld.name}) f(t);"
+    if t == "VidOrTid":
+        return f"if (!n.{fld.name}.is_vid) f(n.{fld.name}.tid);"
+    if t == "IntOrVidOrTid":
+        return f"if (n.{fld.name}.kind == 2) f(n.{fld.name}.tid);"
+    return None
 
 
 def _fbs_type_to_cpp(
