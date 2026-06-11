@@ -288,6 +288,30 @@ def _export_with_custom_components(
     for sym, constraint in exported_program.range_constraints.items():
         logger.info(f"  Range constraint: {sym}: {constraint}")
 
+    # Metadata methods consumed by the ExecuTorch LLM runner (e.g. via
+    # react-native-executorch's TextRunner): EOS/BOS ids, max seq len, and the
+    # KV-cache flag. Embedded as constant_methods so the runner can read them
+    # from the .pte. Values come from the model's generation/text config.
+    gen_cfg = model.generation_config
+    text_cfg = model.config.get_text_config()
+    eos_ids = gen_cfg.eos_token_id
+    if eos_ids is None:
+        eos_ids = getattr(text_cfg, "eos_token_id", None)
+    if isinstance(eos_ids, int):
+        eos_ids = [eos_ids]
+    bos_id = gen_cfg.bos_token_id
+    if bos_id is None:
+        bos_id = getattr(text_cfg, "bos_token_id", 1)
+    llm_metadata = {
+        "get_eos_ids": list(eos_ids) if eos_ids else [],
+        "get_bos_id": int(bos_id),
+        "get_max_seq_len": int(effective_cache_len),
+        "get_max_context_len": int(effective_cache_len),
+        "use_kv_cache": True,
+        "enable_dynamic_shape": True,
+    }
+    logger.info(f"Embedding LLM runner metadata: {llm_metadata}")
+
     logger.info("Delegating to MLX backend...")
     edge_config = EdgeCompileConfig(
         _check_ir_validity=False,
@@ -299,6 +323,7 @@ def _export_with_custom_components(
         transform_passes=get_default_passes(),
         partitioner=[MLXPartitioner()],
         compile_config=edge_config,
+        constant_methods=llm_metadata,
     )
 
     logger.info("Exporting to ExecuTorch...")
