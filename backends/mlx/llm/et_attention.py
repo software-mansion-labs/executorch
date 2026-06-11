@@ -75,13 +75,16 @@ class MLXAttentionMHA(Attention):
         self.use_qk_norm = args.use_qk_norm
         self.qk_norm_before_rope = args.qk_norm_before_rope
         self.enable_dynamic_shape = args.enable_dynamic_shape
+        self.use_q_gate = getattr(args, "use_q_gate", False)
 
         if self.use_qk_norm:
             self.q_norm_fn = RMSNorm(self.head_dim, eps=args.norm_eps)
             self.k_norm_fn = RMSNorm(self.head_dim, eps=args.norm_eps)
 
         self.wq = nn.Linear(
-            self.dim, self.n_heads * self.head_dim, bias=self.attention_qkv_bias
+            self.dim,
+            self.n_heads * self.head_dim * (2 if self.use_q_gate else 1),
+            bias=self.attention_qkv_bias,
         )
         self.wk = nn.Linear(
             self.dim, self.n_kv_heads * self.head_dim, bias=self.attention_qkv_bias
@@ -144,6 +147,8 @@ class MLXAttentionMHA(Attention):
         instance.use_qk_norm = other.use_qk_norm
         instance.qk_norm_before_rope = other.qk_norm_before_rope
         instance.enable_dynamic_shape = other.enable_dynamic_shape
+        # Qwen3.5 q-gated attention (q_proj packs query+gate; output gated).
+        instance.use_q_gate = getattr(other, "use_q_gate", False)
 
         # Share weight references
         instance.wq = other.wq
@@ -190,7 +195,14 @@ class MLXAttentionMHA(Attention):
         bsz, seqlen, _ = x.shape
 
         q, k, v = self.wq(x), self.wk(x), self.wv(x)
-        q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        gate = None
+        if self.use_q_gate:
+            q_and_gate = q.view(bsz, seqlen, self.n_local_heads, self.head_dim * 2)
+            q, gate = torch.chunk(q_and_gate, 2, dim=-1)
+            q = q.reshape(bsz, seqlen, self.n_local_heads, self.head_dim)
+            gate = gate.reshape(bsz, seqlen, -1)
+        else:
+            q = q.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         k = k.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         v = v.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
 
@@ -249,4 +261,6 @@ class MLXAttentionMHA(Attention):
         )
 
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        if self.use_q_gate:
+            output = output * torch.sigmoid(gate)
         return self.wo(output), None
