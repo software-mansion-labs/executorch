@@ -646,6 +646,54 @@ for _targets, _node_cls, _op_name, _max_args in _REDUCTION_OPS:
     )
 
 
+_DIM_ARG_REDUCTION_OPS: List[Tuple[Any, Any, Any, str]] = [
+    (torch.ops.aten.max.dim, MaxNode, ArgmaxNode, "aten.max.dim"),
+    (torch.ops.aten.min.dim, MinNode, ArgminNode, "aten.min.dim"),
+]
+
+
+def _make_dim_reduction_handler(value_cls: Any, index_cls: Any, op_name: str):
+    """Create a handler for max.dim/min.dim: (x, dim, keepdim=False) -> (values, indices)."""
+
+    def handler(P: MLXProgramBuilder, n: Node):
+        args = P.args(n)
+        require_args(args, 2, 3, op_name)
+        require_kwargs(P.kwargs(n), set(), op_name)
+        x, dim = args[0:2]
+        keepdim = args[2] if len(args) > 2 else False
+        output_slots = P.make_or_get_slots(n)
+        P.emit(
+            value_cls(
+                x=P.slot_to_tid(x),
+                out=P.slot_to_tid(output_slots[0]),
+                axes=[dim],
+                keepdims=keepdim,
+            )
+        )
+        if 1 in used_getitem_indices(n):
+            P.emit(
+                index_cls(
+                    x=P.slot_to_tid(x),
+                    out=P.slot_to_tid(output_slots[1]),
+                    axis=dim,
+                    keepdims=keepdim,
+                )
+            )
+        return output_slots
+
+    handler.__name__ = f"_{op_name.replace('.', '_')}_handler"
+    handler.__doc__ = (
+        f"Handle {op_name} (dim-arg reduction returning values + indices)."
+    )
+    return handler
+
+
+for _target, _value_cls, _index_cls, _op_name in _DIM_ARG_REDUCTION_OPS:
+    REGISTRY.register(target=[_target])(
+        _make_dim_reduction_handler(_value_cls, _index_cls, _op_name)
+    )
+
+
 _FULL_OPS: List[Tuple[List[Any], str, Optional[float]]] = [
     ([torch.ops.aten.full.default], "aten.full", None),
     ([torch.ops.aten.zeros.default], "aten.zeros", 0.0),
@@ -1914,6 +1962,189 @@ def _index_select_handler(P: MLXProgramBuilder, n: Node) -> Slot:
             index=IntOrVidOrTid.from_tid(P.slot_to_tid(indices)),
             out=P.slot_to_tid(out),
             axis=dim,
+        )
+    )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.gather.default])
+def _gather_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.gather: gather(input, dim, index) where index has the same
+    rank as input and selects along dim. This is mlx take_along_axis.
+    """
+    args = P.args(n)
+    require_args(args, 3, 3, "aten.gather")
+    require_kwargs(P.kwargs(n), {"sparse_grad"}, "aten.gather")
+    x, dim, index = args
+    out = P.make_or_get_slot(n)
+    P.emit(
+        TakeAlongAxisNode(
+            x=P.slot_to_tid(x),
+            indices=P.slot_to_tid(index),
+            out=P.slot_to_tid(out),
+            axis=dim,
+        )
+    )
+    return out
+
+
+@REGISTRY.register(
+    target=[torch.ops.aten.bitwise_or.Tensor, torch.ops.aten.bitwise_or.Scalar]
+)
+def _bitwise_or_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.bitwise_or for boolean tensors via logical_or.
+
+    Gemma4's audio mask uses bitwise_or on bool tensors, which is identical
+    to logical_or. Only bool inputs are supported.
+    """
+    args = P.args(n)
+    require_args(args, 2, 2, "aten.bitwise_or")
+    require_kwargs(P.kwargs(n), set(), "aten.bitwise_or")
+    a, b = args
+    if n.meta["val"].dtype != torch.bool:
+        raise ValueError("aten.bitwise_or only supported for bool tensors")
+    out = P.make_or_get_slot(n)
+    P.emit(
+        LogicalOrNode(
+            a=P.slot_to_tid(a),
+            b=P.slot_to_tid(b),
+            out=P.slot_to_tid(out),
+        )
+    )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.aten.unfold_copy.default])
+def _unfold_copy_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """Handle aten.unfold_copy: sliding windows of `size` along `dimension`,
+    stepping by `step`, appended as a new trailing dimension.
+
+    unfold(dim, size, step) on input of shape [..., L, ...] produces
+    [..., n_windows, ...rest, size] where n_windows = (L - size) // step + 1.
+    Lowered to as_strided over the (channels-last, row-major) input.
+    """
+    args = P.args(n)
+    require_args(args, 4, 4, "aten.unfold_copy")
+    require_kwargs(P.kwargs(n), set(), "aten.unfold_copy")
+    x, dim, size, step = args
+    require_static_int(size, "size", "aten.unfold_copy")
+    require_static_int(step, "step", "aten.unfold_copy")
+
+    in_val = n.args[0].meta["val"]
+    ndim = in_val.dim()
+    if dim < 0:
+        dim += ndim
+
+    in_sizes = list(in_val.shape)
+    # Dims after `dim` must be static (their product is the stride of `dim`).
+    if not all(isinstance(s, int) for s in in_sizes[dim + 1 :]):
+        raise ValueError(
+            "aten.unfold_copy requires static sizes after the unfold dimension"
+        )
+
+    # Element stride of `dim` and of every dim after it is a static product of
+    # trailing (static) sizes. Dims BEFORE `dim` have strides that include the
+    # (possibly dynamic) length of `dim`, so they must be computed dynamically.
+    stride_after: List[int] = [1] * ndim
+    acc = 1
+    for d in reversed(range(dim, ndim)):
+        stride_after[d] = acc
+        acc *= in_sizes[d] if isinstance(in_sizes[d], int) else 1
+    dim_elem_stride = stride_after[dim]  # static: product of sizes after `dim`
+
+    # n_windows = (L - size) // step + 1.
+    length = in_sizes[dim]
+    if isinstance(length, int):
+        n_windows: Union[int, Slot] = (length - size) // step + 1
+        length_iov = IntOrVid.from_literal(length)
+    else:
+        # (L - size + step) // step  ==  (L - size) // step + 1  (step | (L-size))
+        _, len_slot = P.make_tmp_value_slot()
+        P.emit(SymSizeNode(a=P.slot_to_tid(x), dim=dim, out=P.slot_to_vid(len_slot)))
+        length_iov = IntOrVid.from_vid(P.slot_to_vid(len_slot))
+        _, num_slot = P.make_tmp_value_slot()
+        P.emit(
+            SubtractIntNode(
+                a=IntOrVid.from_vid(P.slot_to_vid(len_slot)),
+                b=IntOrVid.from_literal(size - step),
+                out=P.slot_to_vid(num_slot),
+            )
+        )
+        _, win_slot = P.make_tmp_value_slot()
+        P.emit(
+            FloorDivideIntNode(
+                a=IntOrVid.from_vid(P.slot_to_vid(num_slot)),
+                b=IntOrVid.from_literal(step),
+                out=P.slot_to_vid(win_slot),
+            )
+        )
+        n_windows = win_slot
+
+    def _iov(v: Union[int, Slot]) -> "IntOrVid":
+        if isinstance(v, int):
+            return IntOrVid.from_literal(v)
+        return IntOrVid.from_vid(P.slot_to_vid(v))
+
+    # Strides for dims before `dim` include the full extent of `dim` (= length *
+    # dim_elem_stride). Compute that product dynamically when length is dynamic.
+    if isinstance(length, int):
+        before_base: Union[int, Slot] = length * dim_elem_stride
+    else:
+        _, base_slot = P.make_tmp_value_slot()
+        P.emit(
+            MultiplyIntNode(
+                a=length_iov,
+                b=IntOrVid.from_literal(dim_elem_stride),
+                out=P.slot_to_vid(base_slot),
+            )
+        )
+        before_base = base_slot
+
+    # Output shape: in_sizes with dim replaced by n_windows, then `size` appended.
+    out_shape: List[Any] = list(in_sizes)
+    out_shape[dim] = n_windows
+    out_shape.append(size)
+
+    # Strides:
+    #   dims < dim : product of (their trailing static sizes) * before_base
+    #   dim        : dim_elem_stride * step  (advance one window)
+    #   dims > dim : dim_elem_stride for that dim (static)
+    #   new axis   : dim_elem_stride          (consecutive within window)
+    out_strides_iov: List[IntOrVid] = []
+    for d in range(ndim):
+        if d < dim:
+            # product of sizes in (d, dim) exclusive, times the full `dim` extent
+            inner = 1
+            for dd in range(d + 1, dim):
+                inner *= in_sizes[dd]  # all static (only `dim` is dynamic)
+            if isinstance(before_base, int):
+                out_strides_iov.append(IntOrVid.from_literal(inner * before_base))
+            elif inner == 1:
+                out_strides_iov.append(_iov(before_base))
+            else:
+                _, sl = P.make_tmp_value_slot()
+                P.emit(
+                    MultiplyIntNode(
+                        a=_iov(before_base),
+                        b=IntOrVid.from_literal(inner),
+                        out=P.slot_to_vid(sl),
+                    )
+                )
+                out_strides_iov.append(_iov(sl))
+        elif d == dim:
+            out_strides_iov.append(IntOrVid.from_literal(dim_elem_stride * step))
+        else:
+            out_strides_iov.append(IntOrVid.from_literal(stride_after[d]))
+    out_strides_iov.append(IntOrVid.from_literal(dim_elem_stride))
+
+    out = P.make_or_get_slot(n)
+    P.emit(
+        AsStridedNode(
+            x=P.slot_to_tid(x),
+            out=P.slot_to_tid(out),
+            shape=[_iov(s) for s in out_shape],
+            strides=out_strides_iov,
+            offset=0,
         )
     )
     return out

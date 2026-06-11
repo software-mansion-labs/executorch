@@ -6841,3 +6841,192 @@ class NVFP4QuantizedLinearTest(OpTestCase):
             self.batch_size, self.seq_len, self.in_features, dtype=self.dtype
         )
         return (x,)
+
+
+class MaxDimModel(nn.Module):
+    """Model that returns max values along a dim (indices discarded)."""
+
+    def __init__(self, dim: int, keepdim: bool):
+        super().__init__()
+        self.dim = dim
+        self.keepdim = keepdim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.max(x, dim=self.dim, keepdim=self.keepdim).values
+
+
+@register_test
+class MaxDimTest(OpTestCase):
+    """Test case for torch.max(dim) -> MaxNode (aten.max.dim, values only)."""
+
+    name = "max_dim"
+
+    def __init__(self, shape=(4, 8, 16), dim: int = 1, keepdim: bool = False):
+        self.shape = shape
+        self.dim = dim
+        self.keepdim = keepdim
+        self.name = f"max_dim{dim}_keep{int(keepdim)}"
+
+    @classmethod
+    def get_test_configs(cls) -> List["MaxDimTest"]:
+        return [
+            cls(shape=(4, 8, 16), dim=0, keepdim=False),
+            cls(shape=(4, 8, 16), dim=1, keepdim=True),
+            cls(shape=(4, 8, 16), dim=-1, keepdim=False),
+        ]
+
+    def create_model(self) -> nn.Module:
+        return MaxDimModel(self.dim, self.keepdim)
+
+    def create_inputs(self) -> Tuple[torch.Tensor, ...]:
+        return (torch.randn(self.shape),)
+
+
+class GatherModel(nn.Module):
+    """Model that gathers along a dim with a same-rank index tensor."""
+
+    def __init__(self, dim: int, index: torch.Tensor):
+        super().__init__()
+        self.dim = dim
+        self.register_buffer("index", index)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.gather(x, self.dim, self.index)
+
+
+@register_test
+class GatherTest(OpTestCase):
+    """Test case for torch.gather -> TakeAlongAxisNode (aten.gather.default)."""
+
+    name = "gather"
+
+    def __init__(self, shape=(2, 4, 6), dim: int = -1):
+        self.shape = shape
+        self.dim = dim
+        self.name = f"gather_dim{dim}"
+
+    @classmethod
+    def get_test_configs(cls) -> List["GatherTest"]:
+        return [
+            cls(shape=(2, 4, 6), dim=-1),
+            cls(shape=(2, 4, 6), dim=1),
+            cls(shape=(5, 3), dim=0),
+        ]
+
+    def create_model(self) -> nn.Module:
+        dim = self.dim % len(self.shape)
+        index = torch.randint(0, self.shape[dim], self.shape)
+        return GatherModel(self.dim, index)
+
+    def create_inputs(self) -> Tuple[torch.Tensor, ...]:
+        return (torch.randn(self.shape),)
+
+
+class BitwiseOrModel(nn.Module):
+    """Model that bitwise-ORs two boolean masks."""
+
+    def forward(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return torch.bitwise_or(a > 0, b > 0)
+
+
+@register_test
+class BitwiseOrTest(OpTestCase):
+    """Test case for torch.bitwise_or on bool -> LogicalOrNode."""
+
+    name = "bitwise_or"
+
+    def __init__(self, shape=(4, 8)):
+        self.shape = shape
+
+    @classmethod
+    def get_test_configs(cls) -> List["BitwiseOrTest"]:
+        return [cls(shape=(4, 8)), cls(shape=(3, 5, 7))]
+
+    def create_model(self) -> nn.Module:
+        return BitwiseOrModel()
+
+    def create_inputs(self) -> Tuple[torch.Tensor, ...]:
+        return (torch.randn(self.shape), torch.randn(self.shape))
+
+
+class UnfoldModel(nn.Module):
+    """Model that unfolds (sliding windows) along a dimension."""
+
+    def __init__(self, dim: int, size: int, step: int):
+        super().__init__()
+        self.dim = dim
+        self.size = size
+        self.step = step
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.unfold(self.dim, self.size, self.step).contiguous()
+
+
+@register_test
+class UnfoldTest(OpTestCase):
+    """Test case for Tensor.unfold -> AsStridedNode (aten.unfold_copy.default)."""
+
+    name = "unfold"
+
+    def __init__(
+        self,
+        shape=(1, 100, 8, 128),
+        dim: int = 1,
+        size: int = 24,
+        step: int = 12,
+        dynamic: bool = False,
+    ):
+        self.shape = shape
+        self.dim = dim
+        self.size = size
+        self.step = step
+        self.dynamic = dynamic
+        self.name = f"unfold_dim{dim}_s{size}_st{step}{'_dyn' if dynamic else ''}"
+
+    @classmethod
+    def get_test_configs(cls) -> List["UnfoldTest"]:
+        return [
+            # Non-overlapping
+            cls(shape=(2, 12, 4), dim=1, size=3, step=3),
+            # Overlapping (the Gemma4 audio case: size>step)
+            cls(shape=(1, 96, 8, 16), dim=1, size=24, step=12),
+            # Dynamic dim, overlapping
+            cls(shape=(1, 96, 8, 16), dim=1, size=24, step=12, dynamic=True),
+        ]
+
+    def create_model(self) -> nn.Module:
+        return UnfoldModel(self.dim, self.size, self.step)
+
+    def create_inputs(self) -> Tuple[torch.Tensor, ...]:
+        return (torch.randn(self.shape),)
+
+    def get_dynamic_shapes(self) -> Optional[Dict]:
+        if not self.dynamic:
+            return None
+        # number of windows steps by `step`; keep divisibility (L-size) % step == 0
+        win = Dim("win", min=2, max=32)
+        length = self.step * win + (self.size - self.step)
+        return {"x": {self.dim: length}}
+
+
+class FloorDivDualConsumeModel(nn.Module):
+    """floor-div output consumed by two selects then combined (Gemma4 pooler)."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = torch.div(x.clamp(min=0), 3, rounding_mode="floor")
+        return (y[..., 0] + 9 * y[..., 1]).long()
+
+
+@register_test
+class FloorDivDualConsumeTest(OpTestCase):
+    """Regression: integer floor-div output consumed twice must not corrupt."""
+
+    name = "floordiv_dual_consume"
+    rtol = 0
+    atol = 0
+
+    def create_model(self) -> nn.Module:
+        return FloorDivDualConsumeModel()
+
+    def create_inputs(self) -> Tuple[torch.Tensor, ...]:
+        return (torch.randint(-5, 60, (1, 300, 2)),)
