@@ -18,6 +18,12 @@ add_compile_options(
 set_overridable_option(BUILD_TESTING OFF)
 set_overridable_option(EXECUTORCH_BUILD_XNNPACK ON)
 set_overridable_option(EXECUTORCH_BUILD_COREML ON)
+# MLX requires deployment target >= 14.0, but our macOS preset still
+# ships at 12.0. Enable MLX only for iOS / iOS Simulator until the macOS
+# preset bumps its floor.
+if(${CMAKE_SYSTEM_NAME} MATCHES "iOS")
+  set_overridable_option(EXECUTORCH_BUILD_MLX ON)
+endif()
 set_overridable_option(EXECUTORCH_BUILD_MPS ON)
 set_overridable_option(EXECUTORCH_XNNPACK_ENABLE_WEIGHT_CACHE ON)
 set_overridable_option(EXECUTORCH_XNNPACK_SHARED_WORKSPACE ON)
