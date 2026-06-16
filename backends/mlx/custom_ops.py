@@ -279,6 +279,41 @@ def rope_fake(
     return x.new_empty(x.shape)
 
 
+@torch.library.custom_op("mlx::rope_t", mutates_args=())
+def rope_t(
+    x: Tensor,
+    dims: int,
+    pos: Tensor,  # 0-d Long tensor: starting position
+    traditional: bool = False,
+    base: float = 500000.0,
+    scale: float = 1.0,
+    freqs: Optional[Tensor] = None,
+) -> Tensor:
+    """RoPE with the starting position passed as a tensor.
+
+    Identical math to mlx::rope, but the offset stays a tensor through
+    torch.export so the lowered graph contains no data-dependent scalar
+    extraction — a requirement for wrapping execution in mx::compile
+    (the MLX runtime already supports tensor offsets via fast::rope's
+    array-offset overload).
+    """
+    return torch.ops.mlx.rope(x, dims, int(pos.item()), traditional, base, scale, freqs)
+
+
+@torch.library.register_fake("mlx::rope_t")
+def rope_t_fake(
+    x: Tensor,
+    dims: int,
+    pos: Tensor,
+    traditional: bool = False,
+    base: float = 500000.0,
+    scale: float = 1.0,
+    freqs: Optional[Tensor] = None,
+) -> Tensor:
+    """Fake implementation for tracing."""
+    return x.new_empty(x.shape)
+
+
 @torch.library.custom_op("mlx::gather_mm", mutates_args=())
 def gather_mm(
     a: Tensor,  # [..., M, K]

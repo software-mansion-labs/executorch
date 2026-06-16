@@ -195,6 +195,17 @@ class KVCache(nn.Module):
             Tuple of (k_cache, v_cache) - slices of the FULL cache buffers
         """
 
+        if getattr(self, "use_index_copy", False) and isinstance(
+            input_pos, torch.Tensor
+        ):
+            # Compile-friendly path: positions stay a tensor end-to-end
+            # (index_copy lowers to IndexCopyNode with a tensor index), so the
+            # lowered graph has no data-dependent scalar extraction and can be
+            # wrapped in mx::compile.
+            self.k_cache.index_copy_(2, input_pos, k_val)
+            self.v_cache.index_copy_(2, input_pos, v_val)
+            return self.k_cache[:, :, :, :], self.v_cache[:, :, :, :]
+
         if isinstance(input_pos, torch.Tensor):
             start_pos = input_pos[0].item()
             seq_len = k_val.size(2)
@@ -287,6 +298,16 @@ class RingBufferKVCache(nn.Module):
         Returns:
             Tuple of (k_cache, v_cache) — full ring buffer slices
         """
+        if getattr(self, "use_index_copy", False) and isinstance(
+            input_pos, torch.Tensor
+        ):
+            # Compile-friendly ring write: slot = pos % buffer_size as a
+            # tensor op — no scalar extraction (see LinearKVCache.update).
+            ring_pos = torch.remainder(input_pos, self.buffer_size)
+            self.k_cache.index_copy_(2, ring_pos, k_val)
+            self.v_cache.index_copy_(2, ring_pos, v_val)
+            return self.k_cache[:, :, :, :], self.v_cache[:, :, :, :]
+
         if isinstance(input_pos, torch.Tensor):
             start_pos = input_pos[0].item()
             seq_len = k_val.size(2)

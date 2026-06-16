@@ -2583,7 +2583,9 @@ class HFStaticCacheSliceTest(OpTestCase):
         "AddIntNode": 3,
         "SliceUpdateNode": 2,
         "IdCopyNode": 2,
-        "SliceNode": 2,
+        # static-index selects lower to slice+squeeze views
+        "SliceNode": 4,
+        "SqueezeNode": 2,
     }
 
     def __init__(
@@ -5514,7 +5516,9 @@ class CustomSDPATest(OpTestCase):
     expected_node_counts = {
         "SdpaNode": 1,
         "SliceUpdateNode": 2,
-        "SliceNode": 2,
+        # static-index selects (input_pos[0]) lower to slice+squeeze views
+        "SliceNode": 4,
+        "SqueezeNode": 2,
         "IdCopyNode": 2,
         "ExpandDimsNode": 0,
     }

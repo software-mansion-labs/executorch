@@ -2231,6 +2231,34 @@ def _select_handler(P: MLXProgramBuilder, n: Node) -> Slot:
     require_kwargs(P.kwargs(n), set(), "aten.select_copy.int")
     x, dim, index = args
     out = P.make_or_get_slot(n)
+
+    # Static index: lower to slice + squeeze, which are views in MLX (zero
+    # GPU dispatches), instead of a gather kernel. Per-layer selects from
+    # stacked tensors (e.g. PLE) otherwise cost one gather per layer.
+    in_meta = n.args[0].meta.get("val") if isinstance(n.args[0], Node) else None
+    if isinstance(index, int) and in_meta is not None:
+        dim_size = in_meta.shape[dim]
+        if isinstance(dim_size, int) and dim_size > 0:
+            idx = index if index >= 0 else index + dim_size
+            _, sliced = P.make_tmp_slot()
+            P.emit(
+                SliceNode(
+                    x=P.slot_to_tid(x),
+                    out=P.slot_to_tid(sliced),
+                    axis=IntOrVid.from_literal(dim),
+                    start=IntOrVid.from_literal(idx),
+                    stop=IntOrVid.from_literal(idx + 1),
+                )
+            )
+            P.emit(
+                SqueezeNode(
+                    x=P.slot_to_tid(sliced),
+                    out=P.slot_to_tid(out),
+                    dims=[dim],
+                )
+            )
+            return out
+
     P.emit(
         TakeNode(
             x=P.slot_to_tid(x),
@@ -2464,6 +2492,37 @@ def _aten_rms_norm_handler(P: MLXProgramBuilder, n: Node) -> Slot:
             weight=P.slot_to_tid(w) if w else None,
             out=P.slot_to_tid(out),
             eps=eps,
+        )
+    )
+    return out
+
+
+@REGISTRY.register(target=[torch.ops.mlx.rope_t.default])
+def _rope_t_handler(P: MLXProgramBuilder, n: Node) -> Slot:
+    """mlx::rope_t — RoPE with the offset as a tensor (no scalar extraction).
+
+    Lowers to the same RopeNode; the runtime dispatches to fast::rope's
+    array-offset overload when offset is a Tid.
+    """
+    args = P.args(n)
+    require_args(args, 3, 7, "mlx.rope_t")
+    require_kwargs(P.kwargs(n), set(), "mlx.rope_t")
+    x, dims, pos = args[0], args[1], args[2]
+    traditional = args[3] if len(args) > 3 else False
+    base = args[4] if len(args) > 4 else 500000.0
+    scale = args[5] if len(args) > 5 else 1.0
+    freqs = args[6] if len(args) > 6 else None
+    out = P.make_or_get_slot(n)
+    P.emit(
+        RopeNode(
+            x=P.slot_to_tid(x),
+            out=P.slot_to_tid(out),
+            dims=dims,
+            offset=VidOrTid.from_tid(P.slot_to_tid(pos)),
+            freqs=P.slot_to_tid(freqs) if freqs else None,
+            traditional=traditional,
+            base=base,
+            scale=scale,
         )
     )
     return out

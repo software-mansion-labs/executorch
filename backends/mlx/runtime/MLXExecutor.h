@@ -796,6 +796,8 @@ inline void load_constants(
     ConstantData& store,
     std::vector<runtime::FreeableBuffer>& constant_buffers) {
   using namespace ::mlx::core;
+  std::vector<array> pinned_views;
+  size_t total_constant_bytes = 0;
 
   store.tensors.clear();
   constant_buffers.clear();
@@ -850,6 +852,7 @@ inline void load_constants(
     // Move the buffer into our storage (keeps it alive for zero-copy)
     constant_buffers.push_back(std::move(data_result.get()));
     runtime::FreeableBuffer& buffer = constant_buffers.back();
+    total_constant_bytes += buffer.size();
 
     const auto& meta = *program.tensor_meta[tid];
     Shape shape = to_shape(meta.shape);
@@ -871,14 +874,45 @@ inline void load_constants(
       array arr = array(data_ptr, shape, dtype, deleter);
       store.add(std::move(arr));
     } else {
-      // No deleter = MLX copies the data into its own memory
-      store.add(array(static_cast<const char*>(data_ptr), shape, dtype));
+      // Copy mode: wrap the raw bytes zero-copy first, then materialize a
+      // copy into MLX-owned (resident) memory via the copy op. NOTE 1:
+      // passing the pointer to array's (data, shape, dtype) constructor
+      // directly would select the ITERATOR overload, which converts each
+      // byte numerically to the target dtype and scrambles packed weights.
+      // NOTE 2: the view must stay referenced until eval — mlx::copy
+      // DONATES a sole-referenced input buffer (is_donatable() is purely
+      // refcount-based), which would silently adopt the mmap'd pointer
+      // instead of copying (file-backed pages then fault in from storage
+      // on every weight read — catastrophic for decode on iOS).
+      auto deleter = [](void*) {};
+      pinned_views.emplace_back(data_ptr, shape, dtype, deleter);
+      store.add(::mlx::core::copy(pinned_views.back()));
     }
   }
 
   // Evaluate all constants immediately to prepare Metal buffers
   // This trades init time for faster first inference
   eval(store.tensors);
+
+  if constexpr (!kEnableConstantZeroCopy) {
+    // Copies are materialized; release the pinned views. The FreeableBuffers
+    // stay alive with the handle — they are file-backed (clean pages, no
+    // dirty-memory cost) and other init-path consumers may still read them.
+    pinned_views.clear();
+
+    // Residency guard: in copy mode MLX must now own roughly the full
+    // constant payload. If it doesn't, the copy was elided (e.g. buffer
+    // donation adopting the mmap'd pointer) and we are silently back to
+    // file-backed weights — fail loudly instead of running with pathological
+    // decode performance.
+    const size_t active = ::mlx::core::get_active_memory();
+    if (active < total_constant_bytes / 2) {
+      throw std::runtime_error(
+          "MLX residency check failed: constant copy was elided (active " +
+          std::to_string(active / 1000000) + "MB < payload " +
+          std::to_string(total_constant_bytes / 1000000) + "MB)");
+    }
+  }
 }
 
 inline void load_mutable_buffers(

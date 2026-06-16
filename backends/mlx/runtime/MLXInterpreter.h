@@ -1228,110 +1228,40 @@ inline void
 exec_index_copy(const IndexCopyNode& n, ExecutionState& st, StreamOrDevice s) {
   array& dst = st.tensor_ref(n.dst);
   const array& upd = st.const_tensor_ref(n.update);
-  const array& indices = st.const_tensor_ref(n.indices);
-  if (indices.ndim() != 1) {
+  const array& indices_in = st.const_tensor_ref(n.indices);
+  if (indices_in.ndim() != 1) {
     throw std::invalid_argument("IndexCopyNode: indices must be 1D");
+  }
+  if (indices_in.dtype() != ::mlx::core::int64) {
+    throw std::invalid_argument(
+        std::string("IndexCopyNode: expected int64 indices, got ") +
+        ExecutionState::dtype_str(indices_in.dtype()));
   }
   const int rank = static_cast<int>(dst.ndim());
   int axis = normalize_axis(n.axis, rank, "IndexCopyNode");
-  const size_t uaxis = static_cast<size_t>(axis);
-  const int dst_dim = static_cast<int>(dst.shape()[uaxis]);
+  const auto dst_dim = dst.shape()[static_cast<size_t>(axis)];
 
-  // Get indices as a vector of ints, handling negative indices
-  // Note: PyTorch uses int64 for indices, so we read as int64_t
-  eval(indices); // Ensure indices are materialized before accessing data
-  if (indices.dtype() != ::mlx::core::int64) {
-    throw std::invalid_argument(
-        std::string("IndexCopyNode: expected int64 indices, got ") +
-        ExecutionState::dtype_str(indices.dtype()));
-  }
-  std::vector<int32_t> idx_vec(indices.size());
-  auto idx_data = indices.data<int64_t>();
-  for (size_t i = 0; i < indices.size(); ++i) {
-    int64_t idx = idx_data[i];
-    if (idx < 0) {
-      idx += dst_dim;
-    }
-    if (idx < 0 || idx >= dst_dim) {
-      throw std::out_of_range(
-          "IndexCopyNode: index " + std::to_string(idx_data[i]) +
-          " out of range for axis " + std::to_string(axis) + " with size " +
-          std::to_string(dst_dim));
-    }
-    if (idx > std::numeric_limits<int32_t>::max()) {
-      throw std::out_of_range(
-          "IndexCopyNode: index " + std::to_string(idx) +
-          " exceeds int32 range");
-    }
-    idx_vec[i] = static_cast<int>(idx);
-  }
+  // Pure tensor implementation: scatter the update rows at the given
+  // indices without materializing them on the host. Keeping the indices
+  // on-device avoids a GPU sync per call and keeps the op traceable under
+  // mx::compile (the previous implementation eval()'d the indices and
+  // issued host-computed slice_updates). Negative indices wrap like
+  // torch.index_copy; out-of-range indices are undefined (the host path
+  // used to throw — a bounds check is impossible without a sync).
+  auto dim_arr = array(static_cast<int64_t>(dst_dim), ::mlx::core::int64);
+  array idx = remainder(add(indices_in, dim_arr, s), dim_arr, s);
+  ::mlx::core::Shape ishape(static_cast<size_t>(rank), 1);
+  ishape[static_cast<size_t>(axis)] = static_cast<int>(indices_in.shape()[0]);
+  idx = reshape(idx, ishape, s);
+  idx = broadcast_to(idx, upd.shape(), s);
+  array result = put_along_axis(dst, idx, upd, axis, s);
 
-  // When out == dst, use direct assignment to preserve MLX buffer donation.
-  // TODO: I'm not sure if this is needed as a special case since the standard
-  // st.set_tensor does a std::move. Keeping for now, but should investigate and
-  // possibly remove in future.
-  const bool in_place = (n.out.idx == n.dst.idx);
-
-  if (idx_vec.empty()) {
-    if (!in_place) {
-      st.set_tensor(n.out, dst);
-    }
-    return;
-  }
-
-  // Build base start/stop vectors for slice_update
-  const size_t urank = static_cast<size_t>(rank);
-  std::vector<int> dst_vstart(urank, 0);
-  std::vector<int> dst_vstop;
-  dst_vstop.reserve(urank);
-  auto sh = dst.shape();
-  for (size_t i = 0; i < urank; ++i) {
-    dst_vstop.push_back(static_cast<int>(sh[i]));
-  }
-
-  std::vector<int> upd_vstart(urank, 0);
-  std::vector<int> upd_vstop;
-  upd_vstop.reserve(urank);
-  auto upd_sh = upd.shape();
-  for (size_t i = 0; i < urank; ++i) {
-    upd_vstop.push_back(static_cast<int>(upd_sh[i]));
-  }
-
-  array result = dst; // copy of dst to accumulate into
-
-  // Process contiguous runs
-  size_t offset = 0;
-  while (offset < idx_vec.size()) {
-    auto [dst_start, dst_stop, upd_start, upd_stop] =
-        next_contiguous_run(idx_vec, offset);
-
-    // Set axis range for dst
-    dst_vstart[uaxis] = dst_start;
-    dst_vstop[uaxis] = dst_stop;
-
-    // Set axis range for upd slice
-    upd_vstart[uaxis] = upd_start;
-    upd_vstop[uaxis] = upd_stop;
-
-    // Slice update - skip slicing if using entire update tensor
-    array upd_slice =
-        (upd_start == 0 && upd_stop == static_cast<int>(upd_sh[uaxis]))
-        ? upd
-        : slice(upd, to_shape(upd_vstart), to_shape(upd_vstop), s);
-
-    if (in_place) {
-      dst = slice_update(
-          dst, upd_slice, to_shape(dst_vstart), to_shape(dst_vstop), s);
-    } else {
-      result = slice_update(
-          result, upd_slice, to_shape(dst_vstart), to_shape(dst_vstop), s);
-    }
-
-    offset = static_cast<size_t>(upd_stop);
-  }
-
-  if (!in_place) {
-    st.set_tensor(n.out, result);
+  if (n.out.idx == n.dst.idx) {
+    // In-place form: write back through the slot reference to preserve
+    // MLX buffer donation.
+    dst = std::move(result);
+  } else {
+    st.set_tensor(n.out, std::move(result));
   }
 }
 

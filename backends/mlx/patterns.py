@@ -30,6 +30,7 @@ from executorch.backends.mlx.builder.op_registry import PatternHandler, REGISTRY
 from executorch.backends.mlx.builder.program_builder import MLXProgramBuilder
 from executorch.backends.mlx.builder.slot_manager import Slot
 from executorch.backends.mlx.pattern_utils import (
+    extract_lifted_tensor_constant,
     has_single_user,
     match_target,
     OpStep,
@@ -46,6 +47,7 @@ from executorch.backends.mlx.serialization.mlx_graph_schema import (
     ModIntNode,
     MultiplyNode,
     QuantizedMatmulNode,
+    RMSNormNode,
     SdpaNode,
     SliceNode,
     SliceUpdateNode,
@@ -822,6 +824,242 @@ class MLXCustomSdpaHandler(PatternHandler):
         )
 
         return out_slot
+
+
+@REGISTRY.register_pattern(name="RMS_NORM_DECOMPOSED")
+class RMSNormDecomposedHandler(PatternHandler):
+    """
+    Fuse the decomposed fp32-upcast RMSNorm cluster into mlx::fast::rms_norm.
+
+    Matches the Gemma-style RMSNorm as it appears in Edge IR:
+
+        x32 = _to_copy(x, fp32)                  # absent in fp32 models
+        ms  = add(mean(pow(x32, 2), [-1], True), eps)
+        n   = mul(x32, pow(ms, -0.5))
+        n   = mul(n, [_to_copy(]weight[)])       # optional learnable scale
+        out = _to_copy(n, x.dtype)               # absent in fp32 models
+
+    The whole cluster lowers to a single RMSNormNode. fast::rms_norm
+    accumulates in float32 internally, preserving the upcast semantics
+    without materializing any of the intermediate kernels (each unfused
+    norm costs ~8 Metal dispatches; a decode step has hundreds of norms,
+    making kernel-encode time the dominant per-token cost).
+    """
+
+    def __init__(
+        self,
+        head: Node,
+        body: List[Node],
+        x_node: Node,
+        weight_node: Optional[Node],
+        eps: float,
+    ):
+        super().__init__(head, body)
+        self.x_node = x_node
+        self.weight_node = weight_node
+        self.eps = eps
+
+    @staticmethod
+    def _node_dtype(node: Node):
+        val = node.meta.get("val")
+        return getattr(val, "dtype", None)
+
+    @staticmethod
+    def _is_cast(node: Any) -> bool:
+        # The fp32 upcast / downcast appears as _to_copy or type_as depending
+        # on how the cluster was traced; both advance via args[0].
+        return isinstance(node, Node) and (
+            match_target(node, torch.ops.aten._to_copy.default)
+            or match_target(node, torch.ops.aten.type_as.default)
+        )
+
+    @classmethod
+    def _match_core(
+        cls, norm_mul: Node
+    ) -> Optional[Tuple[Node, Node, float, List[Node]]]:
+        """Match ``mul(x32, pow(add(mean(pow(x32, 2)), eps), -0.5))``.
+
+        Returns (x32, pow2, eps, core_body) or None. x32 may have two users
+        (the pow(2) and the mul itself), both inside the cluster.
+        """
+        if not match_target(norm_mul, torch.ops.aten.mul.Tensor):
+            return None
+        if len(norm_mul.args) != 2:
+            return None
+        for x32, r in (norm_mul.args, norm_mul.args[::-1]):
+            if not isinstance(x32, Node) or not isinstance(r, Node):
+                continue
+            if not match_target(r, torch.ops.aten.pow.Tensor_Scalar):
+                continue
+            if r.args[1] != -0.5 or not has_single_user(r):
+                continue
+            add_n = r.args[0]
+            if not (
+                isinstance(add_n, Node)
+                and match_target(add_n, torch.ops.aten.add.Tensor)
+                and has_single_user(add_n)
+                and len(add_n.args) == 2
+            ):
+                continue
+            eps_arg = add_n.args[1]
+            eps = (
+                float(eps_arg)
+                if isinstance(eps_arg, (int, float))
+                else extract_lifted_tensor_constant(eps_arg)
+            )
+            if eps is None:
+                continue
+            mean_n = add_n.args[0]
+            if not (
+                isinstance(mean_n, Node)
+                and match_target(mean_n, torch.ops.aten.mean.dim)
+                and has_single_user(mean_n)
+                and list(mean_n.args[1]) == [-1]
+                and len(mean_n.args) > 2
+                and mean_n.args[2] is True
+            ):
+                continue
+            pow2 = mean_n.args[0]
+            if not (
+                isinstance(pow2, Node)
+                and match_target(pow2, torch.ops.aten.pow.Tensor_Scalar)
+                and pow2.args[1] == 2
+                and has_single_user(pow2)
+            ):
+                continue
+            if pow2.args[0] is not x32:
+                continue
+            body = [pow2, mean_n, add_n, r]
+            if isinstance(eps_arg, Node):
+                body.append(eps_arg)
+            return x32, pow2, eps, body
+        return None
+
+    @classmethod
+    def _weight_like(cls, node: Any) -> Optional[Tuple[Node, Optional[Node]]]:
+        """Return (weight_placeholder, cast_or_None) if node is a 1-D
+        parameter, possibly behind a dtype cast."""
+        cast = None
+        if cls._is_cast(node):
+            if not has_single_user(node):
+                return None
+            cast = node
+            node = node.args[0]
+        if not isinstance(node, Node) or node.op != "placeholder":
+            return None
+        val = node.meta.get("val")
+        if val is None or getattr(val, "dim", lambda: -1)() != 1:
+            return None
+        return node, cast
+
+    @classmethod
+    def maybe_create(  # noqa: C901
+        cls, ep: ExportedProgram, head: Node
+    ) -> Optional["RMSNormDecomposedHandler"]:
+        body: List[Node] = []
+
+        node = head
+        if cls._is_cast(node):
+            inner = node.args[0]
+            if not (isinstance(inner, Node) and has_single_user(inner)):
+                return None
+            node = inner
+
+        if not match_target(node, torch.ops.aten.mul.Tensor):
+            return None
+
+        weight_node = None
+        weight_cast = None
+        weight_mul = None
+        norm_mul = None
+        core = cls._match_core(node)
+        if core is not None:
+            norm_mul = node
+        else:
+            # `node` may be the weight multiply over the norm output.
+            for cand, w in (node.args, node.args[::-1]):
+                if not (isinstance(cand, Node) and has_single_user(cand)):
+                    continue
+                inner_core = cls._match_core(cand)
+                if inner_core is None:
+                    continue
+                weight = cls._weight_like(w)
+                if weight is None:
+                    return None
+                core = inner_core
+                norm_mul = cand
+                weight_mul = node
+                weight_node, weight_cast = weight
+                break
+            if core is None:
+                return None
+
+        x32, pow2, eps, core_body = core
+        # Claim every cluster node except the head (the head's slot becomes
+        # the fused op's output; body nodes are absorbed).
+        for cluster_node in (norm_mul, weight_mul):
+            if cluster_node is not None and cluster_node is not head:
+                body.append(cluster_node)
+        body.extend(core_body)
+
+        # Don't claim a sub-cluster when the pattern continues past the head:
+        # a following weight multiply (bare-norm anchors) or a same-dtype cast
+        # (anchors below the output cast). The larger anchor matches instead.
+        if len(head.users) == 1:
+            (user,) = head.users
+            if weight_node is None and match_target(user, torch.ops.aten.mul.Tensor):
+                other = [a for a in user.args if a is not head]
+                if len(other) == 1 and cls._weight_like(other[0]) is not None:
+                    return None
+            if cls._is_cast(user) and cls._node_dtype(user) == cls._node_dtype(head):
+                return None
+
+        # Input cast: absorb only when every user is inside this cluster.
+        x_node = x32
+        if (
+            cls._is_cast(x32)
+            and isinstance(x32.args[0], Node)
+            and set(x32.users) <= {pow2, norm_mul}
+        ):
+            x_node = x32.args[0]
+            body.append(x32)
+
+        # dtype sanity: the fused op produces x's dtype; the cluster's output
+        # must agree, and the (un-cast) weight must match x.
+        x_dt = cls._node_dtype(x_node)
+        out_dt = cls._node_dtype(head)
+        if x_dt is None or out_dt != x_dt:
+            return None
+        if weight_node is not None:
+            if cls._node_dtype(weight_node) != x_dt:
+                return None
+            if weight_cast is not None:
+                body.append(weight_cast)
+
+        return cls(
+            head=head,
+            body=body,
+            x_node=x_node,
+            weight_node=weight_node,
+            eps=eps,
+        )
+
+    def __call__(self, P: MLXProgramBuilder, n: Node) -> Slot:
+        assert n == self.head
+        x_slot = P.slot_map([self.x_node])[0]
+        weight_tid = None
+        if self.weight_node is not None:
+            weight_tid = P.slot_to_tid(P.slot_map([self.weight_node])[0])
+        out = P.make_or_get_slot(n)
+        P.emit(
+            RMSNormNode(
+                x=P.slot_to_tid(x_slot),
+                weight=weight_tid,
+                out=P.slot_to_tid(out),
+                eps=self.eps,
+            )
+        )
+        return out
 
 
 @REGISTRY.register_pattern(name="QUANTIZED_LINEAR")
