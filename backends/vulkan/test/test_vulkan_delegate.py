@@ -762,6 +762,59 @@ class TestVulkanBackend(unittest.TestCase):
 
         self.lower_module_and_test_output(model, sample_inputs)
 
+    def test_vulkan_backend_index_tensor_higher_rank_self(self):
+        # `table[positions]` with a 2-D table, the shape RoPE uses to look up
+        # its precomputed frequencies. The gather only ever needed `indices` to
+        # be 1-D -- `self`'s trailing dims come through unchanged -- but the
+        # support check used to require a 1-D `self` too, and the buffer shader
+        # only read `self[idx, 0, 0, 0]`.
+        class Gather(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("table", torch.rand(32, 8))
+
+            def forward(self, positions):
+                return self.table[positions] * 2.0
+
+        sample_inputs = (torch.arange(5, dtype=torch.int32),)
+
+        self.lower_module_and_test_output(Gather(), sample_inputs)
+
+    def test_vulkan_backend_functionalized_mutable_buffer(self):
+        # A recurrent state whose update is functionalized: `cat` + slice
+        # produce a NEW tensor which is then copied into the buffer, unlike a
+        # KV cache that is written in place by a custom op. Two things have to
+        # hold for this to work:
+        #
+        #  * the update must not be serialized as a graph output. The delegate
+        #    call has no argument slot for a mutated buffer, so a surplus
+        #    output makes VulkanBackend::execute's `args.size() - num_outputs`
+        #    underflow and read through a wild pointer.
+        #  * the update must be copied back into the prepacked buffer tensor,
+        #    otherwise every call restarts from the buffer's initial value and
+        #    the recurrence is silently lost.
+        #
+        # Calling the module repeatedly below is what distinguishes the two:
+        # the first call passes either way.
+        class Recurrent(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("state", torch.zeros(1, 4, 2))
+
+            def forward(self, x):
+                combined = torch.cat((self.state, x), dim=-1)
+                self.state.copy_(combined[:, :, -2:])
+                return combined * 2.0
+
+        sample_inputs = (torch.rand(size=(1, 4, 3), dtype=torch.float32),)
+        test_inputs = [
+            (torch.rand(size=(1, 4, 3), dtype=torch.float32),) for _ in range(4)
+        ]
+
+        self.lower_module_and_test_output(
+            Recurrent(), sample_inputs, test_inputs=test_inputs
+        )
+
     @disable_test(
         "Currently this test is failing due to weird partitioning because the eq scalar"
         "operator is not supported yet. Re-enable when the operator is supported."
