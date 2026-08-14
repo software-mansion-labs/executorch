@@ -21,13 +21,13 @@ from executorch.backends.vulkan.utils import (
     get_vk_datatype,
     is_constant,
     is_get_attr_node,
-    is_mutable_buffer_node,
     is_param_node,
     is_symint_node,
     TensorRepr,
 )
 from executorch.exir._serialize._named_data_store import NamedDataStore
 from executorch.exir.backend.utils import DelegateMappingBuilder
+from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.tensor import TensorSpec
 from torch._export.utils import get_buffer, get_param, is_buffer, is_param
 from torch.export import ExportedProgram
@@ -438,6 +438,46 @@ class VkGraphBuilder:
     def process_getattr_node(self, node: Node) -> None:
         self.create_node_value(node)
 
+    def buffer_value_id_for_mutation(self, out_node: Node) -> Optional[int]:
+        """Value id of the buffer that `out_node` holds the new contents of.
+
+        A mutated buffer reaches the `output` node in one of two forms:
+
+          * as the buffer PLACEHOLDER itself, when the mutation was in place
+            (what `sdpa_with_kv_cache` does to the KV caches), or
+          * as a COMPUTED node, when the mutation was functionalized into new
+            values (e.g. a short-conv state updated by `cat` + `slice_copy`).
+
+        `buffers_to_mutate` is keyed by the name of whichever node feeds
+        `output`, so it recognises both; `is_mutable_buffer_node` only
+        recognises the first, since it looks up `node.target` in
+        `inputs_to_buffers`.
+
+        The id returned is the one the graph's operators actually read from.
+        `insert_prepack_nodes` leaves the placeholder itself as a TensorRef and
+        routes every operator through an `et_vk.prepack` node, so where such a
+        node exists it is the prepacked GPU tensor -- not the TensorRef -- that
+        holds the buffer's live contents.
+        """
+        signature = self.program.graph_signature
+        buffer_name = signature.buffers_to_mutate.get(out_node.name)
+        if buffer_name is None:
+            return None
+
+        placeholder_names = {
+            name
+            for name, buf in signature.inputs_to_buffers.items()
+            if buf == buffer_name
+        }
+        for candidate in self.program.graph_module.graph.nodes:
+            if candidate.op != "placeholder" or candidate.name not in placeholder_names:
+                continue
+            for user in candidate.users:
+                if user.target == exir_ops.edge.et_vk.prepack.default:
+                    return self.node_to_value_ids.get(user)
+            return self.node_to_value_ids.get(candidate)
+        return None
+
     def process_output_node(self, node: Node) -> None:
         for out_node in node.all_input_nodes:
             if out_node not in self.node_to_value_ids:
@@ -446,9 +486,33 @@ class VkGraphBuilder:
                     "the output node is being serialized before its corresponding "
                     "internal node which is not allowed."
                 )
-            # Mutable buffers outputs are not included as an output to the
-            # delegate call. Skip marking them as an output.
-            if is_mutable_buffer_node(out_node, self.program):
+            # Mutable buffer outputs are not passed to the delegate call, so
+            # they must not be counted as graph outputs: VulkanBackend::execute
+            # computes `args.size() - num_outputs` in size_t arithmetic, and
+            # any surplus output turns that into a wild pointer.
+            buffer_value_id = self.buffer_value_id_for_mutation(out_node)
+            if buffer_value_id is not None:
+                out_value_id = self.node_to_value_ids[out_node]
+                # A mutable buffer is prepacked as a graph-owned tensor, so its
+                # contents survive between execute() calls -- but only what is
+                # written into that tensor does. An in-place mutation already
+                # produced the buffer's own value id; a functionalized one
+                # produced a separate value, and the update is lost unless it
+                # is copied back. Without this, a recurrent state (e.g. LFM2.5's
+                # short-conv cache) silently restarts from its initial value on
+                # every call.
+                if out_value_id != buffer_value_id:
+                    self.chain.append(
+                        vk_graph_schema.OperatorCall(
+                            node_id=0,
+                            name="aten.clone.default",
+                            args=[
+                                out_value_id,
+                                self.create_null_value(),
+                                buffer_value_id,
+                            ],
+                        )
+                    )
                 continue
 
             self.output_ids.append(self.node_to_value_ids[out_node])
