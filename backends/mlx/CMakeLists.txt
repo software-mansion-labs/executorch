@@ -194,11 +194,12 @@ message(
 set(_mlx_patches
     ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_nax_has_include.patch
     ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_qmm_splitk_bk_align.patch
-    # iOS support: MLX gates Metal behind macOS-only checks and compiles its
-    # metallib against the macOS SDK unconditionally. These two make the Metal
-    # build reachable on iOS and let the metallib's SDK / version-min be chosen
-    # by the MLX_METAL_* variables forwarded through CMAKE_ARGS below.
-    ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_ios_enable_metal.patch
+    # iOS support: MLX still compiles its metallib against the macOS SDK
+    # unconditionally, so this lets the SDK / version-min / deployment target be
+    # chosen by the MLX_METAL_* variables forwarded through CMAKE_ARGS below.
+    # (The companion mlx_ios_enable_metal.patch was dropped at the 1.4.1 bump:
+    # MLX upstream now keeps Metal on for iOS itself and gates its macOS SDK
+    # probe on CMAKE_SYSTEM_NAME STREQUAL "Darwin".)
     ${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx_ios_metallib.patch
 )
 

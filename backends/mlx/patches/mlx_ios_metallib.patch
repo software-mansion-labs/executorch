@@ -1,5 +1,5 @@
 diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
-index 8d3d8a19..31151b30 100644
+index edc169e..4f6d95b 100644
 --- a/mlx/backend/metal/kernels/CMakeLists.txt
 +++ b/mlx/backend/metal/kernels/CMakeLists.txt
 @@ -9,6 +9,22 @@ set(BASE_HEADERS
@@ -41,12 +41,21 @@ index 8d3d8a19..31151b30 100644
              -I${PROJECT_SOURCE_DIR} -o ${TARGET}.air
      DEPENDS ${SRCFILE} ${DEPS} ${BASE_HEADERS}
      OUTPUT ${TARGET}.air
-@@ -176,7 +192,7 @@ endif()
+@@ -179,13 +195,14 @@ if(NOT MLX_METAL_JIT)
+ endif()
+ 
+ set(METAL_LINK_FLAGS)
+-if(NOT CMAKE_OSX_DEPLOYMENT_TARGET STREQUAL "")
+-  set(METAL_LINK_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++if(NOT MLX_METAL_DEPLOYMENT_TARGET STREQUAL "")
++  set(METAL_LINK_FLAGS
++      "${MLX_METAL_VERSION_MIN_FLAG}=${MLX_METAL_DEPLOYMENT_TARGET}")
+ endif()
  
  add_custom_command(
    OUTPUT ${MLX_METAL_PATH}/mlx.metallib
--  COMMAND xcrun -sdk macosx metallib ${KERNEL_AIR} -o
-+  COMMAND xcrun -sdk ${MLX_METAL_SDK} metallib ${KERNEL_AIR} -o
+-  COMMAND xcrun -sdk macosx metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
++  COMMAND xcrun -sdk ${MLX_METAL_SDK} metal ${METAL_LINK_FLAGS} ${KERNEL_AIR} -o
            ${MLX_METAL_PATH}/mlx.metallib
    DEPENDS ${KERNEL_AIR}
    COMMENT "Building mlx.metallib"
