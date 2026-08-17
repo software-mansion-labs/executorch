@@ -179,7 +179,25 @@ endif()
 include(ExternalProject)
 
 set(_mlx_binary_dir ${CMAKE_CURRENT_BINARY_DIR}/mlx)
-set(_mlx_static_lib ${_mlx_binary_dir}/libmlx.a)
+
+# Send MLX's archive to the same place ExecuTorch sends its own, so
+# create_frameworks.sh finds libmlx.a next to libmlxdelegate.a when merging the
+# backend_mlx framework. Upstream leaves it inside the ExternalProject binary
+# dir, which is fine for a single-config Ninja build but not for the Apple
+# framework build: that uses the Xcode generator, which nests output under a
+# per-config directory, so the merge step failed with
+# "File ios/Release/libmlx.a does not exist".
+if(CMAKE_ARCHIVE_OUTPUT_DIRECTORY)
+  set(_mlx_archive_dir ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY})
+else()
+  set(_mlx_archive_dir ${_mlx_binary_dir})
+endif()
+get_property(_mlx_multi_config GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(_mlx_multi_config)
+  set(_mlx_static_lib ${_mlx_archive_dir}/${CMAKE_BUILD_TYPE}/libmlx.a)
+else()
+  set(_mlx_static_lib ${_mlx_archive_dir}/libmlx.a)
+endif()
 # With MLX_METAL_JIT=ON, MLX does not install the metallib; it is produced in
 # the build tree at this path.
 set(_mlx_metallib ${_mlx_binary_dir}/mlx/backend/metal/kernels/mlx.metallib)
@@ -241,6 +259,7 @@ ExternalProject_Add(
   PATCH_COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/patches/apply.sh
                 ${MLX_SOURCE_DIR} ${_mlx_patches}
   CMAKE_ARGS -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+             -DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${_mlx_archive_dir}
              -DCMAKE_CXX_STANDARD=${CMAKE_CXX_STANDARD}
              -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}
              -DCMAKE_TOOLCHAIN_FILE=${CMAKE_TOOLCHAIN_FILE}
