@@ -354,7 +354,6 @@ for mode in "${MODES[@]}"; do
   append_framework_flag "" "$FRAMEWORK_EXECUTORCH_LLM" "$mode"
   append_framework_flag "" "$FRAMEWORK_THREADPOOL" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_COREML" "$FRAMEWORK_BACKEND_COREML" "$mode"
-  append_framework_flag "EXECUTORCH_BUILD_MLX" "$FRAMEWORK_BACKEND_MLX" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_MPS" "$FRAMEWORK_BACKEND_MPS" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_XNNPACK" "$FRAMEWORK_BACKEND_XNNPACK" "$mode"
   append_framework_flag "EXECUTORCH_BUILD_KERNELS_LLM" "$FRAMEWORK_KERNELS_LLM" "$mode"
@@ -364,6 +363,24 @@ for mode in "${MODES[@]}"; do
 
   cd "${OUTPUT_DIR}"
   "$SOURCE_ROOT_DIR"/scripts/create_frameworks.sh "${FRAMEWORK_FLAGS[@]}"
+
+  # MLX is an iOS-only backend here: apple_common enables it for iOS / iOS
+  # Simulator, but not for macOS, whose preset deployment target (12.0) is below
+  # MLX's 14.0 floor. create_frameworks.sh applies every --framework to every
+  # --directory, so merging MLX in the pass above would fail on the macOS
+  # directory with "File macos/Release/libmlxdelegate.a does not exist". Merge it
+  # separately from just the directories that actually built it.
+  MLX_FRAMEWORK_FLAGS=()
+  for preset_out_dir in "${PRESETS_RELATIVE_OUT_DIR[@]}"; do
+    if [[ -f "${OUTPUT_DIR}/${preset_out_dir}/${mode}/libmlxdelegate.a" ]]; then
+      MLX_FRAMEWORK_FLAGS+=("--directory=${preset_out_dir}/${mode}")
+    fi
+  done
+  if [[ ${#MLX_FRAMEWORK_FLAGS[@]} -gt 0 ]]; then
+    FRAMEWORK_FLAGS=("${MLX_FRAMEWORK_FLAGS[@]}")
+    append_framework_flag "EXECUTORCH_BUILD_MLX" "$FRAMEWORK_BACKEND_MLX" "$mode"
+    "$SOURCE_ROOT_DIR"/scripts/create_frameworks.sh "${FRAMEWORK_FLAGS[@]}"
+  fi
 done
 
 echo "Cleaning up"
