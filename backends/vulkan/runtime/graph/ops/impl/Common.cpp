@@ -122,10 +122,20 @@ utils::uvec3 pick_hw_square_wg_size(
     const utils::uvec3& global_workgroup_size,
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args) {
-  (void)graph;
   (void)shader;
   (void)args;
   (void)resize_args;
+  // Adreno drivers miscompute the tiled GEMM family of shaders for near-square
+  // local work groups: with 8x8x1 (and with 4x16x1) entire work groups
+  // intermittently write garbage while every other block is bit-exact. These
+  // shaders have no shared memory and no barriers and their invocations are
+  // independent, so the result cannot legitimately depend on the group shape.
+  // 16x4x1 is correct across every run measured and is the cheapest correct
+  // shape. See pytorch/executorch#22327.
+  if (graph != nullptr && graph->device_is_adreno()) {
+    return {16u, 4u, 1u};
+  }
+  (void)graph;
   // Some inactive invocations are okay; set 6 as the threshold to use the
   // a square wg size.
   if (global_workgroup_size[0u] >= 6 && global_workgroup_size[1u] >= 6) {
