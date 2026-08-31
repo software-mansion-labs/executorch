@@ -87,6 +87,26 @@ utils::uvec3 reduce_global_wg_size(
   return global_wg_size;
 }
 
+// Threads co-operating on one reduction output, scaled with the reduction
+// extent. kReduceNGroups * this must stay within MAX_NTHREADS (256) in the
+// shaders. Backport of pytorch/executorch#22348.
+constexpr uint32_t kReduceMaxNThreads = 256u;
+constexpr uint32_t kReduceNGroups = 4u;
+
+uint32_t reduce_nworkers(
+    ComputeGraph* graph,
+    const ValueRef in,
+    const int32_t reduce_dim_whcn) {
+  const uint32_t cap = kReduceMaxNThreads / kReduceNGroups;
+  const uint32_t extent = utils::safe_downcast<uint32_t>(
+      graph->logical_limits_of(in)[reduce_dim_whcn]);
+  uint32_t nworkers = 4u;
+  while (nworkers < cap && nworkers < extent) {
+    nworkers *= 2u;
+  }
+  return nworkers;
+}
+
 utils::uvec3 reduce_local_wg_size(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
@@ -94,7 +114,6 @@ utils::uvec3 reduce_local_wg_size(
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args) {
   (void)shader;
-  (void)args;
   (void)global_workgroup_size;
 
   const int32_t reduce_dim_whcn =
@@ -102,16 +121,12 @@ utils::uvec3 reduce_local_wg_size(
   const int64_t group_dim_whcn =
       graph->extract_scalar<int64_t>(resize_args.at(2));
 
-  // This should match the value of MAX_NTHREADS in the reduce shader.
-  constexpr uint32_t max_nthreads = 16;
-
-  const uint32_t nworkers_per_group = 4;
-  const uint32_t ngroups = 4;
-  VK_CHECK_COND(nworkers_per_group * ngroups <= max_nthreads);
+  const uint32_t nworkers_per_group =
+      reduce_nworkers(graph, args.at(1).refs.at(0), reduce_dim_whcn);
 
   utils::uvec3 local_wg_size{1, 1, 1};
   local_wg_size[reduce_dim_whcn] = nworkers_per_group;
-  local_wg_size[group_dim_whcn] = ngroups;
+  local_wg_size[group_dim_whcn] = kReduceNGroups;
 
   return local_wg_size;
 }
@@ -170,7 +185,10 @@ void add_reduce_node(
       // Push Constants
       {},
       // Specialization Constants
-      {graph.packed_dim_of(out), reduce_dim, group_dim},
+      {graph.packed_dim_of(out),
+       reduce_dim,
+       group_dim,
+       utils::safe_downcast<int32_t>(reduce_nworkers(&graph, in, reduce_dim))},
       // Resize Args
       {dim_ref, reduce_dim_whcn_ref, group_dim_whcn_ref},
       // Resizing Logic
@@ -247,7 +265,11 @@ void add_reduce2d_node(
       // Push Constants
       {},
       // Specialization Constants
-      {graph.packed_dim_of(out), reduce_dim1, reduce_dim2, group_dim},
+      {graph.packed_dim_of(out),
+       reduce_dim1,
+       reduce_dim2,
+       group_dim,
+       utils::safe_downcast<int32_t>(reduce_nworkers(&graph, in, reduce_dim1))},
       // Resize Args
       {dims_ref,
        reduce_dim1_whcn_ref,

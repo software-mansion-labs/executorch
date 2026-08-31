@@ -33,12 +33,13 @@ layout(constant_id = 6) const int group_dim = 2;
 // A more verbose name would be NWORKERS_PER_GROUP. This describes the number of
 // threads that will co-operate to compute one reduction output. There may be
 // multiple groups computing distinct reduction outputs within one work group.
-#define NWORKERS 4
+// Supplied by the dispatch so it can scale with the length of the reduction.
+layout(constant_id = 7) const int NWORKERS = 4;
 
 // Sets an upper limit on the total size of a work group based on how many
 // elements are allocated in the shared memory array below. Each thread in the
 // work group will write into its assigned element in the shared array.
-#define MAX_NTHREADS 16
+#define MAX_NTHREADS 256
 
 
 shared vec4 shared_vecs[MAX_NTHREADS];
