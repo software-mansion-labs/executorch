@@ -84,8 +84,13 @@ utils::uvec3 pick_softmax_local_wg_size(
   const uint32_t nworkers_per_group = 4;
 
   if (graph->is_buffer_storage(out)) {
+    // NWORKERS is baked into softmax_buffer as a specialization constant when
+    // the node is built, so the launch has to keep using that value.
+    // Recomputing it here from the resized extent would launch fewer threads
+    // than the shader's tree reduction indexes over, leaving it to read shared
+    // memory slots that no thread wrote. Take it from the resize args instead.
     utils::uvec3 local_wg_size{1, 1, 1};
-    local_wg_size[reduce_dim] = softmax_nworkers(graph, in, reduce_dim);
+    local_wg_size[reduce_dim] = static_cast<uint32_t>(resize_args.at(1));
     return local_wg_size;
   }
 
@@ -150,11 +155,10 @@ void add_softmax_node(
 
   const int dim_val = graph.extract_scalar<int>(dim_ref);
 
-  vkapi::SpecVarList spec_constants = {
-      reduce_dim_xyz,
-      utils::safe_downcast<int32_t>(
-          softmax_nworkers(&graph, in, reduce_dim_xyz))};
-  std::vector<ValueRef> resize_args = {dim_val};
+  const int32_t buffer_nworkers = utils::safe_downcast<int32_t>(
+      softmax_nworkers(&graph, in, reduce_dim_xyz));
+  vkapi::SpecVarList spec_constants = {reduce_dim_xyz, buffer_nworkers};
+  std::vector<ValueRef> resize_args = {dim_val, buffer_nworkers};
 
   if (!graph.is_buffer_storage(out)) {
     const int other_dim_1 = (reduce_dim_xyz + 1) % 3;
