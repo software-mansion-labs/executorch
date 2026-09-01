@@ -264,15 +264,29 @@ def is_tensor_node(node: Any) -> bool:
     return False
 
 
-def is_tensor_arg_node(node: Any) -> bool:
-    if isinstance(node, torch.fx.Node):
-        return is_tensor_node(node)
-    elif isinstance(node, (list, tuple)):
-        if len(node) == 0:
-            return False
-        return all(is_tensor_node(n) for n in node)
+def tensor_nodes_in_arg(node: Any) -> List[torch.fx.Node]:
+    """The tensor nodes that an operator argument refers to.
 
-    return False
+    An argument is either a single tensor node or a list of them. A few
+    operators pass a list with a None for every dimension that is not involved:
+    `index.Tensor(x, [None, None, idx])` gathers along dim 2. Those Nones carry
+    no tensor and are skipped, so the tensors that ARE there still get a
+    representation assigned.
+    """
+    if isinstance(node, torch.fx.Node):
+        return [node] if is_tensor_node(node) else []
+    if isinstance(node, (list, tuple)):
+        entries = [n for n in node if n is not None]
+        if len(entries) == 0:
+            return []
+        if all(is_tensor_node(n) for n in entries):
+            return entries
+
+    return []
+
+
+def is_tensor_arg_node(node: Any) -> bool:
+    return len(tensor_nodes_in_arg(node)) > 0
 
 
 def num_tensor_arg_nodes(node: torch.fx.Node) -> int:
@@ -1181,33 +1195,6 @@ def make_tensor_repset(tensor_repr: TensorRepr) -> TensorRepSet:
         raise RuntimeError(f"Unsupported storage type {tensor_repr.storage_type}")
 
 
-def upper_bound_size(dim: Union[int, torch.SymInt]) -> Optional[int]:
-    """Largest value a (possibly symbolic) tensor dimension can take.
-
-    Returns None if no finite bound is known.
-
-    A symbolic dim compares against a limit using its *hint* -- the size of the
-    example input the model happened to be traced with -- not the maximum the
-    exported range allows. Sizing decisions must use the bound instead, or a
-    model traced with a small example will make a choice that is invalid once it
-    runs at a larger size.
-    """
-    if not isinstance(dim, torch.SymInt):
-        return int(dim)
-    if not dim.node.expr.free_symbols:
-        return int(dim.node.expr)
-    shape_env = dim.node.shape_env
-    if shape_env is None:
-        return None
-    try:
-        upper = shape_env.bound_sympy(dim.node.expr).upper
-    except Exception:
-        return None
-    if upper is None or not upper.is_finite:
-        return None
-    return int(upper)
-
-
 def filter_invalid_reprs(
     tensor_val: FakeTensor,
     tensor_repset: TensorRepSet,
@@ -1225,17 +1212,11 @@ def filter_invalid_reprs(
     can be used to produce a valid image texture for the given tensor (i.e. fits within
     texture limits).
     """
-    # Size the texture by what the dimension CAN be, not by the example the
-    # model was traced with. An unbounded dim cannot be shown to fit, so it
-    # falls back to buffer storage.
-    bounds = [upper_bound_size(d) for d in tensor_val.shape]
     valid_texture_layouts = set()
-    if all(b is not None for b in bounds):
-        max_shape = torch.Size(bounds)
-        for memory_layout in tensor_repset.valid_texture_layouts:
-            extents = required_image_extents(max_shape, memory_layout)
-            if extents_are_valid(extents, texture_limits):
-                valid_texture_layouts.add(memory_layout)
+    for memory_layout in tensor_repset.valid_texture_layouts:
+        extents = required_image_extents(tensor_val.shape, memory_layout)
+        if extents_are_valid(extents, texture_limits):
+            valid_texture_layouts.add(memory_layout)
 
     # High dimensional tensors require buffer storage
     if len(tensor_val.shape) > 4:
@@ -1475,15 +1456,8 @@ class OpRepSets:
         outs_repset_list = TensorRepSetList([])
         common_out_repset = ANY_STORAGE_INCL_PACKED_INT8
         if num_tensors_in_node(op_node) == 1:
-            out_val = op_node.meta["val"]
-            # num_tensors_in_node counts the tensors, not the nesting: an op
-            # declared to return Tensor[] still lands here when it happens to
-            # produce exactly one, and meta["val"] is then a one-element list
-            # rather than a bare FakeTensor.
-            if isinstance(out_val, (list, tuple)):
-                out_val = out_val[0]
             common_out_repset = filter_invalid_reprs(
-                out_val, outputs_repsets[0], texture_limits
+                op_node.meta["val"], outputs_repsets[0], texture_limits
             )
             outs_repset_list.append(common_out_repset)
         # Multiple output tensors
@@ -1552,10 +1526,10 @@ class OpRepSets:
                 arg_node.meta["val"], arg_repsets, texture_limits
             )
         elif isinstance(arg_node, list) and all(
-            is_single_tensor_node(n) for n in arg_node
+            is_single_tensor_node(n) for n in tensor_nodes_in_arg(arg_node)
         ):
             return filter_invalid_reprs_for_node_list(
-                arg_repsets, arg_node, texture_limits
+                arg_repsets, tensor_nodes_in_arg(arg_node), texture_limits
             )
         # Special case for getitem; return the repset of the particular val in the
         # list of tensors that is being extracted.

@@ -208,22 +208,6 @@ def register_copy_op():
 # =============================================================================
 
 
-def _check_clamp_bounds_are_static(node: torch.fx.Node) -> bool:
-    """Only support clamp when both bounds are static.
-
-    get_val_or_inf() in UnaryOp.cpp reads each bound with
-    extract_scalar<float>() when the node is BUILT and bakes the result into the
-    dispatch. A bound derived from a dynamic dimension is therefore never
-    refreshed, and the op silently computes against a stale limit -- no error is
-    raised. This is especially damaging when clamp is applied to index tensors,
-    where a wrong limit silently reorders or drops data downstream.
-    """
-    for bound in node.args[1:3]:
-        if isinstance(bound, torch.fx.Node):
-            return False
-    return True
-
-
 @update_features(
     [
         exir_ops.edge.aten.abs.default,
@@ -242,15 +226,14 @@ def _check_clamp_bounds_are_static(node: torch.fx.Node) -> bool:
         exir_ops.edge.aten.tanh.default,
         exir_ops.edge.aten.round.default,
         exir_ops.edge.aten.leaky_relu.default,
+        exir_ops.edge.aten.log10.default,
     ]
 )
 def register_unaryop_cpp_ops():
     return OpFeatures(
         inputs_storage=utils.ANY_STORAGE,
         inputs_dtypes=utils.FP_T,
-        supports_resize=True,        # hardtanh/hardshrink/leaky_relu read their bounds through the same
-        # build-time get_val_or_inf() path as clamp.
-        are_node_inputs_supported_fn=_check_clamp_bounds_are_static,
+        supports_resize=True,
     )
 
 
@@ -259,7 +242,7 @@ def register_clamp():
     return OpFeatures(
         inputs_storage=utils.ANY_STORAGE,
         inputs_dtypes=utils.FP_INT_T,
-        supports_resize=True,        are_node_inputs_supported_fn=_check_clamp_bounds_are_static,
+        supports_resize=True,
     )
 
 
@@ -1130,28 +1113,6 @@ def register_general_sdpa():
     )
 
 
-@update_features("et_vk::gemma_sdpa_with_kv_cache")
-def register_gemma_sdpa_with_kv_cache_op():
-    # Mirrors llama::sdpa_with_kv_cache (above). Cache update is internal
-    # to the op's lowering, so the partitioner sees a single fused node and
-    # never splits the cache write from the SDPA.
-    return OpFeatures(
-        inputs_storage=utils.CONTIGUOUS_ANY,
-        supports_resize=True,
-        supports_prepacking=True,
-    )
-
-
-@update_features("et_vk::gemma_custom_sdpa")
-def register_gemma_custom_sdpa_op():
-    # Read-only SDPA against an already-updated cache, used for KV-consumer
-    # layers in shared-KV groups. Mirrors llama::custom_sdpa.
-    return OpFeatures(
-        inputs_storage=utils.CONTIGUOUS_ANY,
-        supports_resize=True,
-    )
-
-
 # =============================================================================
 # RotaryEmbedding.cpp
 # =============================================================================
@@ -1306,6 +1267,21 @@ def register_alias_copy():
     return OpFeatures(
         inputs_storage=utils.ANY_STORAGE_INCL_PACKED_INT8,
         inputs_dtypes=utils.FP_INT_BOOL_T,
+        supports_resize=True,
+        supports_highdim=True,
+    )
+
+
+# =============================================================================
+# Unfold.cpp
+# =============================================================================
+
+
+@update_features(exir_ops.edge.aten.unfold_copy.default)
+def register_unfold_copy():
+    return OpFeatures(
+        inputs_storage=utils.ANY_BUFFER,
+        inputs_dtypes=utils.FP_T,
         supports_resize=True,
         supports_highdim=True,
     )
@@ -1472,26 +1448,28 @@ def register_index_tensor():
         if self_val is None:
             return None
 
-        # Only support exactly one non-None index tensor, applied to dim 0.
+        # Exactly one index tensor; the position it sits at is the dimension
+        # the gather runs along.
         if not isinstance(indices, (list, tuple)):
             return None
-        non_none = [idx for idx in indices if idx is not None]
-        if len(non_none) != 1 or indices[0] is None:
+        positions = [i for i, idx in enumerate(indices) if idx is not None]
+        if len(positions) != 1:
             return None
-        index_arg = non_none[0]
+        dim = positions[0]
+        index_arg = indices[dim]
         if not isinstance(index_arg, torch.fx.Node):
             return None
         index_val = index_arg.meta.get("val", None)
         if index_val is None:
             return None
 
-        return self_val, index_val
+        return self_val, index_val, dim
 
     def check_index_tensor_node(node: torch.fx.Node) -> bool:
         shapes = _index_tensor_shapes(node)
         if shapes is None:
             return False
-        _, index_val = shapes
+        _, index_val, _ = shapes
         # The gather is expressed as "one index position per output slice", so
         # the index must be 1-D. `self` may be any rank: the buffer shader
         # copies self's trailing dims through unchanged.
@@ -1499,6 +1477,10 @@ def register_index_tensor():
 
     def pick_index_tensor_storage(node: torch.fx.Node):
         shapes = _index_tensor_shapes(node)
+        # A gather on any dimension but 0 is handed to index_select, which reads
+        # and writes channels-packed textures.
+        if shapes is not None and shapes[2] != 0:
+            return utils.CHANNELS_PACKED_TEXTURE, utils.CHANNELS_PACKED_TEXTURE
         # Only the buffer shader handles a higher-rank `self`; the texture
         # variant still assumes the 1-D form (it reads self[idx, 0, 0, 0]).
         if shapes is not None and len(shapes[0].size()) > 1:
@@ -1532,30 +1514,12 @@ def register_arange():
 # =============================================================================
 
 
-def _check_pad_is_static(node: torch.fx.Node) -> bool:
-    """Only support constant_pad_nd when the pad amounts are static.
-
-    A symbolic pad list is serialized as a VALUELIST rather than an INTLIST, and
-    Pad.cpp reads it with get_int_list(), which throws "Expected value to have
-    type IntList, got VALUELIST instead". Separately,
-    add_constant_pad_nd_node() bakes the amounts into a params buffer at build
-    time, so a pad derived from a dynamic dim would use stale values even if the
-    list were read symbolically. Decline the node until the padding is plumbed
-    through as a symint.
-    """
-    pad = node.args[1]
-    if not isinstance(pad, (list, tuple)):
-        return False
-    return all(isinstance(p, int) for p in pad)
-
-
 @update_features(exir_ops.edge.aten.constant_pad_nd.default)
 def register_constant_pad_nd():
     return OpFeatures(
         inputs_storage=utils.ANY_STORAGE,
         inputs_dtypes=utils.FP_INT_BOOL_T,
         supports_resize=True,
-        are_node_inputs_supported_fn=_check_pad_is_static,
     )
 
 
@@ -1777,21 +1741,6 @@ def register_embedding_q4gsw():
 # =============================================================================
 
 
-def _check_batch_norm_is_4d(node: torch.fx.Node) -> bool:
-    """Only support batch norm on a 4d input.
-
-    add_native_batch_norm_node() asserts
-    VK_CHECK_COND(in_sizes.size() == 4, "BatchNorm only support 4d tensor"), so
-    partitioning a batch norm whose input is not 4d (any conv1d model, where
-    activations are rank 3) yields a .pte that aborts at execute time.
-    """
-    input_node = node.args[0]
-    if not isinstance(input_node, torch.fx.Node):
-        return False
-    val = input_node.meta.get("val")
-    return val is not None and val.dim() == 4
-
-
 @update_features(exir_ops.edge.aten._native_batch_norm_legit_no_training.default)
 def register_native_batch_norm_legit_no_training():
     return OpFeatures(
@@ -1799,7 +1748,6 @@ def register_native_batch_norm_legit_no_training():
         inputs_dtypes=utils.FP_T,
         supports_prepacking=True,
         supports_resize=True,
-        are_node_inputs_supported_fn=_check_batch_norm_is_4d,
     )
 
 
@@ -1842,10 +1790,10 @@ def register_native_layer_norm():
 # =============================================================================
 
 
-@update_features(exir_ops.edge.aten.rms_norm.default)
+@update_features(exir_ops.edge.et_vk.rms_norm.default)
 def register_rms_norm():
     return OpFeatures(
-        inputs_storage=utils.CONTIGUOUS_BUFFER,
+        inputs_storage=utils.CONTIGUOUS_ANY,
         inputs_dtypes=utils.FP_T,
         supports_prepacking=True,
         supports_resize=True,
