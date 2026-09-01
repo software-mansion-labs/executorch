@@ -1438,6 +1438,7 @@ def register_index_select():
     return OpFeatures(
         inputs_storage=utils.CHANNELS_PACKED_TEXTURE,
         inputs_dtypes=utils.FP_INT_BOOL_T,
+        supports_resize=True,
     )
 
 

@@ -85,7 +85,7 @@ void add_index_select_channel_node(
       // Resize Args
       {},
       // Resizing Logic
-      nullptr));
+      resize_index_select_channel_node));
 }
 
 struct IndexSelectParams final {
@@ -172,7 +172,7 @@ void add_index_select_node(
       // Resize Args
       {},
       // Resizing Logic
-      nullptr));
+      resize_fn));
 }
 
 int64_t get_dim_idx(ComputeGraph& graph, ValueRef in, ValueRef dim_ref) {
