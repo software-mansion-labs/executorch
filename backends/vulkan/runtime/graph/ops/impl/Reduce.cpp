@@ -107,6 +107,16 @@ uint32_t reduce_nworkers(
   return nworkers;
 }
 
+// NWORKERS is baked into the shader as a specialization constant when the node
+// is built, so the launch must use that same value for the lifetime of the
+// node. Recomputing it here from the current (possibly resized) extent would
+// launch fewer threads than the shader aggregates over, and the shader would
+// then reduce over shared memory slots that no thread wrote. The count is
+// therefore read back from the resize args rather than recomputed.
+//
+// Launching more workers than there are elements is harmless: a worker whose
+// loop body never runs contributes INIT_ACCUM, which is the identity for sum
+// and mean and idempotent for amax and amin.
 utils::uvec3 reduce_local_wg_size(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
@@ -115,17 +125,49 @@ utils::uvec3 reduce_local_wg_size(
     const std::vector<ValueRef>& resize_args) {
   (void)shader;
   (void)global_workgroup_size;
+  (void)args;
 
   const int32_t reduce_dim_whcn =
       graph->extract_scalar<int32_t>(resize_args.at(1));
   const int64_t group_dim_whcn =
       graph->extract_scalar<int64_t>(resize_args.at(2));
-
   const uint32_t nworkers_per_group =
-      reduce_nworkers(graph, args.at(1).refs.at(0), reduce_dim_whcn);
+      utils::safe_downcast<uint32_t>(graph->extract_scalar<int32_t>(
+          resize_args.at(resize_args.size() - 1)));
 
   utils::uvec3 local_wg_size{1, 1, 1};
   local_wg_size[reduce_dim_whcn] = nworkers_per_group;
+  local_wg_size[group_dim_whcn] = kReduceNGroups;
+
+  return local_wg_size;
+}
+
+// As above for the 2d reduction. Note this deliberately keeps the existing
+// choice of which dim carries the NGROUPS threads: the shader reads tid.y from
+// group_dim, so spreading threads over reduce_dim2 instead leaves tid.y at 0
+// and merely makes those threads duplicate each other's work, which is
+// harmless. Changing it here alters the output write positions and breaks the
+// reduction, so only the worker count is corrected.
+utils::uvec3 reduce2d_local_wg_size(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const utils::uvec3& global_workgroup_size,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)shader;
+  (void)global_workgroup_size;
+  (void)args;
+
+  const int32_t reduce_dim1_whcn =
+      graph->extract_scalar<int32_t>(resize_args.at(1));
+  const int64_t group_dim_whcn =
+      graph->extract_scalar<int64_t>(resize_args.at(2));
+  const uint32_t nworkers_per_group =
+      utils::safe_downcast<uint32_t>(graph->extract_scalar<int32_t>(
+          resize_args.at(resize_args.size() - 1)));
+
+  utils::uvec3 local_wg_size{1, 1, 1};
+  local_wg_size[reduce_dim1_whcn] = nworkers_per_group;
   local_wg_size[group_dim_whcn] = kReduceNGroups;
 
   return local_wg_size;
@@ -172,6 +214,9 @@ void add_reduce_node(
   const ValueRef reduce_dim_whcn_ref =
       graph.get_or_add_value_for_int(reduce_dim);
   const ValueRef group_dim_whcn_ref = graph.get_or_add_value_for_int(group_dim);
+  const int32_t nworkers =
+      utils::safe_downcast<int32_t>(reduce_nworkers(&graph, in, reduce_dim));
+  const ValueRef nworkers_ref = graph.get_or_add_value_for_int(nworkers);
 
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
@@ -185,12 +230,9 @@ void add_reduce_node(
       // Push Constants
       {},
       // Specialization Constants
-      {graph.packed_dim_of(out),
-       reduce_dim,
-       group_dim,
-       utils::safe_downcast<int32_t>(reduce_nworkers(&graph, in, reduce_dim))},
+      {graph.packed_dim_of(out), reduce_dim, group_dim, nworkers},
       // Resize Args
-      {dim_ref, reduce_dim_whcn_ref, group_dim_whcn_ref},
+      {dim_ref, reduce_dim_whcn_ref, group_dim_whcn_ref, nworkers_ref},
       // Resizing Logic
       resize_reduce_node));
 }
@@ -252,12 +294,15 @@ void add_reduce2d_node(
   const ValueRef reduce_dim2_whcn_ref =
       graph.get_or_add_value_for_int(reduce_dim2);
   const ValueRef group_dim_whcn_ref = graph.get_or_add_value_for_int(group_dim);
+  const int32_t nworkers =
+      utils::safe_downcast<int32_t>(reduce_nworkers(&graph, in, reduce_dim1));
+  const ValueRef nworkers_ref = graph.get_or_add_value_for_int(nworkers);
 
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
       VK_KERNEL_FROM_STR(kernel_name),
       reduce_global_wg_size,
-      reduce_local_wg_size,
+      reduce2d_local_wg_size,
       // Inputs and Outputs
       {{out, vkapi::kWrite}, {in, vkapi::kRead}},
       // Shader params buffers
@@ -265,16 +310,13 @@ void add_reduce2d_node(
       // Push Constants
       {},
       // Specialization Constants
-      {graph.packed_dim_of(out),
-       reduce_dim1,
-       reduce_dim2,
-       group_dim,
-       utils::safe_downcast<int32_t>(reduce_nworkers(&graph, in, reduce_dim1))},
+      {graph.packed_dim_of(out), reduce_dim1, reduce_dim2, group_dim, nworkers},
       // Resize Args
       {dims_ref,
        reduce_dim1_whcn_ref,
        reduce_dim2_whcn_ref,
-       group_dim_whcn_ref},
+       group_dim_whcn_ref,
+       nworkers_ref},
       // Resizing Logic
       resize_reduce2d_node));
 }
