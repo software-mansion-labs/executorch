@@ -208,6 +208,22 @@ def register_copy_op():
 # =============================================================================
 
 
+def _check_clamp_bounds_are_static(node: torch.fx.Node) -> bool:
+    """Only support clamp when both bounds are static.
+
+    get_val_or_inf() in UnaryOp.cpp reads each bound with
+    extract_scalar<float>() when the node is BUILT and bakes the result into the
+    dispatch. A bound derived from a dynamic dimension is therefore never
+    refreshed, and the op silently computes against a stale limit -- no error is
+    raised. This is especially damaging when clamp is applied to index tensors,
+    where a wrong limit silently reorders or drops data downstream.
+    """
+    for bound in node.args[1:3]:
+        if isinstance(bound, torch.fx.Node):
+            return False
+    return True
+
+
 @update_features(
     [
         exir_ops.edge.aten.abs.default,
@@ -232,7 +248,9 @@ def register_unaryop_cpp_ops():
     return OpFeatures(
         inputs_storage=utils.ANY_STORAGE,
         inputs_dtypes=utils.FP_T,
-        supports_resize=True,
+        supports_resize=True,        # hardtanh/hardshrink/leaky_relu read their bounds through the same
+        # build-time get_val_or_inf() path as clamp.
+        are_node_inputs_supported_fn=_check_clamp_bounds_are_static,
     )
 
 
@@ -241,7 +259,7 @@ def register_clamp():
     return OpFeatures(
         inputs_storage=utils.ANY_STORAGE,
         inputs_dtypes=utils.FP_INT_T,
-        supports_resize=True,
+        supports_resize=True,        are_node_inputs_supported_fn=_check_clamp_bounds_are_static,
     )
 
 
