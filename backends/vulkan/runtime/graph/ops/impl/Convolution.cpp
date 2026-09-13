@@ -402,16 +402,28 @@ utils::uvec3 conv2d_local_wg_size(
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args) {
   (void)args;
-  (void)resize_args;
 
-  // Determine method from shader name
+  // Backport of infer_conv2d_method_from_shader from upstream main. The test
+  // here used to be "conv2d_pw" OR ("conv2d" AND NOT "conv_transpose2d"),
+  // whose second clause matches every conv2d shader there is, so the
+  // SlidingWindow branch below was unreachable and direct and depthwise
+  // convolutions were sized with the pointwise formula.
+  const ValueRef weight_data = resize_args.at(0);
+  const std::string& kernel_name = shader.kernel_name;
   Conv2dMethod method;
-  if (shader.kernel_name.find("conv2d_pw") != std::string::npos ||
-      (shader.kernel_name.find("conv2d") != std::string::npos &&
-       shader.kernel_name.find("conv_transpose2d") == std::string::npos)) {
+  // Checked before the plain "conv2d" test, which conv2d_dw and conv2d_pw
+  // would otherwise match too.
+  if (kernel_name.find("conv2d_dw") != std::string::npos) {
+    method = Conv2dMethod::Depthwise;
+  } else if (kernel_name.find("conv2d_pw") != std::string::npos) {
     method = Conv2dMethod::Pointwise;
+  } else if (kernel_name.find("conv_transpose2d") != std::string::npos) {
+    method = Conv2dMethod::Transposed;
   } else {
-    method = Conv2dMethod::SlidingWindow;
+    const auto& weight_sizes = graph->get_tref(weight_data)->sizes;
+    method = (weight_sizes.at(2) == 1 && weight_sizes.at(3) == 1)
+        ? Conv2dMethod::Pointwise
+        : Conv2dMethod::SlidingWindow;
   }
 
   if (method == Conv2dMethod::Pointwise) {
