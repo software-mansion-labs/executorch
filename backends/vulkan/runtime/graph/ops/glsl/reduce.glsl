@@ -96,14 +96,14 @@ void reduce_nonpacked_dim(const ivec2 tid, ivec3 scan_pos, const bool in_bounds)
   vec4 accum = vec4(0);
   if (in_bounds) {
     scan_pos[reduce_dim] = 0;
-    accum = INIT_ACCUM(load_texel(tin, scan_pos));
+    accum = INIT_ACCUM(vec4(load_texel(tin, scan_pos)));
 
     scan_pos[reduce_dim] = tid.x;
     // Partially accumulate over elements i, i + NWORKERS, i + 2*NWORKERS, ... of
     // the reduction row
     for (int i = tid.x; i < safe_idx(tin_sizes, reduce_dim);
          i += NWORKERS, scan_pos[reduce_dim] += NWORKERS) {
-      accum = UPDATE_ACCUM(accum, load_texel(tin, scan_pos));
+      accum = UPDATE_ACCUM(accum, vec4(load_texel(tin, scan_pos)));
     }
   }
   // Write partial output to shared memory and synchronize work group
@@ -135,7 +135,7 @@ void reduce_nonpacked_dim(const ivec2 tid, ivec3 scan_pos, const bool in_bounds)
       }
     }
     scan_pos[reduce_dim] = tid.x;
-    write_texel(tout, scan_pos, POSTPROCESS(accum));
+    write_texel(tout, scan_pos, VEC4_T(POSTPROCESS(accum)));
   }
 }
 
@@ -169,13 +169,14 @@ void reduce_packed_dim(const ivec2 tid, ivec3 scan_pos, const bool in_bounds) {
     scan_pos[reduce_dim] = tid.x;
     for (int i = tid.x * 4; i < reduce_len;
          i += NWORKERS * 4, scan_pos[reduce_dim] += NWORKERS) {
-      accum = UPDATE_ACCUM(accum, load_texel(tin, scan_pos));
+      accum = UPDATE_ACCUM(accum, vec4(load_texel(tin, scan_pos)));
     }
     // For the last texel in the dim, if there are padding elements then each
     // element of the texel needs to be processed individually such that the
     // padding elements are ignored
-    if (scan_pos[reduce_dim] == safe_idx(tin_limits, reduce_dim) - 1 && nspill > 0) {
-      const vec4 intex = load_texel(tin, scan_pos);
+    if (scan_pos[reduce_dim] == safe_idx(tin_limits, reduce_dim) - 1 &&
+        nspill > 0) {
+      const vec4 intex = vec4(load_texel(tin, scan_pos));
       for (int i = 0; i < nspill; i++) {
         accum.x = UPDATE_ACCUM(accum.x, intex[i]);
       }
@@ -202,7 +203,7 @@ void reduce_packed_dim(const ivec2 tid, ivec3 scan_pos, const bool in_bounds) {
     }
 
     scan_pos[reduce_dim] = tid.x;
-    write_texel(tout, scan_pos, POSTPROCESS(vec4(accum_final, 0, 0, 0)));
+    write_texel(tout, scan_pos, VEC4_T(POSTPROCESS(vec4(accum_final, 0, 0, 0))));
   }
 }
 
