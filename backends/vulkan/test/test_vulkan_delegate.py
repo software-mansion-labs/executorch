@@ -1307,6 +1307,84 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
+    def test_vulkan_backend_grid_sampler_2d(self):
+        class GridSampler2d(torch.nn.Module):
+            def __init__(self, padding_mode, align_corners):
+                super().__init__()
+                self.padding_mode = padding_mode
+                self.align_corners = align_corners
+
+            def forward(self, x, grid):
+                return torch.nn.functional.grid_sample(
+                    x,
+                    grid,
+                    mode="bilinear",
+                    padding_mode=self.padding_mode,
+                    align_corners=self.align_corners,
+                )
+
+        # Deliberately push the grid past [-1, 1] on every side so the zeros
+        # and border paths actually diverge; an in-range grid is identical
+        # under both and would pass even with the padding branch broken.
+        grid = torch.stack(
+            torch.meshgrid(
+                torch.linspace(-1.6, 1.6, 7),
+                torch.linspace(-1.6, 1.6, 5),
+                indexing="ij",
+            )[::-1],
+            dim=-1,
+        ).unsqueeze(0)
+        sample_inputs = (
+            torch.rand(size=(1, 4, 6, 8), dtype=torch.float32),
+            grid.contiguous(),
+        )
+
+        for padding_mode in ("zeros", "border"):
+            for align_corners in (True, False):
+                with self.subTest(
+                    padding_mode=padding_mode, align_corners=align_corners
+                ):
+                    self.lower_module_and_test_output(
+                        GridSampler2d(padding_mode, align_corners),
+                        sample_inputs,
+                    )
+
+    def test_vulkan_backend_slice_scatter(self):
+        class SliceScatter(torch.nn.Module):
+            def __init__(self, dim, start, step):
+                super().__init__()
+                self.dim = dim
+                self.start = start
+                self.step = step
+
+            def forward(self, x, src):
+                return torch.slice_scatter(
+                    x, src, dim=self.dim, start=self.start, step=self.step
+                )
+
+        # dim=1 with step=3 is the interleaving a YOLO pose head emits, and it
+        # is the interesting case for channels-packed storage: one output texel
+        # spans four positions along the scattered dim, so its components come
+        # from src and self alternately.
+        cases = [
+            # (self_shape, src_shape, dim, start, step)
+            ((1, 12, 7), (1, 4, 7), 1, 0, 3),
+            ((1, 12, 7), (1, 4, 7), 1, 1, 3),
+            ((1, 12, 7), (1, 4, 7), 1, 2, 3),
+            ((2, 6, 5), (2, 6, 2), 2, 1, 2),
+            ((3, 8, 4), (2, 8, 4), 0, 1, 1),
+        ]
+        for self_shape, src_shape, dim, start, step in cases:
+            with self.subTest(shape=self_shape, dim=dim, start=start, step=step):
+                sample_inputs = (
+                    torch.rand(size=self_shape, dtype=torch.float32),
+                    torch.rand(size=src_shape, dtype=torch.float32),
+                )
+                self.lower_module_and_test_output(
+                    SliceScatter(dim, start, step),
+                    sample_inputs,
+                )
+
     def test_vulkan_backend_minimum(self):
         class MinimumModule(torch.nn.Module):
             def __init__(self):

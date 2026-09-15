@@ -1398,6 +1398,31 @@ def register_slice_copy():
 
 
 # =============================================================================
+# SliceScatter.cpp
+# =============================================================================
+
+
+@update_features(exir_ops.edge.aten.slice_scatter.default)
+def register_slice_scatter():
+    def check_slice_scatter_node(node: torch.fx.Node) -> bool:
+        # Schema: slice_scatter(self, src, dim, start, end, step)
+        # A non-positive step has no meaning here and aten rejects it; the
+        # shader divides by step, so refuse rather than fault.
+        if len(node.args) >= 6:
+            step = node.args[5]
+            if isinstance(step, int) and step <= 0:
+                return False
+        return True
+
+    return OpFeatures(
+        inputs_storage=utils.CHANNELS_PACKED_TEXTURE,
+        inputs_dtypes=utils.FP_INT_BOOL_T,
+        supports_resize=True,
+        are_node_inputs_supported_fn=check_slice_scatter_node,
+    )
+
+
+# =============================================================================
 # Split.cpp
 # =============================================================================
 
@@ -1666,9 +1691,12 @@ def register_grid_priors():
 
 @update_features(exir_ops.edge.aten.grid_sampler_2d.default)
 def register_grid_sampler_2d():
-    # The Vulkan implementation only supports the configuration used by RIFE's
-    # WarpModule: bilinear interpolation (0), border padding (1),
-    # align_corners=True. The C++ side has VK_CHECK_COND asserts for these,
+    # The Vulkan implementation supports bilinear interpolation (0) with
+    # either zeros (0) or border (1) padding and either align_corners. That
+    # covers RIFE's WarpModule (border, align_corners=True) and the deformable
+    # attention in DETR derivatives (zeros, align_corners=False). Reflection
+    # padding and nearest/bicubic interpolation are not implemented.
+    # The C++ side has VK_CHECK_COND asserts for these,
     # but those abort the whole inference at graph build — for any other model
     # that contains a differently-configured grid_sampler_2d we want graceful
     # CPU fallback, so we gate delegation here.
@@ -1708,8 +1736,10 @@ def register_grid_sampler_2d():
         if interp is None or padding is None or align_corners is None:
             return False
 
-        # mode: 0 = bilinear; padding: 1 = border; align_corners must be True.
-        return interp == 0 and padding == 1 and bool(align_corners) is True
+        # mode: 0 = bilinear. padding: 0 = zeros, 1 = border (2 = reflection
+        # needs a coordinate fold the shader does not implement).
+        # align_corners is free: both settings are specialization constants.
+        return interp == 0 and padding in (0, 1)
 
     return OpFeatures(
         inputs_storage=[
