@@ -90,22 +90,19 @@ void add_index_select_channel_node(
 
 struct IndexSelectParams final {
   int32_t gpu_dim;
-  int32_t stride;
 };
 
-IndexSelectParams create_index_select_params(
-    ComputeGraph& graph,
-    const int64_t dim_idx,
-    const ValueRef in) {
+IndexSelectParams create_index_select_params(const int64_t dim_idx) {
   if (dim_idx == kWidth4D) {
-    return {0, 1};
+    return {0};
   } else if (dim_idx == kHeight4D) {
-    return {1, 1};
+    return {1};
   } else if (dim_idx == kBatch4D) {
-    const std::vector<int64_t> in_sizes = graph.sizes_of(in);
-    int64_t n_channels = dim_at(in_sizes, kChannel4D);
-    int64_t stride = utils::div_up_4(n_channels);
-    return {2, static_cast<int32_t>(stride)};
+    // The batch axis shares the z axis with the channels, so the shader steps
+    // over one batch in units of channel texels. That stride is derived from
+    // the channel count, which a resize can change, so the shader reads it out
+    // of in_sizes rather than taking a value frozen at build time.
+    return {2};
   } else {
     VK_THROW("Unexpected dim_idx!");
   }
@@ -119,7 +116,7 @@ void add_index_select_node(
     ValueRef out) {
   check_index_select_args(graph, in, idx, out);
 
-  IndexSelectParams params = create_index_select_params(graph, dim_idx, in);
+  IndexSelectParams params = create_index_select_params(dim_idx);
 
   std::string kernel_name = "index_select";
   kernel_name.reserve(kShaderNameReserve);
@@ -164,7 +161,9 @@ void add_index_select_node(
       default_pick_global_wg_size,
       default_pick_local_wg_size,
       {{out, vkapi::kWrite}, {{in, idx}, vkapi::kRead}},
-      {graph.sizes_ubo(out), graph.create_params_buffer(params)},
+      {graph.sizes_ubo(out),
+       graph.sizes_ubo(in),
+       graph.create_params_buffer(params)},
       // Push Constants
       {},
       // Specialization Constants
