@@ -11,6 +11,7 @@ linear_q4gsw_tiled:
     IO_STORAGE: texture3d
     WEIGHT_STORAGE: texture2d
     TILE_M4: 1
+    TILE_M: 4
     TILE_K4: 1
     TILE_N8: 1
   generate_variant_forall:
@@ -41,3 +42,39 @@ linear_q4gsw_tiled:
       IO_STORAGE: buffer
       WEIGHT_STORAGE: buffer
       SCALE_DTYPE: float
+    # Narrow-M variants for Mali. The default tile is 4 rows x 8 columns,
+    # double the accumulator registers of the float linear_vec tile (4x4), and
+    # a 4x8 tile measured 5.4x slower than 4x4 on a Mali-G76 for the FLOAT
+    # kernel -- same FLOPs, tile width the only change. 2x8 brings the
+    # accumulator count back to linear_vec's. Adreno is unaffected and keeps
+    # the wide tile.
+    - NAME: linear_q4gsw_tiledm2_texture3d_texture2d
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_texture3d_buffer
+      WEIGHT_STORAGE: buffer
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_buffer_texture2d
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: texture2d
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_buffer_buffer
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: buffer
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_scalefp32_texture3d_texture2d
+      SCALE_DTYPE: float
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_scalefp32_texture3d_buffer
+      WEIGHT_STORAGE: buffer
+      SCALE_DTYPE: float
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_scalefp32_buffer_texture2d
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: texture2d
+      SCALE_DTYPE: float
+      TILE_M: 2
+    - NAME: linear_q4gsw_tiledm2_scalefp32_buffer_buffer
+      IO_STORAGE: buffer
+      WEIGHT_STORAGE: buffer
+      SCALE_DTYPE: float
+      TILE_M: 2

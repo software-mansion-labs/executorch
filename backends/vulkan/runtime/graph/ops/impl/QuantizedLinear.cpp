@@ -150,6 +150,12 @@ utils::uvec3 quantized_linear_global_wg_size(
   if (shader.kernel_name.find("coop") != std::string::npos) {
     M_per_tile = 1;
   }
+  // Must mirror the _tiledm2 selection in pick_quantized_linear_shader: the
+  // shader derives its row offset from TILE_M, so a grid sized for 4 rows
+  // would leave half of every tile unwritten.
+  if (shader.kernel_name.find("tiledm2") != std::string::npos) {
+    M_per_tile = 2;
+  }
 
   if (shader.kernel_name.find("q8ta_q8csw_tiled") != std::string::npos) {
     N_per_tile = 8;
@@ -303,6 +309,14 @@ vkapi::ShaderInfo pick_linear_qw_shader(
 
   if (weight_is_4bit && is_gemv_case) {
     kernel_name += "_coop";
+  } else if (
+      weight_is_4bit && graph->device_is_mali()) {
+    // Mali cannot afford the default 4x8 output tile. Measured on a Mali-G76
+    // with the FLOAT linear kernel, where widening the tile from 4x4 to 4x8 is
+    // the only change: 5.07 s -> 27.45 s, 5.4x. The same widening costs 1.12x
+    // on an Adreno 840, which is why the wide tile is right everywhere else.
+    // 2x8 restores the accumulator count of the 4x4 float tile.
+    kernel_name += "_tiledm2";
   } else {
     kernel_name += "_tiled";
   }
