@@ -427,6 +427,18 @@ class Adapter final {
     return physical_device_.properties.limits.maxStorageBufferRange;
   }
 
+  inline utils::uvec3 max_compute_workgroup_size() const {
+    const VkPhysicalDeviceLimits& limits = physical_device_.properties.limits;
+    return {
+        limits.maxComputeWorkGroupSize[0],
+        limits.maxComputeWorkGroupSize[1],
+        limits.maxComputeWorkGroupSize[2]};
+  }
+
+  inline uint32_t max_compute_workgroup_invocations() const {
+    return physical_device_.properties.limits.maxComputeWorkGroupInvocations;
+  }
+
   // Command Buffer Submission
 
   void submit_cmd(

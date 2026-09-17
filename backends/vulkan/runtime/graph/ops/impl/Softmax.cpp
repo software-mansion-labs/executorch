@@ -14,22 +14,52 @@
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/utils/TensorUtils.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/utils/ShaderNameUtils.h>
 
+#include <algorithm>
+
 namespace vkcompute {
 
 using namespace utils;
 
-// Threads co-operating on one softmax row, scaled with the row length. The
-// shader's shared arrays are MAX_NTHREADS (256) wide. Buffer storage only.
+// This should match the value of MAX_NTHREADS in softmax_buffer.
+constexpr uint32_t kSoftmaxBufferMaxNThreads = 256u;
+
+// The largest worker count the buffer dispatch may ask for. The shared arrays
+// in the shader are one ceiling, but they are not the only one: a device
+// bounds the invocations in a work group (maxComputeWorkGroupInvocations is
+// only guaranteed to be 128) and bounds each axis separately. The buffer
+// launch puts every worker on the reduction axis and leaves the other two at
+// one, so both device limits apply to the worker count directly, and
+// overrunning either aborts the dispatch when the work group is validated.
+uint32_t softmax_nworkers_cap(ComputeGraph* graph, const int32_t reduce_dim) {
+  const vkapi::Adapter* const adapter = graph->context()->adapter_ptr();
+  uint32_t cap = kSoftmaxBufferMaxNThreads;
+  cap = std::min(cap, adapter->max_compute_workgroup_invocations());
+  cap = std::min(cap, adapter->max_compute_workgroup_size()[reduce_dim]);
+  // The shader folds the partials as a tree that halves the worker count each
+  // step, so the count has to be a power of two for the last step to land on
+  // slot 0. Round the cap down to one.
+  uint32_t pow2 = 1u;
+  while (pow2 * 2u <= cap) {
+    pow2 *= 2u;
+  }
+  return pow2;
+}
+
+// Threads co-operating on one softmax row, scaled with the row length. Buffer
+// storage only: the texture path uses a different shader and grouping scheme.
 // Backport of pytorch/executorch#22349.
 uint32_t softmax_nworkers(
     ComputeGraph* graph,
     const ValueRef in,
     const int32_t reduce_dim) {
+  const uint32_t cap = softmax_nworkers_cap(graph, reduce_dim);
   // reduce_dim is a WHCN/xyz index (0 = x = last dim) while size_at counts back
   // from the end, so xyz 0 -> -1, 1 -> -2, 2 -> -3.
   const uint32_t extent = graph->size_at<uint32_t>(-(reduce_dim + 1), in);
-  uint32_t nworkers = 4u;
-  while (nworkers < 256u && nworkers < extent) {
+  // 4 is what this used to be unconditionally; keep it as the floor so short
+  // rows dispatch exactly as they did before.
+  uint32_t nworkers = std::min(4u, cap);
+  while (nworkers * 2u <= cap && nworkers < extent) {
     nworkers *= 2u;
   }
   return nworkers;

@@ -14,6 +14,8 @@
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/utils/TensorUtils.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/utils/ShaderNameUtils.h>
 
+#include <algorithm>
+
 namespace vkcompute {
 
 using namespace utils;
@@ -88,20 +90,44 @@ utils::uvec3 reduce_global_wg_size(
 }
 
 // Threads co-operating on one reduction output, scaled with the reduction
-// extent. kReduceNGroups * this must stay within MAX_NTHREADS (256) in the
-// shaders. Backport of pytorch/executorch#22348.
+// extent. Backport of pytorch/executorch#22348.
 constexpr uint32_t kReduceMaxNThreads = 256u;
 constexpr uint32_t kReduceNGroups = 4u;
+
+// The largest worker count this dispatch may ask for. Three ceilings apply and
+// the smallest of them wins:
+//
+//  - the shaders size shared_vecs at MAX_NTHREADS and every thread in the work
+//    group writes its own slot, so kReduceNGroups workers must fit;
+//  - the device bounds the invocations in one work group, and
+//    maxComputeWorkGroupInvocations is only guaranteed to be 128;
+//  - the device bounds each work group axis on its own, and the workers all sit
+//    on the reduction axis.
+//
+// Overrunning any of them aborts the dispatch when the work group is
+// validated, so the shader capacity alone is not enough to go by.
+uint32_t reduce_nworkers_cap(
+    ComputeGraph* graph,
+    const int32_t reduce_dim_whcn) {
+  const vkapi::Adapter* const adapter = graph->context()->adapter_ptr();
+  uint32_t cap = kReduceMaxNThreads / kReduceNGroups;
+  cap = std::min(
+      cap, adapter->max_compute_workgroup_invocations() / kReduceNGroups);
+  cap = std::min(cap, adapter->max_compute_workgroup_size()[reduce_dim_whcn]);
+  return std::max(cap, 1u);
+}
 
 uint32_t reduce_nworkers(
     ComputeGraph* graph,
     const ValueRef in,
     const int32_t reduce_dim_whcn) {
-  const uint32_t cap = kReduceMaxNThreads / kReduceNGroups;
+  const uint32_t cap = reduce_nworkers_cap(graph, reduce_dim_whcn);
   const uint32_t extent = utils::safe_downcast<uint32_t>(
       graph->logical_limits_of(in)[reduce_dim_whcn]);
-  uint32_t nworkers = 4u;
-  while (nworkers < cap && nworkers < extent) {
+  // 4 is what this used to be unconditionally; keep it as the floor so short
+  // reductions dispatch exactly as they did before.
+  uint32_t nworkers = std::min(4u, cap);
+  while (nworkers * 2u <= cap && nworkers < extent) {
     nworkers *= 2u;
   }
   return nworkers;
