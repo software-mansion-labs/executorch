@@ -39,6 +39,12 @@ class RemoveRedundantOpsTransform(ExportPass):
         # repeat.default: no-op when every repeat factor is 1, which the shape
         # equality check below implies.
         exir_ops.edge.aten.repeat.default,
+        # view_copy.default: a view onto the same shape. These survive into the
+        # partition and dispatch a shader that reads every texel and writes it
+        # back unchanged. Only same-shape views are safe to drop here: a view
+        # that changes the rank must keep its node, because the ops downstream
+        # read their argument's shape.
+        exir_ops.edge.aten.view_copy.default,
     }
 
     # For these ops the meaningful input is args[1] (src), not args[0] (self).
