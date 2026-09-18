@@ -15,6 +15,8 @@
 #include <mlx/mlx.h>
 #include <mlx/ops.h>
 
+#include <cstdlib>
+
 namespace executorch {
 namespace backends {
 namespace mlx {
@@ -1868,6 +1870,17 @@ class Interpreter {
     run_chain(prog, prog.main_chain_idx, st, stream);
   }
 
+  // Instructions allowed to accumulate unevaluated before a forced eval.
+  // 0 disables the barrier entirely (the pre-#22513 behaviour).
+  static size_t eval_interval() {
+    static const size_t n = [] {
+      const char* e = std::getenv("ET_MLX_EVAL_EVERY");
+      return e == nullptr ? size_t{32}
+                          : static_cast<size_t>(std::strtoul(e, nullptr, 10));
+    }();
+    return n;
+  }
+
   void run_chain(
       const MLXProgram& prog,
       uint32_t chain_idx,
@@ -1880,6 +1893,18 @@ class Interpreter {
           std::to_string(prog.instruction_chains.size()) + ")");
     }
     const auto& chain = prog.instruction_chains[chain_idx];
+    // MLX is lazy: dispatch() only builds graph nodes, and nothing is
+    // materialized until MLXBackend::execute calls async_eval on the outputs.
+    // For a long chain that means every intermediate in the method is live at
+    // the same time. Whisper-small's 495-instruction encode peaks at 1105 MB of
+    // MLX allocation against 95 MB of steady-state active memory, which is what
+    // makes the model unusable on an iPhone (pytorch/executorch#22513).
+    //
+    // Bound it by evaluating every N instructions, which caps how much of the
+    // graph can be pending at once. Evaluating early does not change results
+    // (verified bit-identical on all three whisper sizes).
+    const size_t eval_every = eval_interval();
+    size_t since_eval = 0;
     size_t idx = 0;
     for (const auto& instr : chain) {
       st.begin_op(idx, op_name(instr.op));
@@ -1892,6 +1917,23 @@ class Interpreter {
       }
       st.end_op();
       ++idx;
+
+      if (eval_every != 0) {
+        ++since_eval;
+        if (since_eval >= eval_every) {
+          std::vector<::mlx::core::array> live;
+          live.reserve(st.tensors.size());
+          for (auto& t : st.tensors) {
+            if (t.has_value()) {
+              live.push_back(*t);
+            }
+          }
+          if (!live.empty()) {
+            ::mlx::core::eval(live);
+          }
+          since_eval = 0;
+        }
+      }
     }
   }
 
