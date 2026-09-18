@@ -15,6 +15,7 @@
 #include <mlx/mlx.h>
 #include <mlx/ops.h>
 
+#include <algorithm>
 #include <cstdlib>
 
 namespace executorch {
@@ -1870,15 +1871,17 @@ class Interpreter {
     run_chain(prog, prog.main_chain_idx, st, stream);
   }
 
-  // Instructions allowed to accumulate unevaluated before a forced eval.
+  // Bytes of pending intermediates allowed to accumulate before a forced eval.
   // 0 disables the barrier entirely (the pre-#22513 behaviour).
-  static size_t eval_interval() {
-    static const size_t n = [] {
-      const char* e = std::getenv("ET_MLX_EVAL_EVERY");
-      return e == nullptr ? size_t{32}
-                          : static_cast<size_t>(std::strtoul(e, nullptr, 10));
+  static size_t eval_budget_bytes() {
+    static const size_t bytes = [] {
+      const char* e = std::getenv("ET_MLX_EVAL_BUDGET_MB");
+      size_t mb = e == nullptr
+          ? 512u
+          : static_cast<size_t>(std::strtoul(e, nullptr, 10));
+      return mb * 1024u * 1024u;
     }();
-    return n;
+    return bytes;
   }
 
   void run_chain(
@@ -1900,11 +1903,20 @@ class Interpreter {
     // MLX allocation against 95 MB of steady-state active memory, which is what
     // makes the model unusable on an iPhone (pytorch/executorch#22513).
     //
-    // Bound it by evaluating every N instructions, which caps how much of the
-    // graph can be pending at once. Evaluating early does not change results
-    // (verified bit-identical on all three whisper sizes).
-    const size_t eval_every = eval_interval();
-    size_t since_eval = 0;
+    // Bound it by evaluating once the intermediates produced since the last
+    // barrier exceed a byte budget. Each barrier costs a GPU sync, so the cost
+    // tracks the NUMBER of barriers, and the budget is on bytes rather than an
+    // instruction count so that only methods which actually allocate get any.
+    // Whisper-small at 512 MB takes 12 barriers in encode and 0 in decode,
+    // where an every-32-instruction rule took 15 and 22 -- and those 22 bought
+    // 50 MB on a method that peaks at 258 MB while costing 21% on an iPhone 16.
+    //
+    // Per instruction we add the largest tensor it touches, which tracks the
+    // size of what it just produced without needing to know which tid is the
+    // output. Evaluating early does not change results (verified
+    // bit-identical).
+    const size_t eval_budget = eval_budget_bytes();
+    size_t pending_bytes = 0;
     size_t idx = 0;
     for (const auto& instr : chain) {
       st.begin_op(idx, op_name(instr.op));
@@ -1918,9 +1930,18 @@ class Interpreter {
       st.end_op();
       ++idx;
 
-      if (eval_every != 0) {
-        ++since_eval;
-        if (since_eval >= eval_every) {
+      if (eval_budget != 0) {
+        size_t widest = 0;
+        for_each_tid(instr, [&](Tid id) {
+          if (id.idx >= st.num_constants && !st.is_mutable_buffer(id)) {
+            uint32_t slot = st.tensor_index(id);
+            if (slot < st.tensors.size() && st.tensors[slot].has_value()) {
+              widest = std::max(widest, st.tensors[slot]->nbytes());
+            }
+          }
+        });
+        pending_bytes += widest;
+        if (pending_bytes >= eval_budget) {
           std::vector<::mlx::core::array> live;
           live.reserve(st.tensors.size());
           for (auto& t : st.tensors) {
@@ -1931,7 +1952,7 @@ class Interpreter {
           if (!live.empty()) {
             ::mlx::core::eval(live);
           }
-          since_eval = 0;
+          pending_bytes = 0;
         }
       }
     }
