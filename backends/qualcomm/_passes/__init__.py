@@ -23,6 +23,7 @@ from .decompose_col_im import DecomposeColIm
 from .decompose_diagonal import DecomposeDiagonal
 from .decompose_div_mode import DecomposeDivMode
 from .decompose_einsum import DecomposeEinsum
+from .decompose_empty import DecomposeEmpty
 from .decompose_expm1 import DecomposeExpM1
 from .decompose_fill import DecomposeFill
 from .decompose_glu import DecomposeGlu
@@ -87,6 +88,7 @@ __all__ = [
     DecomposeDiagonal,
     DecomposeDivMode,
     DecomposeEinsum,
+    DecomposeEmpty,
     DecomposeExpM1,
     DecomposeFill,
     DecomposeGlu,
