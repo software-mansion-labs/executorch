@@ -173,6 +173,12 @@ void main() {
   // Only the first thread will write out result
   if (lid == 0) {
     out_tile = partial_sums[0];
+    if (apply_bias > 0) {
+      FPPerOutChannelParams bias_tile;
+      load_bias_tile(bias_tile, n4);
+      fp32_add_bias_to_out_tile(out_tile, bias_tile);
+    }
+
     fp32_write_output_tile_with_checks(out_tile, n4, 0, N4, 1);
   }
 }

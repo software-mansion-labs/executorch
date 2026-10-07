@@ -114,6 +114,16 @@ void fp32_accumulate_out_tile_with_out_tile(
   }
 }
 
+void fp32_add_bias_to_out_tile(
+    inout LinearFPOutTileFP32 tile,
+    const FPPerOutChannelParams bias) {
+  [[unroll]] for (int m = 0; m < TILE_M; ++m) {
+    [[unroll]] for (int n4 = 0; n4 < TILE_N4; ++n4) {
+      tile.data[m][n4] = tile.data[m][n4] + vec4(bias.data[n4]);
+    }
+  }
+}
+
 // Storage helpers.
 void fp32_write_output_x4(
     const vec4 out_texel,

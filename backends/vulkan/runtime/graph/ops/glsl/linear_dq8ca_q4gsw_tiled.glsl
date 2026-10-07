@@ -183,5 +183,11 @@ void main() {
 #endif
   }
 
+  if (apply_bias > 0) {
+    FPPerOutChannelParams bias_tile;
+    load_bias_tile(bias_tile, n4);
+    fp32_add_bias_to_out_tile(out_tile, bias_tile);
+  }
+
   fp32_write_output_tile_with_checks(out_tile, n4, m, N4, M);
 }
