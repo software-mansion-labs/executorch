@@ -33,18 +33,18 @@ using executorch::runtime::MemoryAllocator;
 
 XNNWeightsCache::XNNWeightsCache() {
   weights_cache_.context = this;
-  weights_cache_.look_up = (size_t(*)(
+  weights_cache_.look_up = (size_t (*)(
       void*, const xnn_weights_cache_look_up_key*))XNNWeightsCache::look_up;
   weights_cache_.reserve_space =
       (void* (*)(void*, size_t))XNNWeightsCache::reserve_space;
   weights_cache_.look_up_or_insert =
-      (size_t(*)(void*, const xnn_weights_cache_look_up_key*, void*, size_t))
+      (size_t (*)(void*, const xnn_weights_cache_look_up_key*, void*, size_t))
           XNNWeightsCache::look_up_or_insert;
   weights_cache_.is_finalized = (bool (*)(void*))XNNWeightsCache::is_finalized;
   weights_cache_.offset_to_addr =
       (void* (*)(void*, size_t))XNNWeightsCache::offset_to_addr;
   weights_cache_.delete_cache =
-      (enum xnn_status(*)(void*))XNNWeightsCache::delete_cache;
+      (enum xnn_status (*)(void*))XNNWeightsCache::delete_cache;
 }
 
 XNNWeightsCache::~XNNWeightsCache() {
@@ -290,6 +290,20 @@ Result<const uint8_t*> XNNWeightsCache::load_unpacked_data(
   unpacked_data_.push_back(std::move(named_data.get()));
   unpacked_data_to_name_[data_pointer] = name;
   return data_pointer;
+}
+
+void XNNWeightsCache::qualify_unpacked_name(
+    const void* data_ptr,
+    const std::string& suffix) {
+  auto entry = unpacked_data_to_name_.find(data_ptr);
+  if (entry != unpacked_data_to_name_.end()) {
+    entry->second.append(suffix);
+  }
+}
+
+std::string XNNWeightsCache::unpacked_name(const void* data_ptr) const {
+  auto entry = unpacked_data_to_name_.find(data_ptr);
+  return entry == unpacked_data_to_name_.end() ? std::string() : entry->second;
 }
 
 void XNNWeightsCache::release_entry(void* packed_data_ptr) {

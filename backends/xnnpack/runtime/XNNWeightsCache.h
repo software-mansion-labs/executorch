@@ -152,6 +152,23 @@ class XNNWeightsCache {
   Result<const uint8_t*> load_unpacked_data(const std::string& name);
 
   /**
+   * Appends `suffix` to the cache name of a buffer returned by
+   * load_unpacked_data. XNNPACK folds quantization parameters (scales, zero
+   * points) into the packed weights, but the cache identifies packed data by
+   * the unpacked kernel's name alone, so two weights with identical bytes and
+   * different scales would share one entry and the second would run with the
+   * first's scales. No-op for pointers the cache did not load (inline
+   * constants), which never hit the cache.
+   */
+  void qualify_unpacked_name(const void* data_ptr, const std::string& suffix);
+
+  /**
+   * The cache name of a buffer returned by load_unpacked_data, or an empty
+   * string for a pointer the cache did not load.
+   */
+  std::string unpacked_name(const void* data_ptr) const;
+
+  /**
    * Deletes the packed data associated with the names given.
    * Decrements the ref_count if the packed data is used by other
    * models

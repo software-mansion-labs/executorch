@@ -53,20 +53,21 @@ class XNNWeightsCacheTest : public ::testing::Test {
                 builder_, "weight", /*segment_index=*/0),
             executorch_flatbuffer::CreateNamedDataDirect(
                 builder_, "bias", /*segment_index=*/1),
-        };
+    };
     const auto named_data =
         builder_.CreateVector(named_data_arr.data(), named_data_arr.size());
 
     // Create segments.
     std::array<const flatbuffers::Offset<executorch_flatbuffer::DataSegment>, 2>
-        segment_arr = {// @lint-ignore CLANGTIDY facebook-hte-BadArgumentComment
-                       executorch_flatbuffer::CreateDataSegment(
-                           builder_, /*offset=*/0, /*size=*/kSegmentSizes[0]),
-                       // @lint-ignore CLANGTIDY facebook-hte-BadArgumentComment
-                       executorch_flatbuffer::CreateDataSegment(
-                           builder_,
-                           /*offset=*/kSegmentAlignment * 2,
-                           /*size=*/kSegmentSizes[1])};
+        segment_arr = {
+            // @lint-ignore CLANGTIDY facebook-hte-BadArgumentComment
+            executorch_flatbuffer::CreateDataSegment(
+                builder_, /*offset=*/0, /*size=*/kSegmentSizes[0]),
+            // @lint-ignore CLANGTIDY facebook-hte-BadArgumentComment
+            executorch_flatbuffer::CreateDataSegment(
+                builder_,
+                /*offset=*/kSegmentAlignment * 2,
+                /*size=*/kSegmentSizes[1])};
     const auto segments =
         builder_.CreateVector(segment_arr.data(), segment_arr.size());
 
@@ -290,6 +291,183 @@ TEST_F(XNNWeightsCacheTest, ReusePackedWeights) {
   ASSERT_EQ(packed_data_names.size(), 0);
 }
 
+// A per-channel quantized kernel is packed together with its requantization
+// scales, which depend on the consuming node's input and output quantization.
+// Two nodes can therefore share the very same kernel bytes and kernel scales
+// and still need different packed weights. The compiler tells the cache about
+// that through qualify_unpacked_name; this test drives the cache the way the
+// compiler does and checks that the second node does not run on the first
+// node's packing.
+TEST_F(XNNWeightsCacheTest, SameKernelBytesDifferentRequantizationPackApart) {
+  constexpr size_t kInputChannels = 8;
+  constexpr size_t kOutputChannels = 4;
+  constexpr size_t kBatch = 2;
+  // "weight" is kSegmentSizes[0] bytes of 1, enough for a [4, 8] int8 kernel.
+  static_assert(kOutputChannels * kInputChannels <= kSegmentSizes[0]);
+  const std::array<float, kOutputChannels> kernel_scales{
+      0.5f, 0.25f, 0.125f, 0.0625f};
+  std::array<int8_t, kBatch * kInputChannels> input;
+  for (size_t i = 0; i < input.size(); i++) {
+    input[i] = static_cast<int8_t>(i * 7 - 40);
+  }
+
+  // Builds qint8 input -> qc8 fully connected -> qint8 output around the
+  // "weight" segment and runs it once. `cache == nullptr` runs without a
+  // weights cache (the reference); `qualifier` is what XNNCompiler appends to
+  // the kernel's cache name for this node, "" leaves the bare name.
+  auto run = [&](XNNWeightsCache* cache,
+                 const char* qualifier,
+                 float output_scale,
+                 std::array<int8_t, kBatch * kOutputChannels>& output) {
+    xnn_subgraph_t subgraph_ptr = nullptr;
+    ASSERT_EQ(xnn_create_subgraph(2, 0, &subgraph_ptr), xnn_status_success);
+    std::unique_ptr<xnn_subgraph, decltype(&xnn_delete_subgraph)> subgraph(
+        subgraph_ptr, &xnn_delete_subgraph);
+
+    const uint8_t* kernel = nullptr;
+    // Without a cache the kernel is read straight from the data map; the
+    // buffer has to outlive the runtime, hence the outer scope.
+    Result<executorch::runtime::FreeableBuffer> direct = cache != nullptr
+        ? Result<executorch::runtime::FreeableBuffer>(Error::InvalidArgument)
+        : data_map_->get_data("weight");
+    if (cache != nullptr) {
+      Result<const uint8_t*> loaded = cache->load_unpacked_data("weight");
+      ASSERT_TRUE(loaded.ok());
+      kernel = loaded.get();
+      cache->qualify_unpacked_name(kernel, qualifier);
+    } else {
+      ASSERT_TRUE(direct.ok());
+      kernel = static_cast<const uint8_t*>(direct.get().data());
+    }
+
+    uint32_t input_id = XNN_INVALID_VALUE_ID;
+    std::array<size_t, 2> input_dims{kBatch, kInputChannels};
+    ASSERT_EQ(
+        xnn_define_quantized_tensor_value(
+            subgraph_ptr,
+            xnn_datatype_qint8,
+            /*zero_point=*/0,
+            /*scale=*/1.0f / 64.0f,
+            input_dims.size(),
+            input_dims.data(),
+            nullptr,
+            0,
+            XNN_VALUE_FLAG_EXTERNAL_INPUT,
+            &input_id),
+        xnn_status_success);
+
+    uint32_t kernel_id = XNN_INVALID_VALUE_ID;
+    std::array<size_t, 2> kernel_dims{kOutputChannels, kInputChannels};
+    ASSERT_EQ(
+        xnn_define_channelwise_quantized_tensor_value_v2(
+            subgraph_ptr,
+            xnn_datatype_qcint8,
+            /*zero_point=*/0,
+            kernel_scales.data(),
+            kernel_dims.size(),
+            /*channel_dim=*/0,
+            kernel_dims.data(),
+            kernel,
+            XNN_INVALID_VALUE_ID,
+            0,
+            &kernel_id),
+        xnn_status_success);
+
+    uint32_t output_id = XNN_INVALID_VALUE_ID;
+    std::array<size_t, 2> output_dims{kBatch, kOutputChannels};
+    ASSERT_EQ(
+        xnn_define_quantized_tensor_value(
+            subgraph_ptr,
+            xnn_datatype_qint8,
+            /*zero_point=*/0,
+            output_scale,
+            output_dims.size(),
+            output_dims.data(),
+            nullptr,
+            1,
+            XNN_VALUE_FLAG_EXTERNAL_OUTPUT,
+            &output_id),
+        xnn_status_success);
+
+    ASSERT_EQ(
+        xnn_define_fully_connected(
+            subgraph_ptr,
+            -std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::infinity(),
+            input_id,
+            kernel_id,
+            XNN_INVALID_VALUE_ID,
+            output_id,
+            0),
+        xnn_status_success);
+
+    xnn_runtime_t runtime_ptr = nullptr;
+    ASSERT_EQ(
+        xnn_create_runtime_v3(
+            subgraph_ptr,
+            cache != nullptr ? cache->get() : nullptr,
+            nullptr,
+            0,
+            &runtime_ptr),
+        xnn_status_success);
+    std::unique_ptr<xnn_runtime, decltype(&xnn_delete_runtime)> runtime(
+        runtime_ptr, xnn_delete_runtime);
+    if (cache != nullptr) {
+      ASSERT_TRUE(cache->finalize_for_runtime().ok());
+    }
+
+    const std::array<xnn_external_value, 2> external = {
+        xnn_external_value{0, input.data()},
+        xnn_external_value{1, output.data()},
+    };
+    ASSERT_EQ(xnn_reshape_runtime(runtime.get()), xnn_status_success);
+    ASSERT_EQ(
+        xnn_setup_runtime_v2(runtime.get(), external.size(), external.data()),
+        xnn_status_success);
+    ASSERT_EQ(xnn_invoke_runtime(runtime.get()), xnn_status_success);
+  };
+
+  // References without a cache: the two output scales must give different
+  // int8 results, or the test could not tell the packings apart.
+  std::array<int8_t, kBatch * kOutputChannels> ref_coarse, ref_fine;
+  run(nullptr, "", /*output_scale=*/0.5f, ref_coarse);
+  run(nullptr, "", /*output_scale=*/0.0625f, ref_fine);
+  ASSERT_NE(ref_coarse, ref_fine);
+
+  XNNWeightsCache cache;
+  std::array<int8_t, kBatch * kOutputChannels> out;
+
+  // Node A packs under its own qualified name.
+  cache.initialize_for_runtime(memory_allocator_.get(), data_map_.get());
+  run(&cache, "|io:coarse", 0.5f, out);
+  ASSERT_EQ(out, ref_coarse);
+
+  // Node B: same kernel bytes and kernel scales, different output scale. With
+  // the qualifier its name differs, so it must pack its own weights.
+  cache.initialize_for_runtime(memory_allocator_.get(), data_map_.get());
+  run(&cache, "|io:fine", 0.0625f, out);
+  ASSERT_EQ(out, ref_fine);
+  ASSERT_EQ(cache.get_packed_data_names().size(), 2u);
+
+  // And a genuine duplicate of node A still shares its entry.
+  cache.initialize_for_runtime(memory_allocator_.get(), data_map_.get());
+  run(&cache, "|io:coarse", 0.5f, out);
+  ASSERT_EQ(out, ref_coarse);
+  ASSERT_EQ(cache.get_packed_data_names().size(), 2u);
+
+  // Without the qualifier both nodes would share one name, and the second
+  // would silently run on the first's packing: XNNPACK takes a look_up hit
+  // as final and never packs, so nothing downstream can catch it.
+  XNNWeightsCache unqualified;
+  unqualified.initialize_for_runtime(memory_allocator_.get(), data_map_.get());
+  run(&unqualified, "", 0.5f, out);
+  ASSERT_EQ(out, ref_coarse);
+  unqualified.initialize_for_runtime(memory_allocator_.get(), data_map_.get());
+  run(&unqualified, "", 0.0625f, out);
+  ASSERT_NE(out, ref_fine);
+  ASSERT_EQ(unqualified.get_packed_data_names().size(), 1u);
+}
+
 TEST_F(XNNWeightsCacheTest, TakenUnpackedDataSurvivesFinalize) {
   // XNNPACK does not pack every constant it is given: PReLU slopes, for one,
   // stay as the unpacked buffer the subgraph points at. Those buffers are taken
@@ -372,7 +550,7 @@ TEST_F(XNNWeightsCacheTest, PackedWeightsToMmapFile) {
       output_tensor.data());
 
   // The cache file should have been created and contain packed weight bytes.
-  struct stat st {};
+  struct stat st{};
   ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
   ASSERT_GT(st.st_size, 0);
 
@@ -546,7 +724,7 @@ TEST_F(XNNWeightsCacheTest, MultiSessionLoad_DoesNotGrowCacheFile) {
         input.data(),
         output.data());
     ASSERT_EQ(cache.save_packed_index(), Error::Ok);
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
     size_after_first_save = st.st_size;
     ASSERT_GT(size_after_first_save, 0);
@@ -569,7 +747,7 @@ TEST_F(XNNWeightsCacheTest, MultiSessionLoad_DoesNotGrowCacheFile) {
     ASSERT_EQ(cache.save_packed_index(), Error::Ok);
   }
   {
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
     EXPECT_EQ(st.st_size, size_after_first_save);
   }
@@ -600,7 +778,7 @@ TEST_F(XNNWeightsCacheTest, MultiSessionLoad_DoesNotGrowCacheFile) {
     ASSERT_EQ(cache.save_packed_index(), Error::Ok);
   }
   {
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
     EXPECT_EQ(st.st_size, size_after_first_save);
   }
@@ -701,7 +879,7 @@ TEST_F(XNNWeightsCacheTest, MultiplePTEsInSameInstance_NoFileGrowth) {
 
   off_t size_after_pte1 = 0;
   {
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
     size_after_pte1 = st.st_size;
     ASSERT_GT(size_after_pte1, 0);
@@ -723,7 +901,7 @@ TEST_F(XNNWeightsCacheTest, MultiplePTEsInSameInstance_NoFileGrowth) {
   ASSERT_EQ(cache.save_packed_index(), Error::Ok);
 
   {
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
     EXPECT_EQ(st.st_size, size_after_pte1)
         << "PTE 2 with same weights must not append to the cache file";
@@ -745,7 +923,7 @@ TEST_F(XNNWeightsCacheTest, MultiplePTEsInSameInstance_NoFileGrowth) {
       out_pte3.data());
   ASSERT_EQ(cache.save_packed_index(), Error::Ok);
   {
-    struct stat st {};
+    struct stat st{};
     ASSERT_EQ(::stat(cache_path.c_str(), &st), 0);
     EXPECT_EQ(st.st_size, size_after_pte1);
   }
@@ -1022,13 +1200,13 @@ TEST_F(XNNWeightsCacheTest, SavePackedIndex_NoNewReserves_IsNoOp) {
   };
   ASSERT_EQ(::utimensat(AT_FDCWD, cache_path.c_str(), old_times, 0), 0);
 
-  struct stat st_before {};
+  struct stat st_before{};
   ASSERT_EQ(::stat(cache_path.c_str(), &st_before), 0);
 
   // Second save with no intervening reserve_space → no-op short-circuit.
   ASSERT_EQ(cache.save_packed_index(), Error::Ok);
 
-  struct stat st_after {};
+  struct stat st_after{};
   ASSERT_EQ(::stat(cache_path.c_str(), &st_after), 0);
   EXPECT_EQ(st_before.st_size, st_after.st_size);
   EXPECT_EQ(st_before.st_mtime, st_after.st_mtime);
@@ -1069,7 +1247,7 @@ TEST_F(XNNWeightsCacheTest, ConcurrentOptionsAndSave_NoCrash_FileStable) {
       output.data());
   ASSERT_EQ(cache.save_packed_index(), Error::Ok);
 
-  struct stat st_baseline {};
+  struct stat st_baseline{};
   ASSERT_EQ(::stat(cache_path.c_str(), &st_baseline), 0);
 
   // Lock discipline matches XNNPACKBackend's `weights_cache_mutex_`: every
@@ -1103,7 +1281,7 @@ TEST_F(XNNWeightsCacheTest, ConcurrentOptionsAndSave_NoCrash_FileStable) {
   EXPECT_EQ(failure_count.load(), 0);
 
   // File must not balloon: every iteration's save is a no-op.
-  struct stat st_after {};
+  struct stat st_after{};
   ASSERT_EQ(::stat(cache_path.c_str(), &st_after), 0);
   EXPECT_EQ(st_after.st_size, st_baseline.st_size);
 
