@@ -25,6 +25,14 @@ class RemoveRedundantCopyPass(XNNPACKPass):
         """
         input_node = node.args[0]
 
+        # A dtype cast (fp32 <-> fp16) is not a layout copy: it is serialized
+        # as a convert node and must stay, whatever the tags around it say.
+        if ChannelsLastTaggedReshapePass.is_dtype_cast(node) or (
+            input_node.target == exir_ops.edge.aten._to_copy.default
+            and ChannelsLastTaggedReshapePass.is_dtype_cast(input_node)
+        ):
+            return False
+
         # Check if input is a to_copy with opposite memory format
         if (
             input_node.target == exir_ops.edge.aten._to_copy.default

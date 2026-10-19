@@ -9,6 +9,9 @@ from typing import cast, Dict, List
 import torch
 from executorch.backends.transforms import get_shape
 from executorch.backends.xnnpack._passes.fuse_activation_pass import FuseActivationPass
+from executorch.backends.xnnpack._passes.fuse_pad_into_conv_pass import (
+    FusePadIntoConvPass,
+)
 from executorch.backends.xnnpack.operators.node_visitor import (
     NodeVisitor,
     register_node_visitor,
@@ -153,6 +156,16 @@ class Conv2d(NodeVisitor):
         kwargs["padding_right"] = padding[1]
         kwargs["padding_bottom"] = padding[0]
         kwargs["padding_left"] = padding[1]
+        fused_padding = FusePadIntoConvPass.get_fused_padding(node)
+        if fused_padding is not None:
+            # A zero constant_pad_nd folded into this convolution, see
+            # FusePadIntoConvPass. (top, right, bottom, left).
+            (
+                kwargs["padding_top"],
+                kwargs["padding_right"],
+                kwargs["padding_bottom"],
+                kwargs["padding_left"],
+            ) = fused_padding
         kwargs["kernel_height"] = kernel_shape[2]
         kwargs["kernel_width"] = kernel_shape[3]
         kwargs["subsampling_height"] = stride[0]
