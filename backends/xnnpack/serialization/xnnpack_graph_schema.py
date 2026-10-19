@@ -203,6 +203,14 @@ class XNNStaticTranspose:
 
 
 @dataclass
+class XNNDepthToSpace2d:
+    block_size: int
+    input_id: int
+    output_id: int
+    flags: int
+
+
+@dataclass
 class XNNStaticSlice:
     num_dims: int
     offsets: List[int]
@@ -421,6 +429,7 @@ XNodeUnion = Union[
     XNNSin,
     XNNCopy,
     XNNCos,
+    XNNDepthToSpace2d,
 ]
 
 
