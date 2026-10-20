@@ -195,6 +195,11 @@ class VkGraphBuilder:
         # to a string representation to use as a key for the dictionary
         if isinstance(scalar, bool):
             scalar_key = str(scalar)
+        # Likewise 256.0 == 256 (and they hash alike), so a Double would be
+        # handed to a later op that expects that Int, e.g. groups=256 after a
+        # clamp bound of 256.0: keep floats apart from ints in the key.
+        elif isinstance(scalar, float):
+            scalar_key = ("float", scalar)
 
         if scalar_key in self.const_scalar_to_value_ids:
             return self.const_scalar_to_value_ids[scalar_key]
