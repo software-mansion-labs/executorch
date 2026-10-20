@@ -56,5 +56,30 @@ class TestVkGraphBuilderInputIds(unittest.TestCase):
         self.assertEqual(len(builder.input_ids), 2)
 
 
+class TestVkGraphBuilderScalarValues(unittest.TestCase):
+    """Constant scalars are deduplicated by value; the key has to carry the
+    type, because Python treats 256 and 256.0 (and 1 and True) as equal."""
+
+    def test_float_and_int_of_equal_value_get_separate_values(self) -> None:
+        import executorch.backends.vulkan.serialization.vulkan_graph_schema as schema
+
+        builder = VkGraphBuilder.__new__(VkGraphBuilder)
+        builder.values = []
+        builder.const_scalar_to_value_ids = {}
+
+        double_id = builder.get_or_create_scalar_value(256.0)
+        int_id = builder.get_or_create_scalar_value(256)
+        bool_id = builder.get_or_create_scalar_value(True)
+        one_id = builder.get_or_create_scalar_value(1)
+
+        self.assertNotEqual(double_id, int_id)
+        self.assertNotEqual(bool_id, one_id)
+        self.assertIsInstance(builder.values[double_id].value, schema.Double)
+        self.assertIsInstance(builder.values[int_id].value, schema.Int)
+        # and the cache still deduplicates equal scalars of the same type
+        self.assertEqual(builder.get_or_create_scalar_value(256.0), double_id)
+        self.assertEqual(builder.get_or_create_scalar_value(256), int_id)
+
+
 if __name__ == "__main__":
     unittest.main()
