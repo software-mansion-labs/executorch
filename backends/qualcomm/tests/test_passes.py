@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import torch
+from executorch.backends.qualcomm import qnn_preprocess
 from executorch.backends.qualcomm._passes import (
     AnnotateQuantAttrs,
     ConvertBmmToMatmul,
@@ -114,6 +115,8 @@ class TestPasses(unittest.TestCase):
             backend_type=QnnExecuTorchBackendType.kHtpBackend,
         )
         self.assertEqual(ctx_bin, result)
+        # Resolving the loader op must not leak torch names (e.g. range) into the module.
+        self.assertNotIn("range", vars(qnn_preprocess))
 
     def test_context_loader_op_lowers_with_ir_validation(self):
         op_name = "ctx_loader_validation"
