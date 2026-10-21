@@ -62,12 +62,29 @@ class TestVkGraphBuilderScalarValues(unittest.TestCase):
     """Constant scalars are deduplicated by value; the key has to carry the
     type, because Python treats 256 and 256.0 (and 1 and True) as equal."""
 
-    def test_float_and_int_of_equal_value_get_separate_values(self) -> None:
-        import executorch.backends.vulkan.serialization.vulkan_graph_schema as schema
+    def test_grouped_conv_after_float_clamp_bound_gets_an_int_groups(self) -> None:
+        # The original failure: a clamp bound of 256.0 cached a Double, and the
+        # Int 256 that groups passes afterwards was handed that Double's id.
+        class ClampThenDepthwiseConv(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(256, 256, 3, groups=256, bias=False)
 
-        builder = VkGraphBuilder.__new__(VkGraphBuilder)
-        builder.values = []
-        builder.const_scalar_to_value_ids = {}
+            def forward(self, x):
+                return self.conv(torch.nn.functional.hardtanh(x, -1.0, 256.0))
+
+        builder = _build(ClampThenDepthwiseConv(), (torch.randn(1, 256, 4, 4),))
+        conv = next(op for op in builder.chain if "convolution" in op.name)
+        groups = builder.values[conv.args[8]].value
+        self.assertIsInstance(groups, schema.Int)
+        self.assertEqual(groups.int_val, 256)
+
+    def test_equal_scalars_of_different_types_get_separate_values(self) -> None:
+        class Identity(torch.nn.Module):
+            def forward(self, x):
+                return x + x
+
+        builder = _build(Identity(), (torch.randn(2),))
 
         double_id = builder.get_or_create_scalar_value(256.0)
         int_id = builder.get_or_create_scalar_value(256)
@@ -78,6 +95,7 @@ class TestVkGraphBuilderScalarValues(unittest.TestCase):
         self.assertNotEqual(bool_id, one_id)
         self.assertIsInstance(builder.values[double_id].value, schema.Double)
         self.assertIsInstance(builder.values[int_id].value, schema.Int)
+        self.assertIsInstance(builder.values[bool_id].value, schema.Bool)
         # and the cache still deduplicates equal scalars of the same type
         self.assertEqual(builder.get_or_create_scalar_value(256.0), double_id)
         self.assertEqual(builder.get_or_create_scalar_value(256), int_id)
