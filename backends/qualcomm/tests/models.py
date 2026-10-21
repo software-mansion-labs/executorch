@@ -1238,6 +1238,15 @@ class FloorDivConstantFloat(torch.nn.Module):
         return torch.floor(x / self.constant)
 
 
+class FloorDivConstantInt(torch.nn.Module):
+    def __init__(self, constant=80):
+        super().__init__()
+        self.constant = constant
+
+    def forward(self, x):
+        return x // self.constant
+
+
 class Fold(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -2766,6 +2775,11 @@ class TopKandIndex(torch.nn.Module):
     def forward(self, x):
         a, b = torch.topk(x, 3)
         return a + self.idx_source[b]
+
+
+class TopKIndices(torch.nn.Module):
+    def forward(self, x):
+        return torch.topk(x, 3)[1]
 
 
 class Triu(torch.nn.Module):

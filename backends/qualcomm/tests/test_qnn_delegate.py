@@ -1120,8 +1120,9 @@ class TestQNNFloatingPointOperator(TestQNN):
                         torch.randint(-100, 100, (10, 10)).float(),
                         torch.full((10, 10), 2.5),
                     ),
-                    # TODO: this test case exists rounding issue
-                    # (torch.randint(-1000, 1000, (10, 10)), torch.full((10, 10), 100)),
+                    (torch.randint(-1000, 1000, (10, 10)), torch.full((10, 10), 100)),
+                    (torch.randint(0, 24000, (300,)), torch.full((300,), 80)),
+                    (torch.randint(-30000, 30000, (10, 10)), torch.full((10, 10), -7)),
                     (torch.tensor([10]), torch.arange(1, 5)),  # Failed
                     (torch.arange(-10, 10), torch.tensor([2])),
                     (torch.randint(-100, 100, (20,)), torch.full((20,), 2)),
@@ -1138,6 +1139,10 @@ class TestQNNFloatingPointOperator(TestQNN):
             {
                 QCOM_MODULE: [FloorDivConstantFloat()],  # noqa: F405
                 QCOM_SAMPLE_INPUTS: [(torch.randn(2, 5, 1, 3),)],
+            },
+            {
+                QCOM_MODULE: [FloorDivConstantInt()],  # noqa: F405
+                QCOM_SAMPLE_INPUTS: [(torch.randint(-24000, 24000, (300,)),)],
             },
         ]
 
@@ -2093,7 +2098,11 @@ class TestQNNFloatingPointOperator(TestQNN):
                     (
                         torch.tensor([7.0, 5.0, 4.0, -3.0, 8.0, 1.0]).reshape(2, 3),
                         torch.tensor([2.0, 3.0, 1.5, 2.0, 3.0, 4.0]).reshape(2, 3),
-                    )
+                    ),
+                    (
+                        torch.randint(-30000, 30000, (2, 3)),
+                        torch.tensor([80, -7, 3, 100, 9, -80]).reshape(2, 3),
+                    ),
                 ],
             },
             {
@@ -2765,6 +2774,19 @@ class TestQNNFloatingPointModel(TestQNN):
         module = TopKandIndex()  # noqa: F405
         sample_input = (torch.randn(3, 10),)
         self.lower_module_and_test_output(module, sample_input)
+
+    def test_qnn_backend_topk_indices(self):
+        module = TopKIndices()  # noqa: F405
+        sample_input = (torch.randn(3, 10),)
+        self.lower_module_and_test_output(module, sample_input)
+
+    def test_qnn_backend_topk_on_cpu_and_index(self):
+        # int64 indices from a TopK left on CPU feed the delegated index
+        module = TopKandIndex()  # noqa: F405
+        sample_input = (torch.randn(3, 10),)
+        self.lower_module_and_test_output(
+            module, sample_input, skip_node_op_set={"aten.topk.default"}
+        )
 
     def test_qnn_backend_view_permute_matmul(self):
         module = ViewPermuteMatMul()  # noqa: F405
@@ -4014,6 +4036,8 @@ class TestQNNQuantizedOperator(TestQNN):
                         torch.full((10, 10), 2.5),
                     ),
                     (torch.randint(-1000, 1000, (10, 10)), torch.full((10, 10), 100)),
+                    (torch.randint(0, 24000, (300,)), torch.full((300,), 80)),
+                    (torch.randint(-30000, 30000, (10, 10)), torch.full((10, 10), -7)),
                     (torch.tensor([10]), torch.arange(1, 5)),
                     (torch.arange(-10, 10), torch.tensor([2])),
                     (torch.randint(-100, 100, (20,)), torch.full((20,), 2)),
@@ -4030,6 +4054,10 @@ class TestQNNQuantizedOperator(TestQNN):
             {
                 QCOM_MODULE: [FloorDivConstantFloat()],  # noqa: F405
                 QCOM_SAMPLE_INPUTS: [(torch.randn(2, 5, 1, 3),)],
+            },
+            {
+                QCOM_MODULE: [FloorDivConstantInt()],  # noqa: F405
+                QCOM_SAMPLE_INPUTS: [(torch.randint(-24000, 24000, (300,)),)],
             },
         ]
 

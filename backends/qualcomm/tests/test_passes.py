@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 import torch
+from executorch.backends.qualcomm import qnn_preprocess
 from executorch.backends.qualcomm._passes import (
     AnnotateQuantAttrs,
     ConvertBmmToMatmul,
@@ -114,6 +115,8 @@ class TestPasses(unittest.TestCase):
             backend_type=QnnExecuTorchBackendType.kHtpBackend,
         )
         self.assertEqual(ctx_bin, result)
+        # Resolving the loader op must not leak torch names (e.g. range) into the module.
+        self.assertNotIn("range", vars(qnn_preprocess))
 
     def test_context_loader_op_lowers_with_ir_validation(self):
         op_name = "ctx_loader_validation"
@@ -347,8 +350,9 @@ class TestPasses(unittest.TestCase):
             "getitem": 1,
             "getitem_1": 1,
             "aten_view_copy_default": 2,
-            "aten_index_tensor": 3,
-            "aten_add_tensor": 4,
+            "aten__to_copy_default": 3,
+            "aten_index_tensor": 4,
+            "aten_add_tensor": 5,
         }
         module = TopKandIndex()  # noqa: F405
         sample_input = (torch.randn(3, 10),)
@@ -469,6 +473,311 @@ class TestPasses(unittest.TestCase):
                         should_decompose,
                         f"hardsigmoid {'should' if should_decompose else 'should NOT'} be decomposed for {backend.name}",
                     )
+
+    def test_partitioner_falls_back_on_op_without_visitor(self):
+        """QnnOperatorSupport must reject an op that has no node visitor by returning
+        False (CPU fallback), not by KeyError-ing on the node_visitors lookup.
+
+        Uses aten.frac.default: it has no QNN node visitor and is not on any partition
+        operator list, so it exercises the missing-visitor guard directly. (bitwise_not,
+        the op that first surfaced this on Mamba2, is now in to_be_implemented_operator,
+        which returns earlier and would not reach the guard.)
+        """
+
+        class FracModule(torch.nn.Module):
+            def forward(self, x):
+                return torch.frac(x) + x
+
+        sample_input = (torch.randn(1, 4),)
+
+        # Guard against a vacuous test: the visitor-less op must actually be present.
+        exported = torch.export.export(FracModule().eval(), sample_input)
+        self.assertTrue(
+            any(
+                node.op == "call_function" and "frac" in str(node.target)
+                for node in exported.graph.nodes
+            ),
+            "expected aten.frac.default in the traced graph",
+        )
+
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        try:
+            # Must not raise KeyError: frac falls back to CPU; the rest may delegate.
+            edge = to_edge_transform_and_lower_to_qnn(
+                FracModule().eval(), sample_input, compiler_specs
+            )
+            edge.to_executorch()
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+
+    def test_skipped_conv_keeps_its_weight_dequantize_on_cpu(self):
+        """A quantized conv kept off QNN must take its per-channel weight dequantize
+        with it. FoldQDQ force-passes that dequantize, so it used to be lowered alone
+        as a QNN Dequantize, which rejects per-channel encodings and fails context
+        binary generation (#19908)."""
+
+        class ConvDepthwiseConv(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pw1 = torch.nn.Conv2d(8, 16, 1)
+                self.dw = torch.nn.Conv2d(16, 16, 3, padding=1, groups=16)
+                self.pw2 = torch.nn.Conv2d(16, 8, 1)
+
+            def forward(self, x):
+                return self.pw2(torch.relu(self.dw(torch.relu(self.pw1(x)))))
+
+        sample_input = (torch.randn(1, 8, 16, 16),)
+        quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(
+            quant_dtype=QuantDtype.use_16a8w, is_conv_per_channel=True
+        )
+        prepared = prepare_pt2e(
+            torch.export.export(ConvDepthwiseConv().eval(), sample_input).module(),
+            quantizer,
+        )
+        prepared(*sample_input)
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=False),
+        )
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                convert_pt2e(prepared),
+                sample_input,
+                compiler_specs,
+                skip_node_id_set={"aten_convolution_default_1"},
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+
+        # inspected before to_executorch(), which swaps in out-variant ops
+        def cpu_nodes(op_name):
+            return [
+                node
+                for node in edge.exported_program().graph.nodes
+                if node.op == "call_function"
+                and getattr(node.target, "__name__", "") == op_name
+            ]
+
+        convs = cpu_nodes("aten.convolution.default")
+        self.assertEqual([conv.name for conv in convs], ["aten_convolution_default_1"])
+        dequants = cpu_nodes("quantized_decomposed.dequantize_per_channel.default")
+        self.assertTrue(dequants)
+        for dequant in dequants:
+            self.assertEqual(list(dequant.users), convs)
+        edge.to_executorch()
+
+    def test_block_size_is_per_node(self):
+        """Every node in block_size_map must keep its own block size. The annotators
+        used to write it into the weight observer constructor shared by all nodes, so
+        the last node annotated set it for every one: a 2D linear block size reached a
+        4D conv weight and calibration asserted in _get_reduction_params."""
+        from executorch.backends.qualcomm.quantizer.observers.per_block_param_observer import (
+            PerBlockParamObserver,
+        )
+
+        class ConvConvLinear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv_a = torch.nn.Conv2d(32, 64, 1)
+                self.conv_b = torch.nn.Conv2d(64, 64, 1)
+                self.linear = torch.nn.Linear(64, 16)
+
+            def forward(self, x):
+                x = self.conv_b(torch.relu(self.conv_a(x)))
+                return self.linear(x.mean(dim=(2, 3)))
+
+        sample_input = (torch.randn(1, 32, 8, 8),)
+        gm = torch.export.export(ConvConvLinear().eval(), sample_input).module()
+        convs = [
+            n.name for n in gm.graph.nodes if n.target == torch.ops.aten.conv2d.default
+        ]
+        linears = [
+            n.name for n in gm.graph.nodes if n.target == torch.ops.aten.linear.default
+        ]
+        block_size_map = {
+            convs[0]: (1, 16, 1, 1),
+            convs[1]: (1, 32, 1, 1),
+            linears[0]: (1, 16),
+        }
+        quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(
+            quant_dtype=QuantDtype.use_16a4w_block,
+            is_conv_per_channel=True,
+            is_linear_per_channel=True,
+        )
+        quantizer.set_block_size_map(block_size_map)
+        prepared = prepare_pt2e(gm, quantizer)
+        for _ in range(2):
+            prepared(*sample_input)
+
+        observed = sorted(
+            tuple(module.block_size)
+            for module in prepared.modules()
+            if isinstance(module, PerBlockParamObserver)
+        )
+        self.assertEqual(observed, sorted(block_size_map.values()))
+        convert_pt2e(prepared)(*sample_input)
+
+    def test_fp16a8w_conv_on_cpu_stays_fp16(self):
+        """fp16a8w runs conv in fp16, but the HTP only takes it for 1x1 kernels, so a
+        3x3 conv falls back to CPU. Its bias data and weight dequantize must be fp16
+        as well, or to_executorch fails on a bias buffer that does not match its spec.
+        """
+
+        class ConvConvConv(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.pw1 = torch.nn.Conv2d(8, 16, 1)
+                self.k3 = torch.nn.Conv2d(16, 16, 3, padding=1)
+                self.pw2 = torch.nn.Conv2d(16, 8, 1)
+
+            def forward(self, x):
+                return self.pw2(torch.relu(self.k3(torch.relu(self.pw1(x)))))
+
+        sample_input = (torch.randn(1, 8, 16, 16),)
+        quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(
+            quant_dtype=QuantDtype.use_fp16a8w, is_conv_per_channel=True
+        )
+        prepared = prepare_pt2e(
+            torch.export.export(ConvConvConv().eval(), sample_input).module(),
+            quantizer,
+        )
+        prepared(*sample_input)
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=False),
+        )
+        quantized = convert_pt2e(prepared)
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                quantized, sample_input, compiler_specs
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+
+        program = edge.exported_program()
+        convs = [
+            node
+            for node in program.graph.nodes
+            if node.op == "call_function"
+            and getattr(node.target, "__name__", "") == "aten.convolution.default"
+        ]
+        self.assertEqual([conv.name for conv in convs], ["aten_convolution_default_1"])
+        weight, bias = convs[0].args[1], convs[0].args[2]
+        self.assertEqual(weight.kwargs.get("out_dtype"), torch.float16)
+        bias_name = program.graph_signature.inputs_to_parameters[bias.name]
+        self.assertEqual(program.state_dict[bias_name].dtype, torch.float16)
+        # the cast must not reach back into the caller's module
+        self.assertEqual(
+            {t.dtype for t in quantized.state_dict().values() if t.is_floating_point()},
+            {torch.float32},
+        )
+        edge.to_executorch()
+
+    def test_int_floor_divide_by_scalar_lowers(self):
+        """An integer floor_divide by a Python scalar (YOLO26's `index // nc`) used to
+        crash export.
+        """
+
+        class FloorDivideByScalar(torch.nn.Module):
+            def forward(self, x):
+                return x // 3
+
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                FloorDivideByScalar(),
+                (torch.randint(-10, 10, (3, 4), dtype=torch.int32),),
+                compiler_specs,
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+        edge.to_executorch()
+
+    def test_constant_only_partition_stays_on_cpu(self):
+        """An int64 buffer gets an int32 cast from I64toI32. When the buffer's consumer is
+        not delegated, that cast alone would form a partition with no graph input, which
+        QNN cannot compile ("No graph inputs present").
+        """
+
+        class Lookup(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("table", torch.arange(10) % 3)
+
+            def forward(self, x):
+                values, indices = x.topk(4)
+                return values + self.table[indices].float()
+
+        sample_input = (torch.randn(10),)
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                Lookup(),
+                sample_input,
+                compiler_specs,
+                skip_node_op_set={"aten.index.Tensor", "aten.topk.default"},
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+
+        edge.to_executorch()
+
+    def test_full_with_runtime_fill_value_stays_on_cpu(self):
+        """aten.full is lowered as a static tensor, so a fill_value only known at runtime
+        (YOLO's `torch.full(..., stride.item())`) must leave it on CPU rather than crash
+        the partitioner's support check.
+        """
+
+        class FullFromTensor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("stride", torch.tensor([8.0, 16.0]))
+
+            def forward(self, x):
+                return x * torch.full((4, 1), self.stride[0].item())
+
+        sample_input = (torch.randn(4, 3),)
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                FullFromTensor(), sample_input, compiler_specs
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+
+        self.assertTrue(
+            any(
+                node.op == "call_function" and "aten.full" in str(node.target)
+                for node in edge.exported_program().graph.nodes
+            )
+        )
+        edge.to_executorch()
 
 
 if __name__ == "__main__":

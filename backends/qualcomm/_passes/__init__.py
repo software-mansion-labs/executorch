@@ -25,7 +25,6 @@ from .decompose_div_mode import DecomposeDivMode
 from .decompose_einsum import DecomposeEinsum
 from .decompose_expm1 import DecomposeExpM1
 from .decompose_fill import DecomposeFill
-from .decompose_floor_divide import DecomposeFloorDivide
 from .decompose_glu import DecomposeGlu
 from .decompose_hardsigmoid import DecomposeHardsigmoid
 from .decompose_hyperbolic_variants import DecomposeHyperbolicVariants
@@ -90,7 +89,6 @@ __all__ = [
     DecomposeEinsum,
     DecomposeExpM1,
     DecomposeFill,
-    DecomposeFloorDivide,
     DecomposeGlu,
     DecomposeHyperbolicVariants,
     DecomposeHardsigmoid,
