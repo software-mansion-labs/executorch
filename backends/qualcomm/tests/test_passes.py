@@ -643,6 +643,31 @@ class TestPasses(unittest.TestCase):
         )
         edge.to_executorch()
 
+    def test_int_floor_divide_by_scalar_lowers(self):
+        """DecomposeFloorDivide read .meta from both operands, so an integer floor_divide
+        by a Python scalar (YOLO26's `index // nc`) crashed export.
+        """
+
+        class FloorDivideByScalar(torch.nn.Module):
+            def forward(self, x):
+                return x // 3
+
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                FloorDivideByScalar(),
+                (torch.randint(-10, 10, (3, 4), dtype=torch.int32),),
+                compiler_specs,
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+        edge.to_executorch()
+
 
 if __name__ == "__main__":
     unittest.main()
