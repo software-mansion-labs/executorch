@@ -685,8 +685,8 @@ class TestPasses(unittest.TestCase):
         edge.to_executorch()
 
     def test_int_floor_divide_by_scalar_lowers(self):
-        """DecomposeFloorDivide read .meta from both operands, so an integer floor_divide
-        by a Python scalar (YOLO26's `index // nc`) crashed export.
+        """An integer floor_divide by a Python scalar (YOLO26's `index // nc`) used to
+        crash export.
         """
 
         class FloorDivideByScalar(torch.nn.Module):
