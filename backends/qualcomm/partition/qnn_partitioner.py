@@ -180,7 +180,31 @@ class QnnPartitioner(Partitioner):
             edge_program.graph_module,
             op_support=self.op_support_checker,
         )
-        return self._drop_orphaned_parameter_dequants(partitions, edge_program)
+        partitions = self._drop_orphaned_parameter_dequants(partitions, edge_program)
+        # A partition fed only by constants (e.g. an int64 buffer's I64toI32 cast whose
+        # consumer stays on CPU) has no graph input, and QNN cannot build such a graph.
+        signature = edge_program.graph_signature
+        mutable_buffers = set(signature.buffers_to_mutate.values())
+        runtime_constants = {
+            name
+            for name, fqn in signature.inputs_to_buffers.items()
+            if fqn in mutable_buffers
+        }
+
+        def is_runtime_input(node: torch.fx.Node) -> bool:
+            return node.name in runtime_constants or not is_parameter(
+                node, edge_program
+            )
+
+        return [
+            partition
+            for partition in partitions
+            if any(
+                arg not in partition.nodes and is_runtime_input(arg)
+                for node in partition.nodes
+                for arg in node.all_input_nodes
+            )
+        ]
 
     @staticmethod
     def _drop_orphaned_parameter_dequants(
