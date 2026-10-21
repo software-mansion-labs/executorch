@@ -10,6 +10,8 @@ from executorch.backends.transforms.utils import (
 )
 from executorch.exir import to_edge
 from executorch.exir.dialects._ops import ops as exir_ops
+from executorch.exir.pass_base import PassResult
+from executorch.exir.pass_manager import ExportedProgramPassManager
 from torch.export import export
 from torch.export.graph_signature import InputKind
 
@@ -120,3 +122,37 @@ def test_create_delete_non_persistent_buffer():
 
 def test_create_delete_constant_tensor():
     _test_create_delete(InputKind.CONSTANT_TENSOR)
+
+
+def test_delete_inside_a_pass_is_seen_by_the_pass_manager():
+    """Backend passes keep a reference to the program they were built from,
+    while ExportedProgramPassManager runs them on a shallow copy of it. The
+    deletion has to edit the shared signature in place, or the copy that the
+    manager verifies and returns still lists the deleted placeholder."""
+    module = EmptyNetwork()
+    exported_program = export(module, args=module.test_data, strict=True)
+    exported_program = to_edge(exported_program).exported_program()
+    graph = exported_program.graph_module.graph
+
+    input_node = list(graph.nodes)[0]
+    with graph.inserting_before(input_node):
+        const_node = create_constant_placeholder(
+            exp_program=exported_program,
+            graph=graph,
+            kind=InputKind.PARAMETER,
+            name="test_node",
+            data=torch.ones(1),
+        )
+    assert len(exported_program.graph_signature.input_specs) == 2
+
+    def delete_unused_constant(graph_module: torch.fx.GraphModule) -> PassResult:
+        delete_constant_placeholder(exported_program, const_node)
+        return PassResult(graph_module, True)
+
+    result = ExportedProgramPassManager([delete_unused_constant])(exported_program)
+    transformed = result.exported_program
+
+    assert len(transformed.graph_signature.input_specs) == 1
+    assert "test_node" not in transformed.graph_signature.inputs_to_parameters
+    assert "test_node" not in transformed.state_dict
+    assert transformed.module()(torch.zeros(1)) == 0
