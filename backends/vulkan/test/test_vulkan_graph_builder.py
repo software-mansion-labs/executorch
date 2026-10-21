@@ -6,12 +6,25 @@
 
 import unittest
 
+import executorch.backends.vulkan.serialization.vulkan_graph_schema as schema
 import torch
 from executorch.backends.vulkan.serialization.vulkan_graph_builder import VkGraphBuilder
 from executorch.backends.vulkan.vulkan_preprocess import apply_passes
 from executorch.exir import to_edge
 from executorch.exir.backend.utils import DelegateMappingBuilder
 from executorch.exir.passes import SpecPropPass
+
+
+def _build(module: torch.nn.Module, inputs) -> VkGraphBuilder:
+    edge = to_edge(torch.export.export(module, inputs, strict=True))
+    # The builder reads node specs, which the backend's own preprocess
+    # populates before it gets here.
+    program = apply_passes(edge.exported_program(), [SpecPropPass()])
+    builder = VkGraphBuilder(
+        program, DelegateMappingBuilder(generated_identifiers=True)
+    )
+    builder.build_graph()
+    return builder
 
 
 class TestVkGraphBuilderInputIds(unittest.TestCase):
@@ -26,23 +39,12 @@ class TestVkGraphBuilderInputIds(unittest.TestCase):
     graph out of step.
     """
 
-    def _build(self, module: torch.nn.Module, inputs) -> VkGraphBuilder:
-        edge = to_edge(torch.export.export(module, inputs, strict=True))
-        # The builder reads node specs, which the backend's own preprocess
-        # populates before it gets here.
-        program = apply_passes(edge.exported_program(), [SpecPropPass()])
-        builder = VkGraphBuilder(
-            program, DelegateMappingBuilder(generated_identifiers=True)
-        )
-        builder.build_graph()
-        return builder
-
     def test_unused_placeholder_is_still_declared_as_an_input(self) -> None:
         class UsesOnlyTheFirstInput(torch.nn.Module):
             def forward(self, used, unused):
                 return used + used
 
-        builder = self._build(
+        builder = _build(
             UsesOnlyTheFirstInput(), (torch.randn(2, 3), torch.randn(2, 3))
         )
         self.assertEqual(len(builder.input_ids), 2)
@@ -52,7 +54,7 @@ class TestVkGraphBuilderInputIds(unittest.TestCase):
             def forward(self, first, second):
                 return first + second
 
-        builder = self._build(UsesBothInputs(), (torch.randn(2, 3), torch.randn(2, 3)))
+        builder = _build(UsesBothInputs(), (torch.randn(2, 3), torch.randn(2, 3)))
         self.assertEqual(len(builder.input_ids), 2)
 
 
@@ -79,6 +81,40 @@ class TestVkGraphBuilderScalarValues(unittest.TestCase):
         # and the cache still deduplicates equal scalars of the same type
         self.assertEqual(builder.get_or_create_scalar_value(256.0), double_id)
         self.assertEqual(builder.get_or_create_scalar_value(256), int_id)
+
+
+class TestVkGraphBuilderScalarLists(unittest.TestCase):
+    """A scalar list serializes to exactly one Value. bool is a subclass of int,
+    so a bool list also satisfies the all-int check, and an empty list
+    satisfies every check."""
+
+    def setUp(self) -> None:
+        class Identity(torch.nn.Module):
+            def forward(self, x):
+                return x + x
+
+        self.builder = _build(Identity(), (torch.randn(2),))
+
+    def _values_appended_by(self, arg) -> list:
+        before = len(self.builder.values)
+        value_id = self.builder.create_scalar_list_value(arg)
+        self.assertEqual(value_id, before)
+        return [v.value for v in self.builder.values[before:]]
+
+    def test_bool_list_serializes_once(self) -> None:
+        values = self._values_appended_by([True, False])
+        self.assertEqual(len(values), 1)
+        self.assertIsInstance(values[0], schema.BoolList)
+
+    def test_empty_list_serializes_once(self) -> None:
+        values = self._values_appended_by([])
+        self.assertEqual(len(values), 1)
+        self.assertIsInstance(values[0], schema.IntList)
+
+    def test_int_list_serializes_once(self) -> None:
+        values = self._values_appended_by([1, 2])
+        self.assertEqual(len(values), 1)
+        self.assertIsInstance(values[0], schema.IntList)
 
 
 if __name__ == "__main__":

@@ -291,6 +291,7 @@ class VkGraphBuilder:
             self.values.append(
                 vk_graph_schema.VkValue(vk_graph_schema.IntList(items=[]))
             )
+            return new_id
 
         all_bool = True
         all_int = True
@@ -313,7 +314,7 @@ class VkGraphBuilder:
                     vk_graph_schema.BoolList(items=[cast(bool, e) for e in arg])
                 )
             )
-        if all_int:
+        elif all_int:
             self.values.append(
                 vk_graph_schema.VkValue(
                     vk_graph_schema.IntList(items=[cast(int, e) for e in arg])
