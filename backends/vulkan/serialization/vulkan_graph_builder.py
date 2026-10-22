@@ -189,17 +189,9 @@ class VkGraphBuilder:
         return new_id
 
     def get_or_create_scalar_value(self, scalar: _ScalarType) -> int:
-        scalar_key = scalar
-        # Since Python considers 1 and True to be "equivalent" (as well as 0 and False)
-        # to distinguish entries in the dictionary, if scalar is bool then convert it
-        # to a string representation to use as a key for the dictionary
-        if isinstance(scalar, bool):
-            scalar_key = str(scalar)
-        # Likewise 256.0 == 256 (and they hash alike), so a Double would be
-        # handed to a later op that expects that Int, e.g. groups=256 after a
-        # clamp bound of 256.0: keep floats apart from ints in the key.
-        elif isinstance(scalar, float):
-            scalar_key = ("float", scalar)
+        # 1 == True == 1.0 and -0.0 == 0.0, all hashing alike, so key on the
+        # type and the repr; repr also lets equal NaNs share an entry.
+        scalar_key = (type(scalar), repr(scalar))
 
         if scalar_key in self.const_scalar_to_value_ids:
             return self.const_scalar_to_value_ids[scalar_key]

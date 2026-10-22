@@ -27,6 +27,10 @@ def _build(module: torch.nn.Module, inputs) -> VkGraphBuilder:
     return builder
 
 
+def _empty_builder() -> VkGraphBuilder:
+    return VkGraphBuilder(None, DelegateMappingBuilder(generated_identifiers=True))
+
+
 class TestVkGraphBuilderInputIds(unittest.TestCase):
     """The serialized input list has to match the delegate call's arguments.
 
@@ -62,38 +66,68 @@ class TestVkGraphBuilderScalarValues(unittest.TestCase):
     """Constant scalars are deduplicated by value; the key has to carry the
     type, because Python treats 256 and 256.0 (and 1 and True) as equal."""
 
-    def test_float_and_int_of_equal_value_get_separate_values(self) -> None:
-        import executorch.backends.vulkan.serialization.vulkan_graph_schema as schema
+    def test_grouped_conv_after_float_clamp_bound_gets_an_int_groups(self) -> None:
+        # The original failure: a clamp bound of 256.0 cached a Double, and the
+        # Int 256 that groups passes afterwards was handed that Double's id.
+        class ClampThenDepthwiseConv(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(256, 256, 3, groups=256, bias=False)
 
-        builder = VkGraphBuilder.__new__(VkGraphBuilder)
-        builder.values = []
-        builder.const_scalar_to_value_ids = {}
+            def forward(self, x):
+                return self.conv(torch.nn.functional.hardtanh(x, -1.0, 256.0))
+
+        builder = _build(ClampThenDepthwiseConv(), (torch.randn(1, 256, 4, 4),))
+        conv = next(op for op in builder.chain if op.name == "aten.convolution.default")
+        schema_args = [
+            a.name for a in torch.ops.aten.convolution.default._schema.arguments
+        ]
+        groups = builder.values[conv.args[schema_args.index("groups")]].value
+        self.assertIsInstance(groups, schema.Int)
+        self.assertEqual(groups.int_val, 256)
+
+    def test_equal_scalars_of_different_types_get_separate_values(self) -> None:
+        builder = _empty_builder()
 
         double_id = builder.get_or_create_scalar_value(256.0)
         int_id = builder.get_or_create_scalar_value(256)
         bool_id = builder.get_or_create_scalar_value(True)
         one_id = builder.get_or_create_scalar_value(1)
+        zero_id = builder.get_or_create_scalar_value(0.0)
+        negative_zero_id = builder.get_or_create_scalar_value(-0.0)
 
         self.assertNotEqual(double_id, int_id)
         self.assertNotEqual(bool_id, one_id)
+        self.assertNotEqual(zero_id, negative_zero_id)
         self.assertIsInstance(builder.values[double_id].value, schema.Double)
         self.assertIsInstance(builder.values[int_id].value, schema.Int)
+        self.assertIsInstance(builder.values[bool_id].value, schema.Bool)
+        self.assertIsInstance(builder.values[one_id].value, schema.Int)
         # and the cache still deduplicates equal scalars of the same type
         self.assertEqual(builder.get_or_create_scalar_value(256.0), double_id)
         self.assertEqual(builder.get_or_create_scalar_value(256), int_id)
+        self.assertEqual(builder.get_or_create_scalar_value(-0.0), negative_zero_id)
+
+    def test_int_cached_first_does_not_shadow_an_equal_double(self) -> None:
+        builder = _empty_builder()
+
+        int_id = builder.get_or_create_scalar_value(256)
+        double_id = builder.get_or_create_scalar_value(256.0)
+
+        self.assertNotEqual(int_id, double_id)
+        self.assertIsInstance(builder.values[int_id].value, schema.Int)
+        self.assertIsInstance(builder.values[double_id].value, schema.Double)
 
 
 class TestVkGraphBuilderScalarLists(unittest.TestCase):
     """A scalar list serializes to exactly one Value. bool is a subclass of int,
     so a bool list also satisfies the all-int check, and an empty list
-    satisfies every check."""
+    satisfies every check. The builder is not told the argument's declared
+    type, so an empty list is an IntList whatever the op's schema says; the
+    empty-list test records that, it does not endorse it."""
 
     def setUp(self) -> None:
-        class Identity(torch.nn.Module):
-            def forward(self, x):
-                return x + x
-
-        self.builder = _build(Identity(), (torch.randn(2),))
+        self.builder = _empty_builder()
 
     def _values_appended_by(self, arg) -> list:
         before = len(self.builder.values)
