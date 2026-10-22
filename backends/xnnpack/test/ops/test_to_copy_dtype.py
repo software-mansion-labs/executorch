@@ -64,3 +64,16 @@ class TestToCopyDtype(unittest.TestCase):
             .to_edge_transform_and_lower()
             .check_not(["torch.ops.higher_order.executorch_call_delegate"])
         )
+
+    def test_dtype_cast_with_dim_order_change_not_partitioned(self):
+        class ToHalfChannelsLast(torch.nn.Module):
+            def forward(self, x):
+                return x.to(torch.float16, memory_format=torch.channels_last)
+
+        (
+            Tester(ToHalfChannelsLast().eval(), (torch.randn(1, 3, 4, 4),))
+            .export()
+            .to_edge_transform_and_lower()
+            .check_not(["torch.ops.higher_order.executorch_call_delegate"])
+            .check_count({self.cast_ops[0]: 1})
+        )
