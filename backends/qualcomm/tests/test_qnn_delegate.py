@@ -980,6 +980,16 @@ class TestQNNFloatingPointOperator(TestQNN):
         sample_input = (torch.Tensor([[1, 2, 4, 5], [4, 3, 2, 9]]).to(torch.int32),)
         self.lower_module_and_test_output(module, sample_input)
 
+    def test_qnn_backend_empty(self):
+        module = EmptyMemoryFormat()  # noqa: F405
+        sample_input = (torch.randn(1, 2, 3, 4),)
+        self.lower_module_and_test_output(module, sample_input)
+
+    def test_qnn_backend_empty_strided(self):
+        module = EmptyStrided((2, 3), (1, 2))  # noqa: F405
+        sample_input = (torch.randn(2, 3),)
+        self.lower_module_and_test_output(module, sample_input)
+
     def test_qnn_backend_equal(self):
         test_comb = [
             {
@@ -2656,6 +2666,7 @@ class TestQNNFloatingPointModel(TestQNN):
         module = Conv2dBnHardtanhMean()  # noqa: F405
         sample_input = (torch.randn(1, 1, 6, 6),)
         self.lower_module_and_test_output(module, sample_input)
+        self.assert_batch_norm_folded(module, sample_input)
 
     def test_qnn_backend_conv2d_cat(self):
         module = Conv2dCat()  # noqa: F405
@@ -3983,6 +3994,18 @@ class TestQNNQuantizedOperator(TestQNN):
                     is_embedding_per_channel=True,
                 )
                 self.lower_module_and_test_output(qdq_module, sample_input)
+
+    def test_qnn_backend_empty(self):
+        module = EmptyMemoryFormat()  # noqa: F405
+        sample_input = (torch.randn(1, 2, 3, 4),)
+        qdq_module = self.get_qdq_module(module, sample_input)
+        self.lower_module_and_test_output(qdq_module, sample_input)
+
+    def test_qnn_backend_empty_strided(self):
+        module = EmptyStrided((2, 3), (1, 2))  # noqa: F405
+        sample_input = (torch.randn(2, 3),)
+        qdq_module = self.get_qdq_module(module, sample_input)
+        self.lower_module_and_test_output(qdq_module, sample_input)
 
     def test_qnn_backend_equal(self):
         test_comb = [

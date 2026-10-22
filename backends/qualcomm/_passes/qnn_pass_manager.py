@@ -29,6 +29,7 @@ from executorch.backends.qualcomm._passes import (
     DecomposeDiagonal,
     DecomposeDivMode,
     DecomposeEinsum,
+    DecomposeEmpty,
     DecomposeExpM1,
     DecomposeFill,
     DecomposeGlu,
@@ -51,6 +52,7 @@ from executorch.backends.qualcomm._passes import (
     ExpandBroadcastTensorShape,
     FixedLinearKeepDim,
     FoldQDQ,
+    FuseBatchNormWithConv,
     FuseConsecutiveCast,
     FuseConsecutiveTranspose,
     I64toI32,
@@ -144,6 +146,7 @@ class QnnPassManager(PassManager):
             (ExpandBroadcastTensorShape, True),
             (FixedLinearKeepDim, True),
             (FoldQDQ, True),
+            (FuseBatchNormWithConv, True),
             (I64toI32, True),
             (InsertCastForFpActQuantizedWeight, True),
             (LayoutTransform, True),
@@ -183,6 +186,7 @@ class QnnPassManager(PassManager):
             DecomposeVar,
             DecomposeWrapWithAutocast,
             DecomposeEinsum,
+            DecomposeEmpty,
             DecomposeExpM1,
             DecomposeFill,
             DecomposeGlu,
@@ -211,6 +215,7 @@ class QnnPassManager(PassManager):
             DecomposeThreshold,
             DecomposeTriu,
             DecomposeLinalgVectorNorm,
+            DecomposeEmpty,
             DecomposeExpM1,
             DecomposeFill,
             DecomposeVar,
@@ -298,12 +303,15 @@ class QnnPassManager(PassManager):
             ExpandBroadcastTensorShape: [FoldQDQ],
             FixedLinearKeepDim: [FoldQDQ],
             FoldQDQ: [AnnotateQuantAttrs, AnnotateStack, AnnotateUnbind],
+            FuseBatchNormWithConv: [FoldQDQ],
             I64toI32: [RemoveRedundancy],
             InsertCastForFpActQuantizedWeight: [FoldQDQ, LayoutTransform],
             LayoutTransform: [
                 AnnotateQuantAttrs,
                 ExpandBroadcastTensorShape,
                 FixedLinearKeepDim,
+                # folds into the NCHW weight, before it is permuted
+                FuseBatchNormWithConv,
             ],
             RecomposePadMaxPool2d: [DecomposeMaxPool3d, FoldQDQ],
             RecomposePixelUnshuffle: [RemoveRedundancy],
@@ -390,6 +398,9 @@ class QnnPassManager(PassManager):
             kwargs = passes_job[p][QCOM_PASS_ARGS_KWARGS_DEFAULTS_KEY]
             if "edge_program" in kwargs:
                 kwargs["edge_program"] = exported_program
+            # the shared backends/transforms passes name it `exported_program`
+            if "exported_program" in kwargs:
+                kwargs["exported_program"] = exported_program
             if "compiler_specs" in kwargs:
                 kwargs["compiler_specs"] = compiler_specs
             if "skip_node_id_set" in kwargs:

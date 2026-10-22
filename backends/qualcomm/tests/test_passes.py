@@ -31,9 +31,10 @@ from executorch.backends.qualcomm.tests.models import (
 from executorch.backends.qualcomm.utils.utils import (
     generate_htp_compiler_spec,
     generate_qnn_executorch_compiler_spec,
+    qnn_edge_config,
     to_edge_transform_and_lower_to_qnn,
 )
-from executorch.exir import EdgeCompileConfig, to_edge
+from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lower
 from executorch.exir.debug_handle_utils import DEBUG_HANDLE_KEY
 from executorch.exir.dialects._ops import ops as exir_ops
 from torch.library import Library
@@ -709,6 +710,90 @@ class TestPasses(unittest.TestCase):
             raise
         edge.to_executorch()
 
+    def test_fuse_batch_norm_with_conv(self):
+        """In HTP fp16 a standalone BatchNorm multiplies the convolution's rounding
+        error by its per-channel scale; the to_edge pipeline folds it into the conv.
+        A transposed conv keeps its BatchNorm: its weight is [in, out/groups, *k].
+        conv1d is not covered: 1.4.1 rewrites it to conv2d between an unsqueeze and
+        a squeeze before the edge passes, so its BatchNorm follows the squeeze.
+        """
+
+        class ConvBn(torch.nn.Module):
+            def __init__(self, conv, bn):
+                super().__init__()
+                self.conv, self.bn = conv, bn
+
+            def forward(self, x):
+                return self.bn(self.conv(x))
+
+        class DepthwiseConv2dBn(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dw = torch.nn.Conv2d(8, 8, 3, groups=8, bias=False)
+                self.bn1 = torch.nn.BatchNorm2d(8)
+                self.pw = torch.nn.Conv2d(8, 4, 1)
+                self.bn2 = torch.nn.BatchNorm2d(4)
+
+            def forward(self, x):
+                x = torch.nn.functional.silu(self.bn1(self.dw(x)))
+                return self.bn2(self.pw(x))
+
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        bn_ops = {
+            exir_ops.edge.aten.native_batch_norm.default,
+            exir_ops.edge.aten._native_batch_norm_legit_no_training.default,
+        }
+        conv = exir_ops.edge.aten.convolution.default
+
+        def lower(module, shape):
+            for m in module.modules():
+                if isinstance(m, torch.nn.modules.batchnorm._BatchNorm):
+                    m.running_mean.uniform_(-2, 2)
+                    m.running_var.uniform_(1e-3, 1e-2)
+            module.eval()
+            ep = torch.export.export(module, (torch.randn(*shape),), strict=True)
+            pass_manager = get_qnn_pass_manager_cls()()
+            edge = to_edge_transform_and_lower(
+                {"forward": pass_manager.transform_for_export_pipeline(ep)},
+                transform_passes={
+                    "forward": pass_manager.get_to_edge_transform_passes(
+                        ep, compiler_specs=compiler_specs
+                    )
+                },
+                partitioner=None,
+                compile_config=qnn_edge_config(),
+            )
+            nodes = edge.exported_program().graph.nodes
+            targets = [n.target for n in nodes if n.op == "call_function"]
+            return sum(t in bn_ops for t in targets), targets.count(conv)
+
+        cases = (
+            ("depthwise_conv2d_bn", DepthwiseConv2dBn(), (1, 8, 16, 16), 2),
+            (
+                "conv3d_bn",
+                ConvBn(torch.nn.Conv3d(4, 8, 3), torch.nn.BatchNorm3d(8)),
+                (1, 4, 8, 8, 8),
+                1,
+            ),
+        )
+        for msg, module, shape, conv_count in cases:
+            with self.subTest(msg=msg):
+                self.assertEqual(lower(module, shape), (0, conv_count))
+        with self.subTest(msg="conv_transpose2d_bn_is_skipped"):
+            module = ConvBn(torch.nn.ConvTranspose2d(4, 8, 3), torch.nn.BatchNorm2d(8))
+            self.assertEqual(lower(module, (1, 4, 8, 8)), (1, 1))
+        # The folded weights are get_attr constants; partitioning must keep them
+        # constants of the delegate, not turn them into runtime inputs.
+        with self.subTest(msg="folded_weights_lower_to_qnn"):
+            sample_input = (torch.randn(1, 8, 16, 16),)
+            edge = to_edge_transform_and_lower_to_qnn(
+                DepthwiseConv2dBn().eval(), sample_input, compiler_specs
+            )
+            edge.to_executorch()
+
     def test_unbind_of_quantized_constant_lowers(self):
         """AnnotateUnbind read the quant attrs from the quantize node feeding unbind's
         dequantize, but a folded quantized constant feeds the dequantize directly.
@@ -813,6 +898,80 @@ class TestPasses(unittest.TestCase):
             )
         )
         edge.to_executorch()
+
+
+class TestIoBindingCheck(unittest.TestCase):
+    """_check_io_binding must fire when QNN publishes I/O the signature lacks.
+
+    The runtime binds delegate arguments positionally against the tensor list in
+    the context binary, so a graph that declares more bindable tensors than the
+    program passes reads past the end of args. That has to be caught at lowering.
+    """
+
+    @staticmethod
+    def _edge_program(num_inputs, num_outputs):
+        signature = MagicMock()
+        signature.user_inputs = [f"arg_{i}" for i in range(num_inputs)]
+        signature.user_outputs = [f"out_{i}" for i in range(num_outputs)]
+        edge_program = MagicMock()
+        edge_program.graph_signature = signature
+        return edge_program
+
+    def _run(self, names, num_inputs, num_outputs):
+        from executorch.backends.qualcomm import qnn_preprocess
+
+        wrappers = {f"n{i}": {0: object()} for i in range(len(names))}
+        by_id = {
+            id(next(iter(v.values()))): name
+            for v, name in zip(wrappers.values(), names)
+        }
+
+        class _StubWrapper:
+            def __init__(self, wrapper):
+                self._name = by_id[id(wrapper)]
+
+            def GetName(self):
+                return self._name
+
+        with unittest.mock.patch.object(
+            qnn_preprocess.PyQnnManager, "PyQnnTensorWrapper", _StubWrapper
+        ):
+            qnn_preprocess._check_io_binding(
+                self._edge_program(num_inputs, num_outputs), wrappers
+            )
+
+    def test_matching_io_passes(self):
+        self._run(
+            ["input_0_x", "output_y", "conv2d_3", "_frozen_param0"],
+            num_inputs=1,
+            num_outputs=1,
+        )
+
+    def test_mutable_buffers_do_not_consume_arguments(self):
+        # A mutable buffer is threaded through separately and is not a user input.
+        self._run(
+            ["input_0_x", "input_1_mutbuf_0_cache", "output_y"],
+            num_inputs=1,
+            num_outputs=1,
+        )
+
+    def test_extra_published_inputs_are_rejected(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(
+                ["input_0_x", "input_1_stray", "input_2_stray", "output_y"],
+                num_inputs=1,
+                num_outputs=1,
+            )
+        message = str(ctx.exception)
+        self.assertIn("QNN declares 3 graph inputs", message)
+        self.assertIn("input_1_stray", message)
+
+    def test_extra_published_outputs_are_rejected(self):
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run(
+                ["input_0_x", "output_y", "output_stray"], num_inputs=1, num_outputs=1
+            )
+        self.assertIn("2 graph outputs", str(ctx.exception))
 
 
 if __name__ == "__main__":
