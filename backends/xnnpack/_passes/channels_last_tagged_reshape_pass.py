@@ -194,6 +194,8 @@ class ChannelsLastTaggedReshapePass(XNNPACKPass):
             and 0 < val.dim() < 4
             and val.numel() > 1
             and not ChannelsLastTaggedReshapePass.is_nhwc_node(node)
+            # A view between dequantize and the op would carry no qparams
+            and not is_dequant(node)
         )
 
     def unsqueeze_to_4d(

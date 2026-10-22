@@ -388,6 +388,22 @@ class TestChannelsLastTaggedReshapePass(unittest.TestCase):
     ):
         self._test_lower_rank_operand_stays_nhwc(self.ConvNoiseSubConv())
 
+    def test_qs8_channels_last_tagged_reshape_pass_lower_rank_operand(self):
+        # The dequantized operand is left at its own rank: a view between
+        # dequantize and the op would carry no quant params and fail at load.
+        for module in (self.ConvNoiseAddConv(), self.ConvChannelScaleConv()):
+            (
+                Tester(module.eval(), (torch.randn(1, 3, 8, 8),))
+                .quantize()
+                .export()
+                .to_edge()
+                .run_passes(self.PassStage)
+                .check_not(
+                    ["executorch_exir_dialects_edge__ops_aten_view_copy_default"]
+                )
+                .run_method_and_compare_outputs()
+            )
+
     def test_fp32_channels_last_tagged_reshape_pass_conv_bn_hardtanh_mean_seq(self):
         # Copy #1 is for input to conv, nchw -> nhwc
         # Copy #2 is for conv to _native_batch_norm_legit_no_training, nhwc -> nchw
