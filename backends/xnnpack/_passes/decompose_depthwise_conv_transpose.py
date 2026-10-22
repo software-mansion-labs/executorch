@@ -155,10 +155,16 @@ class DecomposeDepthwiseConvTransposePass(XNNPACKPass):
                 # taps of phase (ay, ax) as a stride-1 correlation kernel:
                 # W[q] = w[s * (t_max - q) + a + p]
                 iy = torch.tensor(
-                    [s * (ty_max - q) + ay + padding[0] for q in range(ty_max - ty_min + 1)]
+                    [
+                        s * (ty_max - q) + ay + padding[0]
+                        for q in range(ty_max - ty_min + 1)
+                    ]
                 )
                 ix = torch.tensor(
-                    [s * (tx_max - q) + ax + padding[1] for q in range(tx_max - tx_min + 1)]
+                    [
+                        s * (tx_max - q) + ax + padding[1]
+                        for q in range(tx_max - tx_min + 1)
+                    ]
                 )
                 phase_weight = weight[:, :, iy][:, :, :, ix].contiguous()
                 with graph.inserting_before(weight_node):

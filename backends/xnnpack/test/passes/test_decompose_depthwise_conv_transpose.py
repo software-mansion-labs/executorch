@@ -28,7 +28,9 @@ class TestDecomposeDepthwiseConvTransposePass(unittest.TestCase):
         torch._dynamo.reset()
 
     class DwDeconv(torch.nn.Module):
-        def __init__(self, kernel, stride, padding, output_padding=0, bias=True, channels=8):
+        def __init__(
+            self, kernel, stride, padding, output_padding=0, bias=True, channels=8
+        ):
             super().__init__()
             self.deconv = torch.nn.ConvTranspose2d(
                 channels,
@@ -189,7 +191,13 @@ class TestDecomposeDepthwiseConvTransposePass(unittest.TestCase):
         # The decomposition in plain torch, independent of the lowering.
         import executorch.backends.xnnpack.custom_ops_lib as lib
 
-        for k, s, p, o in [(4, 2, 1, 0), (3, 2, 1, 1), (2, 2, 0, 0), (3, 3, 0, 0), (5, 2, 2, 1)]:
+        for k, s, p, o in [
+            (4, 2, 1, 0),
+            (3, 2, 1, 1),
+            (2, 2, 0, 0),
+            (3, 3, 0, 0),
+            (5, 2, 2, 1),
+        ]:
             c, h, w = 3, 5, 6
             x = torch.randn(1, c, h, w)
             weight = torch.randn(c, 1, k, k)
@@ -205,8 +213,12 @@ class TestDecomposeDepthwiseConvTransposePass(unittest.TestCase):
                         t_max = math.floor((k - 1 - a - p) / s)
                         taps.append((t_min, t_max))
                     (ty_min, ty_max), (tx_min, tx_max) = taps
-                    iy = torch.tensor([s * (ty_max - q) + ay + p for q in range(ty_max - ty_min + 1)])
-                    ix = torch.tensor([s * (tx_max - q) + ax + p for q in range(tx_max - tx_min + 1)])
+                    iy = torch.tensor(
+                        [s * (ty_max - q) + ay + p for q in range(ty_max - ty_min + 1)]
+                    )
+                    ix = torch.tensor(
+                        [s * (tx_max - q) + ax + p for q in range(tx_max - tx_min + 1)]
+                    )
                     wp = weight[:, :, iy][:, :, :, ix]
                     xp = torch.nn.functional.pad(x, (tx_max, -tx_min, ty_max, -ty_min))
                     phases.append(torch.nn.functional.conv2d(xp, wp, groups=c))
