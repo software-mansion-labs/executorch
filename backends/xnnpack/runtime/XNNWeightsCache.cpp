@@ -544,8 +544,15 @@ size_t XNNWeightsCache::look_up_or_insert(
     if (saved_ptr != nullptr && 0 == memcmp(ptr, saved_ptr, size)) {
       return offset;
     }
-    // Cache out of date: name hits but packed bytes differ.
-    return SIZE_MAX;
+    // The name maps to different packed bytes: XNNPACK packed something with
+    // this kernel that its cache name does not capture. Operators that pack
+    // before they consult the cache (deconvolution) take the returned offset
+    // as final, so hand this one its own packing under the name instead of
+    // reporting a miss; the earlier operators keep the packing they hold.
+    ET_LOG(
+        Info,
+        "look_up_or_insert: packed bytes differ for an existing name; "
+        "storing a separate packing");
   }
 
   // Add to Cache if it is not finalized
