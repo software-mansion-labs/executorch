@@ -9,7 +9,7 @@ import hashlib
 import logging
 import operator
 from types import NoneType
-from typing import cast, List, Optional, Union
+from typing import List, Optional, Union
 
 import executorch.backends.vulkan.serialization.vulkan_graph_schema as vk_graph_schema
 import torch
@@ -189,12 +189,9 @@ class VkGraphBuilder:
         return new_id
 
     def get_or_create_scalar_value(self, scalar: _ScalarType) -> int:
-        scalar_key = scalar
-        # Since Python considers 1 and True to be "equivalent" (as well as 0 and False)
-        # to distinguish entries in the dictionary, if scalar is bool then convert it
-        # to a string representation to use as a key for the dictionary
-        if isinstance(scalar, bool):
-            scalar_key = str(scalar)
+        # 1 == True == 1.0 and -0.0 == 0.0, all hashing alike, so key on the
+        # type and the repr; repr also lets equal NaNs share an entry.
+        scalar_key = (type(scalar), repr(scalar))
 
         if scalar_key in self.const_scalar_to_value_ids:
             return self.const_scalar_to_value_ids[scalar_key]
@@ -286,6 +283,7 @@ class VkGraphBuilder:
             self.values.append(
                 vk_graph_schema.VkValue(vk_graph_schema.IntList(items=[]))
             )
+            return new_id
 
         all_bool = True
         all_int = True
@@ -305,19 +303,19 @@ class VkGraphBuilder:
         if all_bool:
             self.values.append(
                 vk_graph_schema.VkValue(
-                    vk_graph_schema.BoolList(items=[cast(bool, e) for e in arg])
+                    vk_graph_schema.BoolList(items=[bool(e) for e in arg])
                 )
             )
-        if all_int:
+        elif all_int:
             self.values.append(
                 vk_graph_schema.VkValue(
-                    vk_graph_schema.IntList(items=[cast(int, e) for e in arg])
+                    vk_graph_schema.IntList(items=[int(e) for e in arg])
                 )
             )
         elif all_float:
             self.values.append(
                 vk_graph_schema.VkValue(
-                    vk_graph_schema.DoubleList(items=[cast(float, e) for e in arg])
+                    vk_graph_schema.DoubleList(items=[float(e) for e in arg])
                 )
             )
         elif all_int_or_symint:

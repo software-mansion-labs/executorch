@@ -378,6 +378,14 @@ class Cast(torch.nn.Module):
         return x.type(torch.IntTensor)
 
 
+class CastIntToFloat(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, y):
+        return y + (x + 1).float()
+
+
 class CastMultiUsers(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -1236,6 +1244,15 @@ class FloorDivConstantFloat(torch.nn.Module):
 
     def forward(self, x):
         return torch.floor(x / self.constant)
+
+
+class FloorDivConstantInt(torch.nn.Module):
+    def __init__(self, constant=80):
+        super().__init__()
+        self.constant = constant
+
+    def forward(self, x):
+        return x // self.constant
 
 
 class Fold(torch.nn.Module):
@@ -2571,6 +2588,15 @@ class SliceCopyWithStep(torch.nn.Module):
         )
 
 
+class SelectElement(torch.nn.Module):
+    def __init__(self, index):
+        super().__init__()
+        self.index = index
+
+    def forward(self, x, y):
+        return y + x[self.index]
+
+
 class SelectScatter(torch.nn.Module):
     def __init__(self, dim, index):
         super().__init__()
@@ -2766,6 +2792,11 @@ class TopKandIndex(torch.nn.Module):
     def forward(self, x):
         a, b = torch.topk(x, 3)
         return a + self.idx_source[b]
+
+
+class TopKIndices(torch.nn.Module):
+    def forward(self, x):
+        return torch.topk(x, 3)[1]
 
 
 class Triu(torch.nn.Module):
