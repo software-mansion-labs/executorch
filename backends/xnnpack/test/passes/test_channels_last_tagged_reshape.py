@@ -289,6 +289,121 @@ class TestChannelsLastTaggedReshapePass(unittest.TestCase):
             x = torch.mean(x, (-1, -2), keepdim=True)
             return x
 
+    class ConvScalarMulConv(torch.nn.Module):
+        """conv -> x * scalar -> clamp -> conv: the scalar must not pull the
+        activation back to NCHW between the two convolutions."""
+
+        def __init__(self):
+            super().__init__()
+            self.conv1 = torch.nn.Conv2d(3, 8, 3, padding=1)
+            self.conv2 = torch.nn.Conv2d(8, 4, 3, padding=1)
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = torch.clamp(x * 1.4142, -256.0, 256.0)
+            return self.conv2(x)
+
+    def test_fp32_channels_last_tagged_reshape_pass_scalar_operand_stays_nhwc(self):
+        (
+            Tester(self.ConvScalarMulConv().eval(), (torch.randn(1, 3, 8, 8),))
+            .export()
+            .to_edge()
+            .run_passes(self.PassStage)
+            # input -> NHWC and output -> NCHW only
+            .check_count({self.to_copy_name: 2})
+            .run_method_and_compare_outputs()
+        )
+
+    class ConvNoiseAddConv(torch.nn.Module):
+        """conv -> x + noise[H, W] -> conv: the rank-2 operand is reshaped to
+        [1, 1, H, W] and converted, instead of converting the activation."""
+
+        def __init__(self):
+            super().__init__()
+            self.conv1 = torch.nn.Conv2d(3, 8, 3, padding=1)
+            self.conv2 = torch.nn.Conv2d(8, 4, 3, padding=1)
+            self.register_buffer("noise", torch.randn(8, 8))
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = x + self.noise
+            return self.conv2(x)
+
+    class ConvChannelScaleConv(torch.nn.Module):
+        """conv -> x * scale[C, 1, 1] -> conv: a per-channel operand is
+        reshaped to [1, C, 1, 1] and converted."""
+
+        def __init__(self):
+            super().__init__()
+            self.conv1 = torch.nn.Conv2d(3, 8, 3, padding=1)
+            self.conv2 = torch.nn.Conv2d(8, 4, 3, padding=1)
+            self.register_buffer("scale", torch.randn(8, 1, 1))
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = x * self.scale
+            return self.conv2(x)
+
+    class ConvNoiseSubConv(torch.nn.Module):
+        """conv -> noise[H, W] - x -> conv: the lower-rank operand is the
+        left argument."""
+
+        def __init__(self):
+            super().__init__()
+            self.conv1 = torch.nn.Conv2d(3, 8, 3, padding=1)
+            self.conv2 = torch.nn.Conv2d(8, 4, 3, padding=1)
+            self.register_buffer("noise", torch.randn(8, 8))
+
+        def forward(self, x):
+            x = self.conv1(x)
+            x = self.noise - x
+            return self.conv2(x)
+
+    def _test_lower_rank_operand_stays_nhwc(self, module):
+        (
+            Tester(module.eval(), (torch.randn(1, 3, 8, 8),))
+            .export()
+            .to_edge()
+            .run_passes(self.PassStage)
+            # input -> NHWC, the 4D view of the operand -> NHWC, output -> NCHW
+            .check_count(
+                {
+                    self.to_copy_name: 3,
+                    "executorch_exir_dialects_edge__ops_aten_view_copy_default": 1,
+                }
+            )
+            .run_method_and_compare_outputs()
+        )
+
+    def test_fp32_channels_last_tagged_reshape_pass_lower_rank_operand_stays_nhwc(self):
+        self._test_lower_rank_operand_stays_nhwc(self.ConvNoiseAddConv())
+
+    def test_fp32_channels_last_tagged_reshape_pass_per_channel_operand_stays_nhwc(
+        self,
+    ):
+        self._test_lower_rank_operand_stays_nhwc(self.ConvChannelScaleConv())
+
+    def test_fp32_channels_last_tagged_reshape_pass_lower_rank_left_operand_stays_nhwc(
+        self,
+    ):
+        self._test_lower_rank_operand_stays_nhwc(self.ConvNoiseSubConv())
+
+    def test_qs8_channels_last_tagged_reshape_pass_lower_rank_operand(self):
+        # The dequantized operand is left at its own rank: a view between
+        # dequantize and the op would carry no quant params and fail at load.
+        for module in (self.ConvNoiseAddConv(), self.ConvChannelScaleConv()):
+            (
+                Tester(module.eval(), (torch.randn(1, 3, 8, 8),))
+                .quantize()
+                .export()
+                .to_edge()
+                .run_passes(self.PassStage)
+                .check_not(
+                    ["executorch_exir_dialects_edge__ops_aten_view_copy_default"]
+                )
+                .run_method_and_compare_outputs()
+            )
+
     def test_fp32_channels_last_tagged_reshape_pass_conv_bn_hardtanh_mean_seq(self):
         # Copy #1 is for input to conv, nchw -> nhwc
         # Copy #2 is for conv to _native_batch_norm_legit_no_training, nhwc -> nchw
@@ -663,5 +778,92 @@ class TestChannelsLastTaggedReshapePass(unittest.TestCase):
             .export()
             .to_edge()
             .run_passes(self.PassStage)
+            .run_method_and_compare_outputs()
+        )
+
+    class DynamicQuantPerChannelBinaryChain(torch.nn.Module):
+        """A per-channel broadcasting binary op that is the first consumer of an
+        input activation, followed by a dynamically-quantized convolution.
+
+        This reproduces the graph shape that the dynamic-quant path of
+        ``input_to_nhwc`` mishandles. The input activation feeds a per-channel
+        ``mul``/``add`` (an NCHW ``[1, C, 1, 1]`` constant operand), and the
+        convolution chain runs *through* that binary op. When the convolution
+        requests NHWC, ``input_to_nhwc`` traces back through the binary op to the
+        input activation and calls ``replace_all_uses_with``, switching the binary
+        op's activation operand to NHWC while its constant operand stays NCHW. At
+        runtime XNNPACK then fails in ``xnn_reshape_binary_elementwise_nd`` with
+        ``xnn_status_invalid_parameter`` because ``[1, H, W, C]`` and
+        ``[1, C, 1, 1]`` are not broadcast-compatible -- unless the pass
+        re-converges the binary op's operands.
+
+        The quantize/dequantize ops are emitted directly (rather than via the
+        quantizer) so the graph reliably reproduces the shared back-traced source;
+        the whole graph delegates to XNNPACK.
+        """
+
+        def __init__(self):
+            super().__init__()
+            out_channels, in_channels, kernel = 8, 8, 3
+            self.register_buffer(
+                "weight",
+                torch.randint(
+                    -127,
+                    127,
+                    (out_channels, in_channels, kernel, kernel),
+                    dtype=torch.int8,
+                ),
+            )
+            self.register_buffer(
+                "weight_scale", torch.rand(out_channels) * 0.02 + 0.001
+            )
+            self.register_buffer(
+                "weight_zero_point", torch.zeros(out_channels, dtype=torch.int64)
+            )
+            self.register_buffer("scale", torch.rand(1, out_channels, 1, 1) + 0.5)
+            self.register_buffer("bias", torch.rand(1, out_channels, 1, 1))
+
+        def forward(self, activation):
+            qd = torch.ops.quantized_decomposed
+            # Per-channel binary op as the first consumer of the input activation.
+            scaled = activation * self.scale + self.bias
+            relued = torch.relu(scaled)
+            # Dynamic (runtime-chosen) quantization feeding the convolution.
+            q_scale, q_zero_point = qd.choose_qparams.tensor(
+                relued, -128, 127, 1e-5, torch.int8
+            )
+            dequantized = qd.dequantize_per_tensor.tensor(
+                qd.quantize_per_tensor.tensor(
+                    relued, q_scale, q_zero_point, -128, 127, torch.int8
+                ),
+                q_scale,
+                q_zero_point,
+                -128,
+                127,
+                torch.int8,
+            )
+            weight = qd.dequantize_per_channel(
+                self.weight,
+                self.weight_scale,
+                self.weight_zero_point,
+                0,
+                -127,
+                127,
+                torch.int8,
+            )
+            return torch.nn.functional.conv2d(dequantized, weight, padding=1)
+
+    def test_dynamic_quant_per_channel_binary_chain_lowers_and_runs(self):
+        # Regression test: the full XNNPACK lowering of this graph must run
+        # without an xnn_status_invalid_parameter from a binary op whose operands
+        # ended up in mismatched (NHWC vs NCHW) memory formats.
+        model = self.DynamicQuantPerChannelBinaryChain().eval()
+        activation = torch.randn(1, 8, 16, 16)
+        (
+            Tester(model, (activation,))
+            .export()
+            .to_edge_transform_and_lower()
+            .to_executorch()
+            .serialize()
             .run_method_and_compare_outputs()
         )
