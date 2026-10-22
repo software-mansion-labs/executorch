@@ -445,10 +445,11 @@ class TestQNNFloatingPointOperator(TestQNN):
         self.lower_module_and_test_output(module, sample_input)
 
     def test_qnn_backend_cast(self):
-        modules = [Cast(), CastMultiUsers()]  # noqa: F405
+        modules = [Cast(), CastMultiUsers(), CastIntToFloat()]  # noqa: F405
         sample_inputs = [
             (10 * torch.rand((9, 4, 5, 3)),),
             (torch.randint(0, 3, size=(3, 3)), torch.randn(3, 3)),
+            (torch.randint(0, 80, size=(3, 3)), torch.randn(3, 3)),
         ]
         for i, (module, sample_input) in enumerate(zip(modules, sample_inputs)):
             with self.subTest(i=i):
@@ -2246,6 +2247,13 @@ class TestQNNFloatingPointOperator(TestQNN):
         sample_input = (torch.randn([1, 3, 3, 3]),)
         self.lower_module_and_test_output(module, sample_input)
 
+    def test_qnn_backend_select_element(self):
+        sample_input = (torch.randn(4), torch.randn(3, 4))
+        for i, index in enumerate([1, -1]):
+            with self.subTest(i=i):
+                module = SelectElement(index)  # noqa: F405
+                self.lower_module_and_test_output(module, sample_input)
+
     def test_qnn_backend_select_scatter(self):
         test_comb = [
             {
@@ -3348,6 +3356,14 @@ class TestQNNQuantizedOperator(TestQNN):
         module = CastMultiUsers()  # noqa: F405
         sample_input = (torch.randint(0, 3, size=(3, 3)), torch.randn(3, 3))
         module = self.get_qdq_module(module, sample_input)
+        self.lower_module_and_test_output(module, sample_input)
+
+    def test_qnn_backend_cast_int_to_float(self):
+        module = CastIntToFloat()  # noqa: F405
+        sample_input = (torch.randint(0, 80, size=(3, 3)), torch.randn(3, 3))
+        module = self.get_qdq_module(module, sample_input)
+        # absolute: the class rtol of 1 would accept an all-zero output
+        self.atol, self.rtol = 1, 0
         self.lower_module_and_test_output(module, sample_input)
 
     def test_qnn_backend_cat(self):
@@ -5384,6 +5400,14 @@ class TestQNNQuantizedOperator(TestQNN):
         sample_input = (torch.randn([1, 3, 3, 3]),)
         module = self.get_qdq_module(module, sample_input)
         self.lower_module_and_test_output(module, sample_input)
+
+    def test_qnn_backend_select_element(self):
+        sample_input = (torch.randn(4), torch.randn(3, 4))
+        for i, index in enumerate([1, -1]):
+            with self.subTest(i=i):
+                module = SelectElement(index)  # noqa: F405
+                module = self.get_qdq_module(module, sample_input)
+                self.lower_module_and_test_output(module, sample_input)
 
     def test_qnn_backend_select_scatter(self):
         test_comb = [

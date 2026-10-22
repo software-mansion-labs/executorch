@@ -378,6 +378,14 @@ class Cast(torch.nn.Module):
         return x.type(torch.IntTensor)
 
 
+class CastIntToFloat(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, y):
+        return y + (x + 1).float()
+
+
 class CastMultiUsers(torch.nn.Module):
     def __init__(self):
         super().__init__()
@@ -2578,6 +2586,15 @@ class SliceCopyWithStep(torch.nn.Module):
             x[:, : seq_length : self.step]
             + self.position_ids[:, : seq_length : self.step]
         )
+
+
+class SelectElement(torch.nn.Module):
+    def __init__(self, index):
+        super().__init__()
+        self.index = index
+
+    def forward(self, x, y):
+        return y + x[self.index]
 
 
 class SelectScatter(torch.nn.Module):

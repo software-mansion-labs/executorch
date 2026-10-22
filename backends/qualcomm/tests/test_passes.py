@@ -709,6 +709,41 @@ class TestPasses(unittest.TestCase):
             raise
         edge.to_executorch()
 
+    def test_unbind_of_quantized_constant_lowers(self):
+        """AnnotateUnbind read the quant attrs from the quantize node feeding unbind's
+        dequantize, but a folded quantized constant feeds the dequantize directly.
+        """
+
+        class UnbindConstant(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.table = torch.tensor([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]])
+
+            def forward(self, x):
+                a, b = torch.unbind(self.table, dim=0)
+                return x * a + b
+
+        sample_input = (torch.randn(4, 4),)
+        quantizer = QnnQuantizer()
+        quantizer.set_default_quant_config(quant_dtype=QuantDtype.use_16a8w)
+        prepared = prepare_pt2e(
+            torch.export.export(UnbindConstant(), sample_input).module(), quantizer
+        )
+        prepared(*sample_input)
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=False),
+        )
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                convert_pt2e(prepared), sample_input, compiler_specs
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+        edge.to_executorch()
+
     def test_constant_only_partition_stays_on_cpu(self):
         """An int64 buffer gets an int32 cast from I64toI32. When the buffer's consumer is
         not delegated, that cast alone would form a partition with no graph input, which
