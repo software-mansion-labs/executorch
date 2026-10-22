@@ -418,6 +418,13 @@ class UpsampleNearest2dConfig(GenericNodePartitionerConfig):
         if out_shape[-2] != 2 * in_shape[-2] or out_shape[-1] != 2 * in_shape[-1]:
             why(node, reason="only x2 nearest upsampling is supported")
             return False
+        # An explicit scale is used as-is for source indexing (not recomputed
+        # from the sizes), so e.g. 2.004 doubles the size but picks pixels
+        # differently from an exact x2.
+        scale_factors = node.args[2] if len(node.args) > 2 else None
+        if scale_factors is not None and any(s != 2.0 for s in scale_factors):
+            why(node, reason="only an exact x2 scale factor is supported")
+            return False
         return True
 
     def supported_precision_types(self) -> List[ConfigPrecisionType]:

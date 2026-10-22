@@ -28,6 +28,15 @@ class TestUpsampleNearest2d(unittest.TestCase):
         def forward(self, x):
             return torch.nn.functional.interpolate(x, scale_factor=3.0, mode="nearest")
 
+    class NearestInexact2x(torch.nn.Module):
+        """Doubles the size, but PyTorch indexes with 1/2.004, so the x2
+        duplication lowering would not match eager."""
+
+        def forward(self, x):
+            return torch.nn.functional.interpolate(
+                x, scale_factor=2.004, mode="nearest"
+            )
+
     class ConvNearestConv(torch.nn.Module):
         """The pattern that used to split XNNPACK partitions in conv decoders."""
 
@@ -83,4 +92,16 @@ class TestUpsampleNearest2d(unittest.TestCase):
             .to_edge_transform_and_lower()
             .check_count({self.edge_op: 1})
             .check_not(["torch.ops.higher_order.executorch_call_delegate"])
+        )
+
+    def test_fp32_upsample_nearest2d_inexact_scale_not_partitioned(self):
+        (
+            Tester(self.NearestInexact2x(), (torch.randn(1, 3, 200, 200),))
+            .export()
+            .to_edge_transform_and_lower()
+            .check_count({self.edge_op: 1})
+            .check_not(["torch.ops.higher_order.executorch_call_delegate"])
+            .to_executorch()
+            .serialize()
+            .run_method_and_compare_outputs()
         )
