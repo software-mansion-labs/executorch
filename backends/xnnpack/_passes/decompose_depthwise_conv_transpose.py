@@ -18,7 +18,6 @@ from executorch.backends.transforms.utils import (
 from executorch.backends.xnnpack._passes.xnnpack_pass import XNNPACKPass
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.pass_base import PassResult
-from torch.export.graph_signature import InputKind
 
 
 class DecomposeDepthwiseConvTransposePass(XNNPACKPass):
@@ -50,19 +49,21 @@ class DecomposeDepthwiseConvTransposePass(XNNPACKPass):
 
     def call(self, graph_module: torch.fx.GraphModule):
         graph = graph_module.graph
-        modified = False
-        for node in list(graph.nodes):
+        # Plan every conv before rewriting any: the nodes created by
+        # _decompose have no meta["val"] until the retrace below.
+        plans = []
+        for node in graph.nodes:
             if (
-                node.op != "call_function"
-                or node.target != exir_ops.edge.aten.convolution.default
+                node.op == "call_function"
+                and node.target == exir_ops.edge.aten.convolution.default
             ):
-                continue
-            plan = self._plan(node)
-            if plan is None:
-                continue
+                plan = self._plan(node)
+                if plan is not None:
+                    plans.append((node, plan))
+        for node, plan in plans:
             self._decompose(graph, node, *plan)
-            modified = True
 
+        modified = bool(plans)
         if modified:
             graph_module.recompile()
             graph_module = super().call(graph_module).graph_module
@@ -142,6 +143,11 @@ class DecomposeDepthwiseConvTransposePass(XNNPACKPass):
         groups = node.args[8]
         weight = get_param_tensor(self.exported_program, weight_node)
         assert weight is not None
+        weight_spec = next(
+            spec
+            for spec in self.exported_program.graph_signature.input_specs
+            if spec.arg.name == weight_node.name
+        )
 
         phase_convs = []
         for ay, (ty_min, ty_max) in enumerate(phases_y):
@@ -159,7 +165,8 @@ class DecomposeDepthwiseConvTransposePass(XNNPACKPass):
                     phase_weight_node = create_constant_placeholder(
                         exp_program=self.exported_program,
                         graph=graph,
-                        kind=InputKind.PARAMETER,
+                        kind=weight_spec.kind,
+                        persistent_buffer=weight_spec.persistent,
                         name=f"{weight_node.name}_phase_{ay}_{ax}",
                         data=phase_weight,
                     )

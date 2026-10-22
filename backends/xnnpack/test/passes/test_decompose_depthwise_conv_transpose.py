@@ -8,10 +8,12 @@ import math
 import unittest
 
 import torch
+from executorch.backends.test.harness.stages import StageType
 from executorch.backends.xnnpack._passes.decompose_depthwise_conv_transpose import (
     DecomposeDepthwiseConvTransposePass,
 )
 from executorch.backends.xnnpack.test.tester import RunPasses, Tester
+from executorch.exir.dialects._ops import ops as exir_ops
 
 
 class TestDecomposeDepthwiseConvTransposePass(unittest.TestCase):
@@ -46,8 +48,25 @@ class TestDecomposeDepthwiseConvTransposePass(unittest.TestCase):
         def forward(self, x):
             return self.deconv(x)
 
+    class QuantizedDwDeconv(torch.nn.Module):
+        # The XNNPACK quantizer never annotates grouped transposed convs, so
+        # build the dequantized weight by hand.
+        def __init__(self):
+            super().__init__()
+            self.register_buffer(
+                "weight", torch.randint(-128, 127, (8, 1, 4, 4), dtype=torch.int8)
+            )
+
+        def forward(self, x):
+            weight = torch.ops.quantized_decomposed.dequantize_per_tensor(
+                self.weight, 0.02, 0, -128, 127, torch.int8
+            )
+            return torch.nn.functional.conv_transpose2d(
+                x, weight, stride=2, padding=1, groups=8
+            )
+
     def _check_pass(self, module, inputs, counts, tol=1e-3):
-        (
+        return (
             Tester(module.eval(), inputs)
             .export()
             .to_edge()
@@ -107,6 +126,53 @@ class TestDecomposeDepthwiseConvTransposePass(unittest.TestCase):
         inputs = (torch.randn(1, 4, 4, 5),)
         self._check_pass(module, inputs, {self.conv: 9, self.cat: 1, self.d2s: 1})
         self._check_lowered(module, inputs)
+
+    def test_conv_before_deconv(self):
+        # The phase pads read the conv's output, not a graph input, which is
+        # what lets FusePadIntoConvPass fold them.
+        module = torch.nn.Sequential(
+            torch.nn.Conv2d(8, 8, 3, padding=1),
+            self.DwDeconv(kernel=4, stride=2, padding=1),
+        )
+        inputs = (torch.randn(1, 8, 6, 10),)
+        tester = self._check_pass(
+            module, inputs, {self.conv: 5, self.pad: 4, self.cat: 1, self.d2s: 1}
+        )
+        graph = (
+            tester.get_artifact(StageType.RUN_PASSES)
+            .exported_program()
+            .graph_module.graph
+        )
+        for node in graph.nodes:
+            if node.target == exir_ops.edge.aten.constant_pad_nd.default:
+                self.assertEqual(
+                    node.args[0].target, exir_ops.edge.aten.convolution.default
+                )
+        self._check_lowered(module, inputs)
+
+    def test_two_deconvs_in_a_row(self):
+        # The second deconv's input is the first one's depth_to_space_2d.
+        module = torch.nn.Sequential(
+            self.DwDeconv(kernel=4, stride=2, padding=1),
+            self.DwDeconv(kernel=4, stride=2, padding=1),
+        )
+        inputs = (torch.randn(1, 8, 4, 6),)
+        self._check_pass(
+            module, inputs, {self.conv: 8, self.pad: 8, self.cat: 2, self.d2s: 2}
+        )
+        self._check_lowered(module, inputs)
+
+    def test_batch_gt_1(self):
+        module = self.DwDeconv(kernel=4, stride=2, padding=1)
+        inputs = (torch.randn(3, 8, 6, 10),)
+        self._check_pass(
+            module, inputs, {self.conv: 4, self.pad: 4, self.cat: 1, self.d2s: 1}
+        )
+        self._check_lowered(module, inputs)
+
+    def test_quantized_is_left_alone(self):
+        inputs = (torch.randn(1, 8, 6, 6),)
+        self._check_pass(self.QuantizedDwDeconv(), inputs, {self.conv: 1, self.d2s: 0})
 
     def test_not_a_clean_upscale_is_left_alone(self):
         # k=4, p=0: output is 2H + 2, not a x2 upscale.
