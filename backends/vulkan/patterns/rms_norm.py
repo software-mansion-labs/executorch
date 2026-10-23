@@ -33,6 +33,10 @@ _ADD_TARGETS = (
     torch.ops.aten.add.Tensor,
     torch.ops.aten.add.Scalar,
 )
+_POW_TARGETS = (
+    exir_ops.edge.aten.pow.Tensor_Scalar,
+    torch.ops.aten.pow.Tensor_Scalar,
+)
 _RSQRT_TARGETS = (
     exir_ops.edge.aten.rsqrt.default,
     torch.ops.aten.rsqrt.default,
@@ -127,15 +131,22 @@ def _verify_rms_inner(
     dims = mean_node.args[1]
     if not isinstance(dims, (list, tuple)) or len(dims) != 1:
         return None
-    if dims[0] not in (-1,):
+    # The last dim, as -1 or, as aten.rms_norm's decomposition spells it, ndim - 1.
+    ndim = len(mean_node.meta["val"].shape)
+    if dims[0] not in (-1, ndim - 1):
         return None
 
-    # sq = mul(x_f32, x_f32)
+    # sq = mul(x_f32, x_f32) or pow(x_f32, 2) (HF RMSNorm, aten.rms_norm)
     sq_node = mean_node.args[0]
-    if not _is_call(sq_node, _MUL_TARGETS):
-        return None
-    sa, sb = sq_node.args[0], sq_node.args[1]
-    if sa is not sb:
+    if _is_call(sq_node, _MUL_TARGETS):
+        sa, sb = sq_node.args[0], sq_node.args[1]
+        if sa is not sb:
+            return None
+    elif _is_call(sq_node, _POW_TARGETS):
+        sa = sq_node.args[0]
+        if sq_node.args[1] not in (2, 2.0):
+            return None
+    else:
         return None
     if sa is not x_f32_node:
         return None
