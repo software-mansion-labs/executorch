@@ -7,6 +7,7 @@ from executorch.backends.qualcomm._passes import (
     AnnotateQuantAttrs,
     ConvertBmmToMatmul,
     ConvertMhaToSha,
+    DecomposeMinMaxDim,
     FoldQDQ,
     InsertIOQDQ,
     InsertReshapeForReduceOps,
@@ -207,6 +208,23 @@ class TestPasses(unittest.TestCase):
         # AddModule with one input and one output should insert exactly
         # one quantize (input) and one dequantize (output) = +2 nodes.
         self.assertEqual(node_count_after, node_count_before + 2)
+
+    def test_decompose_minmaxdim_tensor_method(self):
+        # Tensor.max carries no torch.max source_fn, which the pass used to need.
+        class MaxMethod(torch.nn.Module):
+            def forward(self, x):
+                return x.max(dim=-1)
+
+        x = torch.randn(2, 5, 7)
+        ep = to_edge(torch.export.export(MaxMethod(), (x,))).exported_program()
+        DecomposeMinMaxDim()(ep.graph_module)
+
+        targets = [n.target for n in ep.graph.nodes]
+        self.assertIn(exir_ops.edge.aten.argmax.default, targets)
+        values, indices = ep.graph_module(x)
+        ref_values, ref_indices = MaxMethod()(x)
+        self.assertTrue(torch.equal(values, ref_values))
+        self.assertTrue(torch.equal(indices, ref_indices))
 
     def test_insert_reshape_for_argmax(self):
         class ArgmaxModule(torch.nn.Module):
