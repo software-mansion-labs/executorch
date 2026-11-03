@@ -41,6 +41,7 @@ from executorch.backends.qualcomm.serialization.qc_schema import (
     QnnExecuTorchBackendType,
 )
 from executorch.backends.qualcomm.utils.constants import QCOM_QUANT_ANNOTATION_KEY
+from executorch.backends.transforms.replace_in_place_ops import replace_in_place_ops
 from torch._ops import OpOverload
 
 from torch.fx import GraphModule
@@ -524,6 +525,7 @@ class QnnQuantizer(Quantizer):
         Returns:
             GraphModule: The transformed model.
         """
+        model = replace_in_place_ops(model)
         return get_qnn_pass_manager_cls(
             self.backend
         )().transform_for_annotation_pipeline(model)
