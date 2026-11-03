@@ -855,6 +855,43 @@ class TestPasses(unittest.TestCase):
             raise
         edge.to_executorch()
 
+    def test_i64_to_i32_constant_cast_order(self):
+        """The int32 cast of an int64 get_attr constant must still follow it once the
+        constant is lifted to a placeholder."""
+
+        class RemainderByScalar(torch.nn.Module):
+            # DecomposeRemainder turns the scalar into an int64 get_attr at the graph head
+            def forward(self, x, idx):
+                return x + (idx % 80).float()
+
+        sample_input = (torch.randn(1, 3), torch.tensor([[3, 170, 85]]))
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        ep = torch.export.export(RemainderByScalar(), sample_input, strict=True)
+        pass_manager = get_qnn_pass_manager_cls()()
+        edge = to_edge_transform_and_lower(
+            {"forward": pass_manager.transform_for_export_pipeline(ep)},
+            transform_passes={
+                "forward": pass_manager.get_to_edge_transform_passes(
+                    ep, compiler_specs=compiler_specs
+                )
+            },
+            partitioner=None,
+            compile_config=qnn_edge_config(),
+        )
+        edge.exported_program().graph.lint()
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                RemainderByScalar(), sample_input, compiler_specs
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+        edge.to_executorch()
+
     def test_lift_int_floor_divide_scalar(self):
         """A Python scalar divisor, as in `indices // num_classes`, is lifted to an
         int32 constant so the integer floor_divide stays exact."""
