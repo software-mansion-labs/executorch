@@ -39,17 +39,11 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 // drift over long context lengths. Storage of the softmax output stays at
 // DTYPE so downstream (V*attn-weights) is unchanged.
 //
-// Shared memory for cooperative exp sum finding (fp32).
-shared float shared_exp_sum[NUM_WORKERS_PER_WG];
-// Iter 88 fix: shared memory for cooperative row-max finding. Without
-// max-subtraction, fp16 exp() saturates to inf for any QK > ~11.09 and
-// underflows to 0 for QK < ~-11. Either case yields NaN through 0/inf
-// or 0/0 in the final divide. The reproducer shows 20/40 (pos,head)
-// slots NaN for random gemma-shape weights with QK in [-45, +39]. With
-// max-subtraction the exponent is clamped to [-large, 0] so exp() never
-// overflows; small exp values still underflow to 0 but at least one term
-// (where x == max) contributes exp(0)=1 to the sum so we never divide by 0.
-shared float shared_row_max[NUM_WORKERS_PER_WG];
+// Iter 88 fix: the softmax subtracts the row max before exp(). Without it,
+// fp16 exp() saturates to inf for any QK > ~11.09 and underflows to 0 for
+// QK < ~-11, and either case yields NaN in the final divide.
+#define SOFTMAX_IN_VEC4_T VEC4_T
+#define SOFTMAX_ACC_T float
 
 VEC4_T load_attn_weights_c4(
     const int c4,
@@ -80,6 +74,8 @@ void store_attn_weights_softmax_c4(
 #endif
 }
 
+#include "sdpa_attn_weights_softmax_row.glslh"
+
 void main() {
   const int worker_id = int(gl_LocalInvocationID.x);
 
@@ -97,117 +93,10 @@ void main() {
   // The "actual" tensor sizes may have been aligned to a multiple of 4 to allow
   // memory loads to be aligned to texel boundaries.
   const int context_len = input_pos + S;
-  const int context_texel_len = div_up_4(context_len);
 
   if (s >= S || q_h >= Q_H) {
     return;
   }
 
-  const int context_len_aligned_down = context_len - mod_4(context_len);
-  const int C4_limit = div_4(context_len_aligned_down);
-
-  // Iter 88 fix: numerically-stable softmax via max-subtraction.
-  // Iter136 fp32-attn-acc: max + exp_sum reductions run in fp32 even when
-  // DTYPE=half. Cast to float on read, cast back to VEC4_T on store.
-  // Pass 1: compute row max across this thread's slice.
-  float local_max = -1.0 / 0.0; // -inf
-  for (int c4 = worker_id; c4 < C4_limit; c4 += NUM_WORKERS_PER_WG) {
-    VEC4_T in_texel = load_attn_weights_c4(
-        c4, s, q_h, context_texel_len, S_aligned, Q_H);
-    [[unroll]] for (int comp = 0; comp < 4; comp++) {
-      local_max = max(local_max, float(in_texel[comp]));
-    }
-  }
-  if (worker_id == 0) {
-    for (int c4 = C4_limit; c4 < context_texel_len; ++c4) {
-      const int c_base = mul_4(c4);
-      VEC4_T in_texel = load_attn_weights_c4(
-          c4, s, q_h, context_texel_len, S_aligned, Q_H);
-      [[unroll]] for (int comp = 0; comp < 4; comp++) {
-        if (c_base + comp < context_len) {
-          local_max = max(local_max, float(in_texel[comp]));
-        }
-      }
-    }
-  }
-
-  // Reduce max across the workgroup.
-  shared_row_max[worker_id] = local_max;
-  memoryBarrierShared();
-  barrier();
-  for (int i = NUM_WORKERS_PER_WG / 2; i > 0; i >>= 1) {
-    if (worker_id < i) {
-      shared_row_max[worker_id] =
-          max(shared_row_max[worker_id], shared_row_max[worker_id + i]);
-    }
-    memoryBarrierShared();
-    barrier();
-  }
-  float row_max = shared_row_max[0];
-
-  // Pass 2: compute sum of exp(x - row_max) in fp32.
-  float local_exp_sum = 0.0;
-  for (int c4 = worker_id; c4 < C4_limit; c4 += NUM_WORKERS_PER_WG) {
-    VEC4_T in_texel = load_attn_weights_c4(
-        c4, s, q_h, context_texel_len, S_aligned, Q_H);
-
-    for (int comp = 0; comp < 4; comp++) {
-      local_exp_sum += exp(float(in_texel[comp]) - row_max);
-    }
-  }
-  if (worker_id == 0) {
-    for (int c4 = C4_limit; c4 < context_texel_len; ++c4) {
-      const int c_base = mul_4(c4);
-      VEC4_T in_texel = load_attn_weights_c4(
-          c4, s, q_h, context_texel_len, S_aligned, Q_H);
-
-      [[unroll]] for (int comp = 0; comp < 4; comp++) {
-        if (c_base + comp < context_len) {
-          local_exp_sum += exp(float(in_texel[comp]) - row_max);
-        }
-      }
-    }
-  }
-
-  // Reduce sum.
-  shared_exp_sum[worker_id] = local_exp_sum;
-  memoryBarrierShared();
-  barrier();
-  for (int i = NUM_WORKERS_PER_WG / 2; i > 0; i >>= 1) {
-    if (worker_id < i) {
-      shared_exp_sum[worker_id] = shared_exp_sum[worker_id] +
-          shared_exp_sum[worker_id + i];
-    }
-    memoryBarrierShared();
-    barrier();
-  }
-
-  local_exp_sum = shared_exp_sum[0];
-  // Pass 3: write exp(x - row_max) / sum (fp32 division, cast to VEC4_T on store).
-  for (int c4 = worker_id; c4 < C4_limit; c4 += NUM_WORKERS_PER_WG) {
-    VEC4_T in_texel = load_attn_weights_c4(
-        c4, s, q_h, context_texel_len, S_aligned, Q_H);
-
-    vec4 out_fp32 = exp(vec4(in_texel) - vec4(row_max)) / local_exp_sum;
-    VEC4_T out_texel = VEC4_T(out_fp32);
-    store_attn_weights_softmax_c4(
-        out_texel, c4, s, q_h, context_texel_len, S_aligned, Q_H);
-  }
-  if (worker_id == 0) {
-    for (int c4 = C4_limit; c4 < context_texel_len; ++c4) {
-      const int c_base = mul_4(c4);
-      VEC4_T in_texel = load_attn_weights_c4(
-          c4, s, q_h, context_texel_len, S_aligned, Q_H);
-
-      vec4 out_fp32 = vec4(0);
-      [[unroll]] for (int comp = 0; comp < 4; comp++) {
-        if (c_base + comp < context_len) {
-          out_fp32[comp] = exp(float(in_texel[comp]) - row_max) / local_exp_sum;
-        }
-      }
-      VEC4_T out_texel = VEC4_T(out_fp32);
-      store_attn_weights_softmax_c4(
-          out_texel, c4, s, q_h, context_texel_len, S_aligned, Q_H);
-    }
-  }
+  softmax_attn_weights_row(worker_id, s, q_h, context_len, S_aligned, Q_H);
 }

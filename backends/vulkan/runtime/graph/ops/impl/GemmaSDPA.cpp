@@ -177,7 +177,8 @@ void add_sdpa_attn_weights_softmax_node(
     const ValueRef attn_weights,
     const ValueRef q_projected,
     const ValueRef input_pos_symint,
-    const ValueRef attn_weights_softmax);
+    const ValueRef attn_weights_softmax,
+    const bool has_fused_qk_softmax = false);
 
 void add_sdpa_compute_out_node(
     ComputeGraph& graph,
@@ -214,11 +215,14 @@ void add_sdpa_compute_attn_weights_node(
     const ValueRef attn_mask = kDummyValueRef,
     const bool force_tiled = false,
     const bool mask_per_head = false,
-    const float softcap_value = 0.0f);
+    const float softcap_value = 0.0f,
+    const bool has_fused_qk_softmax = false);
 
 // Decode-only fused attn-weights + softmax (writes softmax-normalized values
 // directly to the consumer-side buffer). Skips the standalone softmax
-// dispatch entirely. See SDPA.cpp for details.
+// dispatch entirely. Must be added alongside the separate attn-weights and
+// softmax nodes created with has_fused_qk_softmax = true, which take over
+// for prefill and for long contexts. See SDPA.cpp for details.
 void add_sdpa_compute_attn_weights_with_softmax_node(
     ComputeGraph& graph,
     const ValueRef q_projected,
@@ -523,9 +527,11 @@ void gemma_sdpa_core(
   // correct (TILE_M=4 with bounds checks covers S<=4). The proper coop
   // shader fix is tracked as a follow-up.
   //
-  // Softmax fusion: at decode (S=1), use the fused matmul+softmax shader
-  // that writes softmax-normalized attn_weights directly to the consumer
-  // buffer. Skips the standalone softmax dispatch (one per layer per token).
+  // Softmax fusion: at decode (S=1) within the fused context cutoff, the fused
+  // matmul+softmax shader writes softmax-normalized attn_weights directly to
+  // the consumer buffer, skipping the standalone softmax dispatch. The
+  // separate pair is built too and serves prefill and longer contexts; the
+  // work group pickers choose between them at every resize.
   //
   // Audio-extension (Phase 2B): when the caller requests per-head mask or
   // softcap, route through the EXTENDED Llama compute-attn-weights shader
@@ -535,7 +541,6 @@ void gemma_sdpa_core(
   // (TILE_M=4 with rows 1,2,3 of each tile corrupted; ~75% bad → cos≈0.40
   // on audio_encoder iter197). Vision iter185 path (mask_h==1, softcap==0)
   // continues to use Llama's shader via the unmodified `else` branch below.
-  const bool fuse_softmax = is_single_token(&graph, q_projected);
   const bool needs_audio_variant = mask_per_head || has_softcap;
 
   if (needs_audio_variant) {
@@ -563,7 +568,7 @@ void gemma_sdpa_core(
         q_projected,
         input_pos_symint,
         attn_weights_softmax);
-  } else if (fuse_softmax) {
+  } else {
     add_sdpa_compute_attn_weights_with_softmax_node(
         graph,
         q_projected,
@@ -572,7 +577,7 @@ void gemma_sdpa_core(
         attn_weights_softmax,
         /*inv_scale_override=*/1.0f,
         /*attn_mask=*/has_mask ? attn_mask : kDummyValueRef);
-  } else {
+
     add_sdpa_compute_attn_weights_node(
         graph,
         q_projected,
@@ -581,14 +586,18 @@ void gemma_sdpa_core(
         attn_weights,
         /*inv_scale_override=*/1.0f,
         /*attn_mask=*/has_mask ? attn_mask : kDummyValueRef,
-        /*force_tiled=*/false);
+        /*force_tiled=*/false,
+        /*mask_per_head=*/false,
+        /*softcap_value=*/0.0f,
+        /*has_fused_qk_softmax=*/true);
 
     add_sdpa_attn_weights_softmax_node(
         graph,
         attn_weights,
         q_projected,
         input_pos_symint,
-        attn_weights_softmax);
+        attn_weights_softmax,
+        /*has_fused_qk_softmax=*/true);
   }
 
   // Stage-3-W: also force tiled for compute_out at S=1 (same coop SPIR-V

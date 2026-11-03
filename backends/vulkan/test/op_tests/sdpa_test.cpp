@@ -879,3 +879,20 @@ TEST(VulkanSDPATest, test_sdpa_op_llama3_params_dynamic) {
   test_vulkan_sdpa(
       0, {111, 1, 1, 1, 57, 1, 1}, head_dim, num_heads, num_kv_heads, 1);
 }
+
+// Decode steps whose context crosses the fused QK+softmax cutoff (256 tokens):
+// the fused node serves the decode steps up to it and the separate
+// attn-weights and softmax pair the ones past it, within one graph.
+TEST(VulkanSDPATest, test_sdpa_op_decode_across_fused_softmax_cutoff) {
+  const int head_dim = 64;
+  const int num_heads = 8;
+  const int num_kv_heads = 2;
+
+  test_vulkan_sdpa(
+      0,
+      {250, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3, 1},
+      head_dim,
+      num_heads,
+      num_kv_heads,
+      1);
+}

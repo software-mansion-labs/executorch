@@ -12,6 +12,7 @@ sdpa_compute_attn_weights_coop:
     HAS_MASK: 0
     MASK_PER_HEAD: 0
     HAS_SOFTCAP: 0
+    FUSE_SOFTMAX: 0
     TILE_K4: 1
     TILE_N4: 1
   generate_variant_forall:
@@ -50,3 +51,14 @@ sdpa_compute_attn_weights_coop:
       HAS_MASK: 1
       MASK_PER_HEAD: 1
       HAS_SOFTCAP: 1
+    # Decode-only fused Q @ K^T + softmax (see FUSE_SOFTMAX in the shader).
+    - NAME: sdpa_compute_attn_weights_coop_softmax_nomask
+      FUSE_SOFTMAX: 1
+      HAS_MASK: 0
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 0
+    - NAME: sdpa_compute_attn_weights_coop_softmax_mask
+      FUSE_SOFTMAX: 1
+      HAS_MASK: 1
+      MASK_PER_HEAD: 0
+      HAS_SOFTCAP: 0
