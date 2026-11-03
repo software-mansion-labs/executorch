@@ -51,6 +51,7 @@ from executorch.backends.qualcomm._passes import (
     DecomposeWrapWithAutocast,
     ExpandBroadcastTensorShape,
     FixedLinearKeepDim,
+    FoldConstantViews,
     FoldQDQ,
     FuseBatchNormWithConv,
     FuseConsecutiveCast,
@@ -164,6 +165,7 @@ class QnnPassManager(PassManager):
         """Return annotation pipeline pass classes. Override in subclasses to add backend-specific passes."""
         return [
             RemoveRedundancy,
+            FoldConstantViews,
             RecomposePixelUnshuffle,
             RecomposeRmsNorm,
             ReplaceArangeArgs,
