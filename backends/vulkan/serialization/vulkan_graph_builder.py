@@ -9,7 +9,7 @@ import hashlib
 import logging
 import operator
 from types import NoneType
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import executorch.backends.vulkan.serialization.vulkan_graph_schema as vk_graph_schema
 import torch
@@ -31,6 +31,7 @@ from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.tensor import TensorSpec
 from torch._export.utils import get_buffer, get_param, is_buffer, is_param
 from torch.export import ExportedProgram
+from torch.export.graph_signature import OutputKind
 from torch.fx import Node
 
 _ScalarType = Union[bool, int, float]
@@ -487,20 +488,44 @@ class VkGraphBuilder:
             return self.node_to_value_ids.get(candidate)
         return None
 
+    def _output_nodes_in_order(self, node: Node) -> List[Tuple[Optional[int], Node]]:
+        """
+        The graph outputs in order, duplicates included, each paired with its
+        position in the output signature.
+
+        `node.all_input_nodes` de-duplicates, so a graph that returns the same
+        value twice (`return y, y`, or `return y, y.view(...)` once a redundant
+        view is removed) would serialize one output id for two outputs and fail
+        the runtime's argument count check.
+
+        The position is what distinguishes those repeats from a buffer mutation
+        that happens to alias a user output: both reference the same node, so
+        only the signature can say which slot is which. It is None when the
+        signature does not line up with the output args, in which case the
+        caller treats every occurrence of a mutation as the mutation.
+        """
+        args = node.args[0] if len(node.args) == 1 else node.args
+        if isinstance(args, Node):
+            args = (args,)
+        output_specs = getattr(self.program.graph_signature, "output_specs", None)
+        aligned = output_specs is not None and len(output_specs) == len(args)
+        out_nodes: List[Tuple[Optional[int], Node]] = []
+        for idx, arg in enumerate(args):
+            if isinstance(arg, Node):
+                out_nodes.append((idx if aligned else None, arg))
+        return out_nodes
+
+    def _is_user_output_slot(self, idx: Optional[int]) -> bool:
+        """Whether the output slot at `idx` is known to be a user output."""
+        if idx is None:
+            return False
+        output_specs = getattr(self.program.graph_signature, "output_specs", None)
+        if output_specs is None:
+            return False
+        return output_specs[idx].kind == OutputKind.USER_OUTPUT
+
     def process_output_node(self, node: Node) -> None:
-        # Iterate the output node's args rather than all_input_nodes, which
-        # deduplicates. A graph that returns the same value more than once
-        # still gets one delegate call argument per returned slot, and
-        # VulkanBackend::execute matches args to inputs and outputs by
-        # position, so collapsing the repeat makes the graph declare fewer
-        # outputs than the call supplies and the call is rejected outright.
-        out_args = node.args[0]
-        if not isinstance(out_args, (list, tuple)):
-            out_args = (out_args,)
-        for out_node in out_args:
-            # all_input_nodes yields only Nodes; keep ignoring anything else.
-            if not isinstance(out_node, Node):
-                continue
+        for idx, out_node in self._output_nodes_in_order(node):
             if out_node not in self.node_to_value_ids:
                 raise AssertionError(
                     "Cannot find input to output node in node_to_value_ids. This means "
@@ -512,7 +537,10 @@ class VkGraphBuilder:
             # computes `args.size() - num_outputs` in size_t arithmetic, and
             # any surplus output turns that into a wild pointer.
             buffer_value_id = self.buffer_value_id_for_mutation(out_node)
-            if buffer_value_id is not None:
+            # Decide per slot rather than per node: once a redundant view is
+            # removed, a buffer mutation and a user output can be the same
+            # node, and only the user output's slot is passed to the call.
+            if buffer_value_id is not None and not self._is_user_output_slot(idx):
                 out_value_id = self.node_to_value_ids[out_node]
                 # A mutable buffer is prepacked as a graph-owned tensor, so its
                 # contents survive between execute() calls -- but only what is

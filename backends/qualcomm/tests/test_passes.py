@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 from executorch.backends.qualcomm import qnn_preprocess
@@ -7,14 +7,18 @@ from executorch.backends.qualcomm._passes import (
     AnnotateQuantAttrs,
     ConvertBmmToMatmul,
     ConvertMhaToSha,
+    DecomposeMinMaxDim,
+    FoldConstantViews,
     FoldQDQ,
     InsertIOQDQ,
     InsertReshapeForReduceOps,
+    LiftConstantScalarOperands,
     RemoveRedundancy,
 )
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
     get_qnn_pass_manager_cls,
 )
+from executorch.backends.qualcomm.builders.node_visitor_manager import get_node_visitors
 from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
 from executorch.backends.qualcomm.partition.qnn_partitioner import QnnOperatorSupport
 from executorch.backends.qualcomm.qnn_preprocess import QnnBackend
@@ -28,6 +32,7 @@ from executorch.backends.qualcomm.tests.models import (
     Reciprocal,
     TopKandIndex,
 )
+from executorch.backends.qualcomm.utils.constants import QCOM_BLOCK_SIZE
 from executorch.backends.qualcomm.utils.utils import (
     generate_htp_compiler_spec,
     generate_qnn_executorch_compiler_spec,
@@ -38,7 +43,9 @@ from executorch.exir import EdgeCompileConfig, to_edge, to_edge_transform_and_lo
 from executorch.exir.debug_handle_utils import DEBUG_HANDLE_KEY
 from executorch.exir.dialects._ops import ops as exir_ops
 from torch.library import Library
+from torchao.quantization.pt2e import MinMaxObserver
 from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
+from torchao.quantization.utils import compute_error
 
 
 class TestPasses(unittest.TestCase):
@@ -207,6 +214,65 @@ class TestPasses(unittest.TestCase):
         # AddModule with one input and one output should insert exactly
         # one quantize (input) and one dequantize (output) = +2 nodes.
         self.assertEqual(node_count_after, node_count_before + 2)
+
+    def test_decompose_minmaxdim_tensor_method(self):
+        # Tensor.max carries no torch.max source_fn, which the pass used to need.
+        class MaxMethod(torch.nn.Module):
+            def forward(self, x):
+                return x.max(dim=-1)
+
+        x = torch.randn(2, 5, 7)
+        ep = to_edge(torch.export.export(MaxMethod(), (x,))).exported_program()
+        DecomposeMinMaxDim()(ep.graph_module)
+
+        targets = [n.target for n in ep.graph.nodes]
+        self.assertIn(exir_ops.edge.aten.argmax.default, targets)
+        values, indices = ep.graph_module(x)
+        ref_values, ref_indices = MaxMethod()(x)
+        self.assertTrue(torch.equal(values, ref_values))
+        self.assertTrue(torch.equal(indices, ref_indices))
+
+    def test_remove_redundancy_single_chunk_split(self):
+        # QNN's Split rejects a single output; a one-chunk split is its input.
+        class SingleChunkSplit(torch.nn.Module):
+            def forward(self, x):
+                (y,) = x.sigmoid().split([x.shape[1]], dim=1)
+                return y.relu()
+
+        x = torch.randn(1, 4, 3)
+        ep = to_edge(torch.export.export(SingleChunkSplit(), (x,))).exported_program()
+        RemoveRedundancy()(ep.graph_module)
+
+        targets = [n.target for n in ep.graph.nodes]
+        self.assertNotIn(exir_ops.edge.aten.split_with_sizes_copy.default, targets)
+        (out,) = ep.graph_module(x)
+        self.assertTrue(torch.equal(out, SingleChunkSplit()(x)))
+
+    def test_fold_constant_views_mha_in_proj(self):
+        # With query != value, nn.MultiheadAttention splits in_proj_weight at
+        # runtime; each projection must get its own constant weight.
+        class CrossAttention(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.attn = torch.nn.MultiheadAttention(16, 2, batch_first=True)
+
+            def forward(self, x):
+                q = x.sigmoid()
+                return self.attn(q, q, x, need_weights=False)[0]
+
+        mod = CrossAttention().eval()
+        x = torch.randn(1, 5, 16)
+        gm = torch.export.export(mod, (x,)).module()
+        FoldConstantViews()(gm)
+
+        weights = [
+            n.args[1]
+            for n in gm.graph.nodes
+            if n.target == torch.ops.aten.linear.default
+        ]
+        self.assertTrue(weights)
+        self.assertTrue(all(w.op == "get_attr" for w in weights))
+        self.assertTrue(torch.allclose(gm(x), mod(x)))
 
     def test_insert_reshape_for_argmax(self):
         class ArgmaxModule(torch.nn.Module):
@@ -515,7 +581,9 @@ class TestPasses(unittest.TestCase):
             if "QNN" in str(e) or "qnn" in str(e):
                 self.skipTest(f"QNN SDK not available: {e}")
 
-    def test_skipped_conv_keeps_its_weight_dequantize_on_cpu(self):
+    def _assert_cpu_conv_keeps_its_weight_dequantize(
+        self, quant_dtype, use_fp16, skip_node_id_set=None
+    ):
         """A quantized conv kept off QNN must take its per-channel weight dequantize
         with it. FoldQDQ force-passes that dequantize, so it used to be lowered alone
         as a QNN Dequantize, which rejects per-channel encodings and fails context
@@ -534,7 +602,7 @@ class TestPasses(unittest.TestCase):
         sample_input = (torch.randn(1, 8, 16, 16),)
         quantizer = QnnQuantizer()
         quantizer.set_default_quant_config(
-            quant_dtype=QuantDtype.use_16a8w, is_conv_per_channel=True
+            quant_dtype=quant_dtype, is_conv_per_channel=True
         )
         prepared = prepare_pt2e(
             torch.export.export(ConvDepthwiseConv().eval(), sample_input).module(),
@@ -543,14 +611,14 @@ class TestPasses(unittest.TestCase):
         prepared(*sample_input)
         compiler_specs = generate_qnn_executorch_compiler_spec(
             soc_model=QcomChipset.SM8650,
-            backend_options=generate_htp_compiler_spec(use_fp16=False),
+            backend_options=generate_htp_compiler_spec(use_fp16=use_fp16),
         )
         try:
             edge = to_edge_transform_and_lower_to_qnn(
                 convert_pt2e(prepared),
                 sample_input,
                 compiler_specs,
-                skip_node_id_set={"aten_convolution_default_1"},
+                skip_node_id_set=skip_node_id_set,
             )
         except RuntimeError as e:
             if "QNN" in str(e) or "qnn" in str(e):
@@ -558,21 +626,35 @@ class TestPasses(unittest.TestCase):
             raise
 
         # inspected before to_executorch(), which swaps in out-variant ops
-        def cpu_nodes(op_name):
+        def cpu_nodes(target):
             return [
                 node
                 for node in edge.exported_program().graph.nodes
-                if node.op == "call_function"
-                and getattr(node.target, "__name__", "") == op_name
+                if node.op == "call_function" and node.target == target
             ]
 
-        convs = cpu_nodes("aten.convolution.default")
+        convs = cpu_nodes(exir_ops.edge.aten.convolution.default)
         self.assertEqual([conv.name for conv in convs], ["aten_convolution_default_1"])
-        dequants = cpu_nodes("quantized_decomposed.dequantize_per_channel.default")
+        dequants = cpu_nodes(
+            exir_ops.edge.quantized_decomposed.dequantize_per_channel.default
+        )
         self.assertTrue(dequants)
         for dequant in dequants:
             self.assertEqual(list(dequant.users), convs)
         edge.to_executorch()
+
+    def test_skipped_conv_keeps_its_weight_dequantize_on_cpu(self):
+        self._assert_cpu_conv_keeps_its_weight_dequantize(
+            QuantDtype.use_16a8w,
+            use_fp16=False,
+            skip_node_id_set={"aten_convolution_default_1"},
+        )
+
+    def test_rejected_conv_keeps_its_weight_dequantize_on_cpu(self):
+        # the HTP rejects fp16-activation/int8-weight depthwise conv
+        self._assert_cpu_conv_keeps_its_weight_dequantize(
+            QuantDtype.use_fp16a8w, use_fp16=True
+        )
 
     def test_block_size_is_per_node(self):
         """Every node in block_size_map must keep its own block size. The annotators
@@ -614,6 +696,11 @@ class TestPasses(unittest.TestCase):
             is_linear_per_channel=True,
         )
         quantizer.set_block_size_map(block_size_map)
+        configs = quantizer.default_quant_config.per_block_quant_config_list
+        before = [
+            (c.block_size, dict(c.weight.observer_or_fake_quant_ctr.p.keywords))
+            for c in configs
+        ]
         prepared = prepare_pt2e(gm, quantizer)
         for _ in range(2):
             prepared(*sample_input)
@@ -624,7 +711,61 @@ class TestPasses(unittest.TestCase):
             if isinstance(module, PerBlockParamObserver)
         )
         self.assertEqual(observed, sorted(block_size_map.values()))
+        # the shared configs are left as they were
+        after = [
+            (c.block_size, dict(c.weight.observer_or_fake_quant_ctr.p.keywords))
+            for c in configs
+        ]
+        self.assertEqual(after, before)
+        self.assertTrue(all(QCOM_BLOCK_SIZE not in kw for _, kw in after))
         convert_pt2e(prepared)(*sample_input)
+
+    def test_recipe_keeps_each_per_block_strategy_block_size(self):
+        from executorch.backends.qualcomm.quantizer.observers.per_block_param_observer import (
+            PerBlockParamObserver,
+        )
+        from executorch.backends.qualcomm.quantizer.quant_recipe import (
+            QuantGranularity,
+            QuantRecipe,
+        )
+        from torchao.quantization.pt2e import MinMaxObserver
+
+        class TwoLinear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(512, 32)
+                self.b = torch.nn.Linear(32, 16)
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        recipe = QuantRecipe(
+            QuantDtype.use_16a4w,
+            False,
+            act_observer=MinMaxObserver,
+            granularity=QuantGranularity.PER_TENSOR,
+        )
+        for regex, block_size in ((r"^a$", (1, 32)), (r"^b$", (1, 16))):
+            recipe.add_regex(
+                {regex},
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": block_size},
+            )
+        quantizer = QnnQuantizer()
+        quantizer.set_recipe(recipe)
+        sample_input = (torch.randn(3, 512),)
+        gm = torch.export.export(TwoLinear().eval(), sample_input).module()
+        prepared = prepare_pt2e(gm, quantizer)
+        prepared(*sample_input)
+        observed = sorted(
+            tuple(m.block_size)
+            for m in prepared.modules()
+            if isinstance(m, PerBlockParamObserver)
+        )
+        self.assertEqual(observed, [(1, 16), (1, 32)])
 
     def test_fp16a8w_conv_on_cpu_stays_fp16(self):
         """fp16a8w runs conv in fp16, but the HTP only takes it for 1x1 kernels, so a
@@ -670,14 +811,21 @@ class TestPasses(unittest.TestCase):
         convs = [
             node
             for node in program.graph.nodes
-            if node.op == "call_function"
-            and getattr(node.target, "__name__", "") == "aten.convolution.default"
+            if node.target == exir_ops.edge.aten.convolution.default
         ]
         self.assertEqual([conv.name for conv in convs], ["aten_convolution_default_1"])
         weight, bias = convs[0].args[1], convs[0].args[2]
         self.assertEqual(weight.kwargs.get("out_dtype"), torch.float16)
-        bias_name = program.graph_signature.inputs_to_parameters[bias.name]
-        self.assertEqual(program.state_dict[bias_name].dtype, torch.float16)
+        self.assertEqual(weight.meta["val"].dtype, torch.float16)
+        self.assertEqual(bias.meta["val"].dtype, torch.float16)
+        bias_name = program.graph_signature.inputs_to_buffers[bias.name]
+        # an fp16 copy of the caller's bias
+        torch.testing.assert_close(
+            program.state_dict[bias_name],
+            quantized.state_dict()["k3.bias"].detach().to(torch.float16),
+            rtol=0,
+            atol=0,
+        )
         # the cast must not reach back into the caller's module
         self.assertEqual(
             {t.dtype for t in quantized.state_dict().values() if t.is_floating_point()},
@@ -709,6 +857,137 @@ class TestPasses(unittest.TestCase):
                 self.skipTest(f"QNN SDK not available: {e}")
             raise
         edge.to_executorch()
+
+    def test_i64_to_i32_constant_cast_order(self):
+        """The int32 cast of an int64 get_attr constant must still follow it once the
+        constant is lifted to a placeholder."""
+
+        class RemainderByScalar(torch.nn.Module):
+            # DecomposeRemainder turns the scalar into an int64 get_attr at the graph head
+            def forward(self, x, idx):
+                return x + (idx % 80).float()
+
+        sample_input = (torch.randn(1, 3), torch.tensor([[3, 170, 85]]))
+        compiler_specs = generate_qnn_executorch_compiler_spec(
+            soc_model=QcomChipset.SM8650,
+            backend_options=generate_htp_compiler_spec(use_fp16=True),
+        )
+        ep = torch.export.export(RemainderByScalar(), sample_input, strict=True)
+        pass_manager = get_qnn_pass_manager_cls()()
+        edge = to_edge_transform_and_lower(
+            {"forward": pass_manager.transform_for_export_pipeline(ep)},
+            transform_passes={
+                "forward": pass_manager.get_to_edge_transform_passes(
+                    ep, compiler_specs=compiler_specs
+                )
+            },
+            partitioner=None,
+            compile_config=qnn_edge_config(),
+        )
+        edge.exported_program().graph.lint()
+        try:
+            edge = to_edge_transform_and_lower_to_qnn(
+                RemainderByScalar(), sample_input, compiler_specs
+            )
+        except RuntimeError as e:
+            if "QNN" in str(e) or "qnn" in str(e):
+                self.skipTest(f"QNN SDK not available: {e}")
+            raise
+        edge.to_executorch()
+
+    def test_batch_norm_uses_its_eps(self):
+        # A channel with ~0 running variance is bounded only by eps; a fixed
+        # 1e-9 inflated its scale by ~100x.
+        bn = torch.nn.BatchNorm2d(2, eps=1e-5).eval()
+        with torch.no_grad():
+            bn.running_var.copy_(torch.tensor([1e-8, 1.0]))
+            bn.weight.copy_(torch.tensor([2.0, 3.0]))
+        edge_program = to_edge(
+            torch.export.export(bn, (torch.randn(1, 2, 4, 4),), strict=True)
+        ).exported_program()
+        node = next(
+            n
+            for n in edge_program.graph_module.graph.nodes
+            if n.op == "call_function" and "batch_norm" in str(n.target)
+        )
+        visitor = get_node_visitors(edge_program)[node.target.__name__]
+        tensors = {}
+
+        def define_tensor(source, target, tensor, *args, **kwargs):
+            tensors[source.name] = tensor
+            return MagicMock()
+
+        with patch.object(visitor, "define_tensor", side_effect=define_tensor), patch(
+            "executorch.backends.qualcomm.builders.op_batch_norm.PyQnnManager"
+        ):
+            visitor.define_node(node, {})
+        torch.testing.assert_close(
+            tensors[node.args[1].name],
+            bn.weight.detach() / torch.sqrt(bn.running_var + bn.eps),
+        )
+
+    def test_quantizer_observes_buffer_after_in_place_write(self):
+        # The quantizer also annotates select, so observers used to split the
+        # view chain and copy_ wrote into a dequantized copy of the buffer.
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, 3, 3)
+
+            def forward(self, x):
+                buf = x.new_zeros(1, 3, 8, 8)
+                buf.select(0, 0).copy_(x)
+                return self.conv(buf)
+
+        torch.manual_seed(0)
+        eager = M().eval()
+        x = torch.randn(3, 8, 8)
+        m = torch.export.export(eager, (x,), strict=True).module()
+        quantizer = QnnQuantizer()
+        # MinMax so that a few calibration runs cover the range the buffer is
+        # filled with; the default moving average starts from its zeros.
+        quantizer.set_default_quant_config(
+            quant_dtype=QuantDtype.use_8a8w, act_observer=MinMaxObserver
+        )
+        m = prepare_pt2e(m, quantizer)
+        for _ in range(4):
+            m(torch.randn(3, 8, 8))
+        m = convert_pt2e(m)
+        self.assertGreater(compute_error(eager(x), m(x)).item(), 20)
+
+    def test_lift_int_floor_divide_scalar(self):
+        """A Python scalar divisor, as in `indices // num_classes`, is lifted to an
+        int32 constant so the integer floor_divide stays exact."""
+
+        class IntFloorDivScalar(torch.nn.Module):
+            def __init__(self, divisor):
+                super().__init__()
+                self.divisor = divisor
+
+            def forward(self, x):
+                return x // self.divisor
+
+        int_inputs = (torch.randint(-10, 10, (3, 4), dtype=torch.int32),)
+        for divisor in (3, -4):
+            with self.subTest(msg=f"int_floor_divide_scalar_{divisor}"):
+                module = IntFloorDivScalar(divisor)
+                gm = torch.export.export(module, int_inputs).module()
+                gm = LiftConstantScalarOperands()(gm).graph_module
+                floor_divide = next(
+                    n
+                    for n in gm.graph.nodes
+                    if n.op == "call_function"
+                    and n.target is torch.ops.aten.floor_divide.default
+                )
+                lifted = floor_divide.args[1]
+                self.assertTrue(
+                    isinstance(lifted, torch.fx.Node) and lifted.op == "get_attr",
+                    f"divisor should be a lifted get_attr, got {lifted}",
+                )
+                constant = getattr(gm, lifted.target)
+                self.assertEqual(constant.dtype, torch.int32)
+                self.assertEqual(constant.item(), divisor)
+                torch.testing.assert_close(gm(*int_inputs), module(*int_inputs))
 
     def test_fuse_batch_norm_with_conv(self):
         """In HTP fp16 a standalone BatchNorm multiplies the convolution's rounding
@@ -898,6 +1177,84 @@ class TestPasses(unittest.TestCase):
             )
         )
         edge.to_executorch()
+
+
+class TestDeadChannelWeightScale(unittest.TestCase):
+    """Near-dead weight channels get a live per-channel scale and keep their bias."""
+
+    BIAS = 0.5
+    CONFIGS = (
+        (QuantDtype.use_8a8w, False),
+        (QuantDtype.use_8a8w, True),
+        (QuantDtype.use_16a8w, False),
+        # 1.4.1's QnnQuantizer has no 16a8w QAT config
+        (QuantDtype.use_16a16w, False),
+        (QuantDtype.use_16a4w, False),
+        (QuantDtype.use_16a4w, True),
+        (QuantDtype.use_fp16a8w, False),
+        (QuantDtype.use_fp16a8w, True),
+    )
+
+    def _quantize(self, quant_dtype, is_qat, weight_gains):
+        from executorch.backends.qualcomm.export_utils import make_quantizer
+        from executorch.backends.qualcomm.quantizer.observers.per_channel_param_observer import (
+            MovingAveragePerChannelLiveScaleObserver,
+            PerChannelParamObserver,
+        )
+        from torchao.quantization.pt2e.quantize_pt2e import (
+            convert_pt2e,
+            prepare_pt2e,
+            prepare_qat_pt2e,
+        )
+
+        torch.manual_seed(0)
+        conv = torch.nn.Conv2d(8, 4, 3)
+        with torch.no_grad():
+            conv.weight *= torch.tensor(weight_gains).view(-1, 1, 1, 1)
+            conv.bias[0] = self.BIAS
+        x = torch.randn(1, 8, 8, 8)
+        prepare = prepare_qat_pt2e if is_qat else prepare_pt2e
+        prepared = prepare(
+            torch.export.export(conv, (x,)).module(),
+            make_quantizer(quant_dtype=quant_dtype, is_qat=is_qat),
+        )
+        prepared(x)
+        observer_types = (
+            PerChannelParamObserver,
+            MovingAveragePerChannelLiveScaleObserver,
+        )
+        (observer,) = [m for m in prepared.modules() if isinstance(m, observer_types)]
+        scale, _ = observer.calculate_qparams()
+        raw_scale, _ = super(type(observer), observer).calculate_qparams()
+        with torch.no_grad():
+            out = convert_pt2e(prepared)(x)
+        return scale, raw_scale, observer.eps, out
+
+    def test_near_dead_channels_get_a_live_scale(self):
+        # channel 0 is dead; channel 1's int8 scale sits between the 16-bit
+        # and 8-bit eps
+        gains = [1e-8, 1e-4, 1.0, 1.0]
+        for quant_dtype, is_qat in self.CONFIGS:
+            with self.subTest(quant_dtype=quant_dtype, is_qat=is_qat):
+                scale, raw_scale, eps, out = self._quantize(quant_dtype, is_qat, gains)
+                self.assertAlmostEqual(float(out[0, 0].mean()), self.BIAS, delta=0.01)
+                floored = raw_scale <= eps
+                self.assertTrue(floored[0])
+                if quant_dtype in (QuantDtype.use_8a8w, QuantDtype.use_16a8w):
+                    self.assertTrue(floored[1])
+                live = raw_scale[~floored]
+                self.assertTrue(
+                    torch.equal(
+                        scale[floored], live.median().expand(int(floored.sum()))
+                    )
+                )
+                self.assertTrue(torch.equal(scale[~floored], live))
+
+    def test_all_floored_channels_keep_the_floor(self):
+        for quant_dtype, is_qat in self.CONFIGS:
+            with self.subTest(quant_dtype=quant_dtype, is_qat=is_qat):
+                scale, _, eps, _ = self._quantize(quant_dtype, is_qat, [1e-8] * 4)
+                self.assertTrue(torch.equal(scale, eps.expand_as(scale)))
 
 
 class TestIoBindingCheck(unittest.TestCase):

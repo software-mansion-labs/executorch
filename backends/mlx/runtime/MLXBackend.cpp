@@ -232,6 +232,25 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
         handle->clear_cache_interval_ = spec.get();
       }
 
+      // Per-model lazy-graph evaluation threshold (optional runtime spec,
+      // keyed per delegate). Configured here, before the init chain runs
+      // below, so the init chain is covered by the same setting. 0 disables
+      // the mechanism. Unset defaults to 512 MB on this fork, the budget the
+      // fork shipped before (Whisper-small: 12 barriers in encode, 0 in decode).
+      handle->interpreter.set_eval_threshold_bytes(size_t{512} << 20);
+      if (auto spec = context.get_runtime_spec<int>(kEvalThresholdBytesKey);
+          spec.ok()) {
+        const int bytes = spec.get();
+        if (bytes < 0) {
+          throw std::runtime_error(
+              std::string(kEvalThresholdBytesKey) +
+              " must be >= 0 (0 disables the mechanism), got " +
+              std::to_string(bytes));
+        }
+        handle->interpreter.set_eval_threshold_bytes(
+            static_cast<size_t>(bytes));
+      }
+
       // Bound the MLX Metal buffer cache. By default MLX sizes the cache to the
       // memory limit (~1.5x the device working set — gigabytes), so freed
       // buffers from each distinct execute() shape accumulate in-cache instead

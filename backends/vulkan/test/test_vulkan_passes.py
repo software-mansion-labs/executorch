@@ -1,5 +1,5 @@
 import unittest
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -8,12 +8,31 @@ from executorch.backends.vulkan._passes.fuse_patterns import FusePatternsPass
 from executorch.backends.vulkan._passes.remove_redundant_ops import (
     RemoveRedundantOpsTransform,
 )
+from executorch.backends.vulkan._passes.replace_instance_norm import (
+    ReplaceInstanceNormPass,
+)
+from executorch.backends.vulkan.op_registry import (
+    can_rewrite_batch_norm_as_group_norm,
+    unwrap_identity_repeat,
+)
+from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
+from executorch.backends.vulkan.serialization.vulkan_graph_serialize import (
+    extract_vk_flatbuffer,
+    flatbuffer_to_vk_graph,
+)
+from executorch.backends.vulkan.utils import get_constant_nodes
 
-from executorch.exir import EdgeCompileConfig, EdgeProgramManager, to_edge
+from executorch.exir import (
+    EdgeCompileConfig,
+    EdgeProgramManager,
+    to_edge,
+    to_edge_transform_and_lower,
+)
 
 from executorch.exir.backend.canonical_partitioners.config_partitioner import (
     format_target_name,
 )
+from executorch.exir.dialects._ops import ops as exir_ops
 
 from torchao.quantization.pt2e.quantize_pt2e import convert_pt2e, prepare_pt2e
 from torchao.quantization.pt2e.quantizer import Quantizer
@@ -88,6 +107,54 @@ def op_node_count(graph_module: torch.fx.GraphModule, canonical_op_name: str) ->
         if canonical_name is not None and canonical_name == canonical_op_name:
             count += 1
     return count
+
+
+def export_to_edge(
+    model: torch.nn.Module,
+    sample_inputs: Tuple[torch.Tensor, ...],
+    dynamic_shapes=None,
+) -> torch.export.ExportedProgram:
+    program = torch.export.export(
+        model, sample_inputs, dynamic_shapes=dynamic_shapes, strict=True
+    )
+    return to_edge(
+        program,
+        compile_config=EdgeCompileConfig(
+            _skip_dim_order=False, _check_ir_validity=False
+        ),
+    ).exported_program()
+
+
+def batch_norm_no_stats_nodes(
+    graph_module: torch.fx.GraphModule,
+) -> List[torch.fx.Node]:
+    return [
+        node
+        for node in graph_module.graph.nodes
+        if node.target == exir_ops.edge.aten._native_batch_norm_legit.no_stats
+    ]
+
+
+def lower_to_vulkan(
+    model: torch.nn.Module,
+    sample_inputs: Tuple[torch.Tensor, ...],
+    **partitioner_kwargs,
+) -> EdgeProgramManager:
+    return to_edge_transform_and_lower(
+        torch.export.export(model, sample_inputs, strict=True),
+        compile_config=EdgeCompileConfig(_skip_dim_order=False),
+        partitioner=[VulkanPartitioner(**partitioner_kwargs)],
+    )
+
+
+def vulkan_delegate_graphs(edge_program: EdgeProgramManager) -> List:
+    """The serialized VkGraph of every Vulkan delegate in the program."""
+    graph_module = edge_program.exported_program().graph_module
+    return [
+        flatbuffer_to_vk_graph(extract_vk_flatbuffer(module.processed_bytes))
+        for _, module in graph_module.named_children()
+        if hasattr(module, "processed_bytes")
+    ]
 
 
 def conv_input_ranks(graph_module: torch.fx.GraphModule) -> list:
@@ -373,6 +440,48 @@ class TestVulkanPasses(unittest.TestCase):
         self.assertEqual(tuple(fused_out.shape), (6, 32))
         self.assertTrue(torch.allclose(fused_out, eager_ref, atol=1e-3, rtol=1e-3))
 
+    def test_fuse_aten_rms_norm(self):
+        """F.rms_norm and nn.RMSNorm decompose to pow -> mean(dim=[ndim - 1]) ->
+        add.Scalar -> rsqrt -> mul -> mul, which must fuse into rms_norm like the
+        hand-written x * rsqrt(mean(x * x, -1) + eps) * w form.
+        """
+        import executorch.backends.vulkan.custom_ops_lib  # noqa: registers et_vk ops
+
+        class FunctionalRmsNorm(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.rand(64) + 0.5)
+
+            def forward(self, x):
+                return torch.nn.functional.rms_norm(x, (64,), self.weight, 1e-6)
+
+        for model in (FunctionalRmsNorm(), torch.nn.RMSNorm(64, eps=1e-6)):
+            model = model.eval()
+            for shape in ((6, 64), (2, 6, 64)):
+                sample_inputs = (torch.randn(shape),)
+                eager_ref = model(*sample_inputs)
+
+                program = torch.export.export(model, sample_inputs, strict=True)
+                edge_program = to_edge(
+                    program,
+                    compile_config=EdgeCompileConfig(_check_ir_validity=False),
+                )
+                ep = edge_program._edge_programs["forward"]
+                fuse_pass = FusePatternsPass()
+                fuse_pass._exported_program = ep
+                result = fuse_pass.call(ep.graph_module)
+
+                self.assertTrue(result.modified)
+                gm = ep.graph_module
+                self.assertEqual(op_node_count(gm, "rms_norm.default"), 1)
+                self.assertEqual(op_node_count(gm, "mean.dim"), 0)
+                self.assertEqual(op_node_count(gm, "rsqrt.default"), 0)
+
+                fused_out = ep.module()(*sample_inputs)
+                self.assertTrue(
+                    torch.allclose(fused_out, eager_ref, atol=1e-5, rtol=1e-5)
+                )
+
     def test_torchao_quantized_embedding_rejects_bad_embed_dim(self):
         """A torchao 4-bit quantized embedding whose embed_dim is not a multiple
         of 32 must NOT fuse: the runtime shader asserts embed_dim % 32 == 0
@@ -523,6 +632,63 @@ class TestVulkanPasses(unittest.TestCase):
             packed_weight, scales_tensor, group_size, sample_inputs[1], True
         )
         self.assertTrue(torch.allclose(emb_x + emb_y, eager_ref, atol=1e-3, rtol=1e-3))
+
+    def test_fuse_torchao_int8_weight_only_linear(self):
+        """A torchao int8 per-channel weight-only linear (dequantize_affine with
+        [N, 1] scales -> linear) should fuse into et_vk.linear_q8csw. Unfused, the
+        dequantize_affine would be serialized into the delegate, which has no
+        kernel for it.
+        """
+        import executorch.backends.vulkan.custom_ops_lib  # noqa: registers et_vk ops
+        from executorch.backends.transforms.utils import get_param_tensor
+        from torchao.quantization.granularity import PerAxis
+        from torchao.quantization.quant_api import IntxWeightOnlyConfig, quantize_
+        from torchao.utils import unwrap_tensor_subclass
+
+        in_features, out_features = 64, 130  # not a multiple of 4
+
+        model = torch.nn.Linear(in_features, out_features, bias=True).eval()
+        quantize_(
+            model,
+            IntxWeightOnlyConfig(weight_dtype=torch.int8, granularity=PerAxis(0)),
+        )
+        unwrap_tensor_subclass(model)
+
+        sample_inputs = (torch.randn(2, 8, in_features),)
+        eager_ref = model(*sample_inputs)
+
+        program = torch.export.export(model, sample_inputs, strict=True)
+        edge_program = to_edge(
+            program,
+            compile_config=EdgeCompileConfig(_check_ir_validity=False),
+        )
+
+        ep = edge_program._edge_programs["forward"]
+        fuse_pass = FusePatternsPass()
+        fuse_pass._exported_program = ep
+        result = fuse_pass.call(ep.graph_module)
+
+        self.assertTrue(result.modified)
+
+        gm = ep.graph_module
+
+        self.assertEqual(op_node_count(gm, "linear_q8csw.default"), 1)
+        self.assertEqual(op_node_count(gm, "dequantize_affine.default"), 0)
+
+        fused_node = next(
+            n
+            for n in gm.graph.nodes
+            if get_target_canonical_name(n) == "linear_q8csw.default"
+        )
+        weight, scales, bias = (get_param_tensor(ep, n) for n in fused_node.args[1:4])
+        # Scales and bias are flattened to [N] and padded to a multiple of 4.
+        self.assertEqual(tuple(scales.shape), (132,))
+        self.assertEqual(tuple(bias.shape), (132,))
+
+        fused_out = torch.ops.et_vk.linear_q8csw.default(
+            sample_inputs[0], weight, scales, bias
+        )
+        self.assertTrue(torch.allclose(fused_out, eager_ref, atol=1e-5, rtol=1e-5))
 
     def test_register_param_mutation(self):
         """utils.register_param_mutation is a storage-keyed idempotency guard:
@@ -1027,3 +1193,469 @@ class TestVulkanPasses(unittest.TestCase):
         before = op_node_count(ep.graph_module, "view_copy.default")
         RemoveRedundantOpsTransform().call(ep.graph_module)
         self.assertEqual(op_node_count(ep.graph_module, "view_copy.default"), before)
+
+    def test_unwrap_identity_repeat(self):
+        """Only a repeat whose every factor is 1 is looked through."""
+
+        class RepeatModule(torch.nn.Module):
+            def __init__(self, repeats):
+                super().__init__()
+                self.repeats = repeats
+
+            def forward(self, x):
+                return x.repeat(*self.repeats) + 1.0
+
+        # [1] keeps the shape, [2] doubles it, and [1, 1] raises [8] to [1, 8].
+        for repeats, unwraps in (([1], True), ([2], False), ([1, 1], False)):
+            with self.subTest(repeats=repeats):
+                ep = export_to_edge(RepeatModule(repeats), (torch.rand(8),))
+                (repeat,) = [
+                    node
+                    for node in ep.graph_module.graph.nodes
+                    if node.target == exir_ops.edge.aten.repeat.default
+                ]
+                expected = repeat.args[0] if unwraps else repeat
+                self.assertIs(unwrap_identity_repeat(repeat), expected)
+
+        # RemoveRedundantOpsTransform must keep identity repeats: if the repeat is
+        # delegated on its own, dropping it would make a constant the delegate's
+        # output, which nothing on the GPU writes.
+        ep = export_to_edge(RepeatModule([1]), (torch.rand(8),))
+        RemoveRedundantOpsTransform().call(ep.graph_module)
+        self.assertEqual(op_node_count(ep.graph_module, "repeat.default"), 1)
+
+    def test_can_rewrite_batch_norm_as_group_norm(self):  # noqa: C901
+        class InstanceNormModule(torch.nn.Module):
+            def __init__(self, affine=True):
+                super().__init__()
+                self.norm = torch.nn.InstanceNorm2d(8, affine=affine)
+
+            def forward(self, x):
+                return self.norm(x)
+
+        class InputAffineModule(torch.nn.Module):
+            def forward(self, x, weight, bias):
+                return torch.nn.functional.instance_norm(x, weight=weight, bias=bias)
+
+        class ComputedWeightModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(8))
+                self.bias = torch.nn.Parameter(torch.randn(8))
+
+            def forward(self, x):
+                return torch.nn.functional.instance_norm(
+                    x, weight=self.weight * 2, bias=self.bias
+                )
+
+        class BatchNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(8))
+                self.bias = torch.nn.Parameter(torch.randn(8))
+
+            def forward(self, x):
+                return torch.nn.functional.batch_norm(
+                    x, None, None, self.weight, self.bias, training=True
+                )
+
+        class SavedStatsModule(BatchNormModule):
+            def forward(self, x):
+                out, mean, _ = torch.ops.aten._native_batch_norm_legit.no_stats(
+                    x, self.weight, self.bias, True, 0.1, 1e-5
+                )
+                return out, mean
+
+        class BufferAffineModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("weight", torch.randn(8))
+                self.register_buffer("bias", torch.randn(8))
+
+            def forward(self, x):
+                return torch.nn.functional.instance_norm(
+                    x, weight=self.weight, bias=self.bias
+                )
+
+        class MutatedBufferAffineModule(BufferAffineModule):
+            # The norm reads the buffer before the update, so it consumes the
+            # buffer placeholder itself, whose data changes between calls.
+            def forward(self, x):
+                out = super().forward(x)
+                self.weight.add_(1.0)
+                return out
+
+        x1 = torch.randn(1, 8, 5, 6)
+        x2 = torch.randn(2, 8, 5, 6)
+        affine = (torch.randn(8), torch.randn(8))
+        cases = [
+            ("instance_norm", InstanceNormModule(), (x1,), True),
+            # F.instance_norm folds the batch into the channels, so the batch
+            # norm input has a batch of 1 either way. The batch shows up as a
+            # repeat of the affine args, which group norm cannot prepack.
+            ("instance_norm_batch_2", InstanceNormModule(), (x2,), False),
+            ("no_affine", InstanceNormModule(affine=False), (x1,), False),
+            ("input_affine", InputAffineModule(), (x1, *affine), False),
+            ("computed_weight", ComputedWeightModule(), (x1,), False),
+            ("buffer_affine", BufferAffineModule(), (x1,), True),
+            ("mutated_buffer_affine", MutatedBufferAffineModule(), (x1,), False),
+            ("batch_norm_batch_1", BatchNormModule(), (x1,), True),
+            ("batch_norm_batch_2", BatchNormModule(), (x2,), False),
+            ("saved_stats", SavedStatsModule(), (x1,), False),
+        ]
+        # The pass hands group norm static channel and spatial sizes.
+        dynamic_height = ({2: torch.export.Dim("height", min=2, max=64)},)
+        cases.append(
+            ("dynamic_height", InstanceNormModule(), (x1,), False, dynamic_height)
+        )
+        for name, model, inputs, expected, *dynamic_shapes in cases:
+            with self.subTest(name):
+                ep = export_to_edge(model, inputs, *dynamic_shapes)
+                nodes = batch_norm_no_stats_nodes(ep.graph_module)
+                self.assertEqual(len(nodes), 1)
+                self.assertEqual(
+                    can_rewrite_batch_norm_as_group_norm(
+                        nodes[0], get_constant_nodes(ep)
+                    ),
+                    expected,
+                )
+
+    def test_replace_instance_norm(self):
+        class InstanceNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm = torch.nn.InstanceNorm2d(13, affine=True)
+                torch.nn.init.normal_(self.norm.weight)
+                torch.nn.init.normal_(self.norm.bias)
+
+            def forward(self, x):
+                return self.norm(x)
+
+        model = InstanceNormModule().eval()
+        inputs = (torch.randn(1, 13, 7, 9),)
+        ep = export_to_edge(model, inputs)
+
+        replace_pass = ReplaceInstanceNormPass()
+        replace_pass._exported_program = ep
+        gm = replace_pass(ep.graph_module).graph_module
+
+        self.assertEqual(batch_norm_no_stats_nodes(gm), [])
+        # The identity repeats of the affine args are looked through and dropped.
+        self.assertEqual(op_node_count(gm, "repeat.default"), 0)
+        group_norms = [
+            node
+            for node in gm.graph.nodes
+            if node.target == exir_ops.edge.aten.native_group_norm.default
+        ]
+        self.assertEqual(len(group_norms), 1)
+        group_norm = group_norms[0]
+        # One group per channel.
+        self.assertEqual(group_norm.args[6], 13)
+        # The affine args are the parameters themselves, not repeats of them.
+        for affine_arg in group_norm.args[1:3]:
+            self.assertEqual(affine_arg.op, "placeholder")
+
+        self.assertTrue(torch.allclose(ep.module()(*inputs), model(*inputs), atol=1e-5))
+
+    def test_instance_norm_delegates_have_no_constant_outputs(self):
+        """
+        Whether or not the instance norm is delegated, no delegate may output a
+        constant: nothing on the GPU writes it, so the CPU reads garbage.
+        """
+
+        class Conv1dInstanceNormModule(torch.nn.Module):
+            # A rank-3 instance norm is not rewritten and stays on the CPU, while
+            # the repeats of its affine args are delegated.
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv1d(8, 8, 3, padding=1)
+                self.norm = torch.nn.InstanceNorm1d(8, affine=True)
+
+            def forward(self, x):
+                return torch.relu(self.norm(self.conv(x)))
+
+        class ComputedWeightModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(8, 8, 3, padding=1)
+                self.norm = torch.nn.InstanceNorm2d(8, affine=True)
+
+            def forward(self, x):
+                return torch.nn.functional.instance_norm(
+                    self.conv(x), weight=self.norm.weight * 2, bias=self.norm.bias
+                )
+
+        class Conv2dInstanceNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(8, 8, 3, padding=1)
+                self.norm = torch.nn.InstanceNorm2d(8, affine=True)
+
+            def forward(self, x):
+                return torch.relu(self.norm(self.conv(x)))
+
+        cases = [
+            ("instance_norm_1d", Conv1dInstanceNormModule(), (torch.randn(1, 8, 20),)),
+            ("computed_weight", ComputedWeightModule(), (torch.randn(1, 8, 6, 6),)),
+            ("rewritten", Conv2dInstanceNormModule(), (torch.randn(1, 8, 6, 6),)),
+        ]
+        for name, model, inputs in cases:
+            with self.subTest(name):
+                graphs = vulkan_delegate_graphs(lower_to_vulkan(model.eval(), inputs))
+                self.assertGreater(len(graphs), 0)
+                for graph in graphs:
+                    constant_outputs = [
+                        i
+                        for i in graph.output_ids
+                        if graph.values[i].value.constant_id >= 0
+                    ]
+                    self.assertEqual(constant_outputs, [])
+
+    def test_instance_norm_with_repeat_not_delegated(self):
+        """
+        The affine args of a delegated instance norm must reach the delegate as
+        constants. If the repeats feeding them are not in the norm's partition,
+        the norm must stay on the CPU.
+        """
+
+        class Conv2dInstanceNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(8, 8, 3, padding=1)
+                self.norm = torch.nn.InstanceNorm2d(8, affine=True)
+
+            def forward(self, x):
+                return torch.relu(self.norm(self.conv(x)))
+
+        class SharedRepeatModule(torch.nn.Module):
+            # The repeat is delegated, but with sin on the CPU the norm cannot
+            # share its partition: a path leaves the partition through sin and
+            # re-enters it at the norm.
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(8))
+                self.bias = torch.nn.Parameter(torch.randn(8))
+
+            def forward(self, x):
+                w = self.weight.repeat(1)
+                y = torch.sin(x + w.reshape(1, 8, 1, 1))
+                return torch.nn.functional.batch_norm(
+                    y, None, None, w, self.bias, training=True
+                )
+
+        repeat = exir_ops.edge.aten.repeat.default
+        sin = exir_ops.edge.aten.sin.default
+        cases = [
+            # (name, model, operator_blocklist, norm stays on the CPU)
+            ("blocklisted_repeat", Conv2dInstanceNormModule(), [repeat], True),
+            ("shared_repeat", SharedRepeatModule(), [sin], True),
+            ("shared_repeat_delegated", SharedRepeatModule(), [], False),
+        ]
+        for name, model, blocklist, norm_on_cpu in cases:
+            with self.subTest(name):
+                edge_program = lower_to_vulkan(
+                    model.eval(),
+                    (torch.randn(1, 8, 6, 6),),
+                    operator_blocklist=blocklist,
+                )
+                self.assertEqual(
+                    len(
+                        batch_norm_no_stats_nodes(
+                            edge_program.exported_program().graph_module
+                        )
+                    ),
+                    1 if norm_on_cpu else 0,
+                )
+                graphs = vulkan_delegate_graphs(edge_program)
+                self.assertGreater(len(graphs), 0)
+                op_names = [op.name for graph in graphs for op in graph.chain]
+                self.assertFalse(any("batch_norm" in op for op in op_names))
+                self.assertEqual(
+                    any("group_norm" in op for op in op_names), not norm_on_cpu
+                )
+
+    def test_replace_instance_norm_rejects_leftover_batch_norm(self):
+        """A batch norm without stats that cannot be rewritten fails the export."""
+
+        class InstanceNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm = torch.nn.InstanceNorm2d(8)
+
+            def forward(self, x):
+                return self.norm(x)
+
+        ep = export_to_edge(InstanceNormModule(), (torch.randn(1, 8, 5, 6),))
+        replace_pass = ReplaceInstanceNormPass()
+        replace_pass._exported_program = ep
+        with self.assertRaises(RuntimeError):
+            replace_pass.call(ep.graph_module)
+
+
+class _NamedOpStub:
+    """Stands in for a llama custom op, which may not be registered here."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self.__name__ = name.replace("::", "_")
+
+    def name(self) -> str:
+        return self._name
+
+    def __call__(self, *args):
+        raise NotImplementedError
+
+
+class TestLLMSDPAPartitionerCheck(unittest.TestCase):
+    """
+    check_llm_sdpa_node keeps llama::custom_sdpa / update_cache configurations
+    that the Vulkan SDPA cannot run on CPU, instead of failing at load time. The
+    causal_sdpa pattern must not match them either, since a matched node is
+    delegated without the per-op checks.
+    """
+
+    S, C, H, D = 4, 16, 2, 8
+
+    def _build(
+        self,
+        mask_shape=None,
+        mask_dtype=torch.float32,
+        q_dtype=torch.float32,
+        is_causal=False,
+        trim_defaults=False,
+    ):
+        from executorch.backends.vulkan.patterns.sdpa import (
+            check_llm_sdpa_node,
+            find_causal_sdpa_patterns,
+        )
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        fake_mode = FakeTensorMode()
+        graph = torch.fx.Graph()
+
+        def placeholder(name, shape, dtype):
+            node = graph.placeholder(name)
+            node.meta["val"] = fake_mode.from_tensor(torch.empty(shape, dtype=dtype))
+            return node
+
+        q = placeholder("q", (1, self.S, self.H, self.D), q_dtype)
+        k = placeholder("k", (1, self.S, self.H, self.D), q_dtype)
+        v = placeholder("v", (1, self.S, self.H, self.D), q_dtype)
+        k_cache = placeholder("k_cache", (1, self.C, self.H, self.D), q_dtype)
+        v_cache = placeholder("v_cache", (1, self.C, self.H, self.D), q_dtype)
+        mask = None
+        if mask_shape is not None:
+            mask = placeholder("mask", mask_shape, mask_dtype)
+
+        update_cache = graph.call_function(
+            _NamedOpStub("llama::update_cache"), (k, k_cache, 0)
+        )
+        graph.call_function(_NamedOpStub("llama::update_cache"), (v, v_cache, 0))
+        args = (q, k_cache, v_cache, 0, mask, 0.0, is_causal)
+        if trim_defaults:
+            # torch.export drops trailing arguments that equal their defaults
+            assert not is_causal
+            args = args[:5]
+        custom_sdpa = graph.call_function(_NamedOpStub("llama::custom_sdpa"), args)
+        supported = check_llm_sdpa_node(custom_sdpa)
+        self.assertEqual(check_llm_sdpa_node(update_cache), supported)
+        match = find_causal_sdpa_patterns(custom_sdpa)
+        self.assertEqual(match is not None, supported)
+        if match is not None:
+            self.assertIs(match.attn_mask_node, mask)
+            self.assertEqual(match.is_causal_node, is_causal)
+        return supported
+
+    def test_causal_without_mask_is_supported(self):
+        self.assertTrue(self._build(is_causal=True))
+
+    def test_non_causal_without_mask_is_rejected(self):
+        self.assertFalse(self._build(is_causal=False))
+
+    def test_mask_is_supported(self):
+        self.assertTrue(self._build(mask_shape=(self.S, self.C)))
+
+    def test_mask_with_trimmed_default_args_is_supported(self):
+        self.assertTrue(self._build(mask_shape=(self.S, self.C), trim_defaults=True))
+
+    def test_mask_with_is_causal_is_rejected(self):
+        self.assertFalse(self._build(mask_shape=(self.S, self.C), is_causal=True))
+
+    def test_mask_dtype_mismatch_is_rejected(self):
+        # The CPU op requires an fp32 mask, also for an fp16 query.
+        self.assertFalse(
+            self._build(mask_shape=(self.S, self.C), q_dtype=torch.float16)
+        )
+
+    def test_mask_shape_mismatch_is_rejected(self):
+        self.assertFalse(self._build(mask_shape=(1, self.S, self.C)))
+        self.assertFalse(self._build(mask_shape=(self.S, self.C - 1)))
+
+    def _build_wrapped_sdpa_with_kv_cache(
+        self, wrapper, q_dtype=torch.float32, cache_slice=None
+    ):
+        from executorch.backends.vulkan.patterns.sdpa import check_llm_sdpa_node
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        fake_mode = FakeTensorMode()
+        graph = torch.fx.Graph()
+
+        def placeholder(name, shape, dtype):
+            node = graph.placeholder(name)
+            node.meta["val"] = fake_mode.from_tensor(torch.empty(shape, dtype=dtype))
+            return node
+
+        q = placeholder("q", (1, self.S, self.H, self.D), q_dtype)
+        k_cache = placeholder("k_cache", (1, self.C, self.H, self.D), q_dtype)
+        v_cache = placeholder("v_cache", (1, self.C, self.H, self.D), q_dtype)
+        mask = placeholder("mask", (self.S, self.C), torch.float32)
+        kwargs = {
+            "query": q,
+            "key": q,
+            "value": q,
+            "start_pos": 0,
+            "seq_len": self.S,
+            "attn_mask": mask,
+            "drpout_p": 0.0,
+            "is_causal": False,
+            "scale": None,
+        }
+        if wrapper == torch.ops.higher_order.auto_functionalized:
+            kwargs.update(key_cache=k_cache, value_cache=v_cache)
+        else:
+            kwargs.update(
+                _all_bases=[k_cache, v_cache],
+                _key_cache_base_index=0,
+                _value_cache_base_index=1,
+            )
+            if cache_slice is not None:
+                start, end = cache_slice
+                kwargs.update(
+                    _key_cache_slice_dim=1,
+                    _key_cache_slice_start=start,
+                    _key_cache_slice_end=end,
+                )
+        node = graph.call_function(
+            wrapper, (_NamedOpStub("llama::sdpa_with_kv_cache"),), kwargs
+        )
+        return check_llm_sdpa_node(node)
+
+    def test_auto_functionalized_sdpa_with_kv_cache(self):
+        # The partitioner passes the wrapper node, whose op args are kwargs.
+        for wrapper in (
+            torch.ops.higher_order.auto_functionalized,
+            torch.ops.higher_order.auto_functionalized_v2,
+        ):
+            self.assertTrue(self._build_wrapped_sdpa_with_kv_cache(wrapper))
+            self.assertFalse(
+                self._build_wrapped_sdpa_with_kv_cache(wrapper, q_dtype=torch.float16)
+            )
+
+    def test_auto_functionalized_v2_cache_view(self):
+        wrapper = torch.ops.higher_order.auto_functionalized_v2
+        self.assertTrue(
+            self._build_wrapped_sdpa_with_kv_cache(wrapper, cache_slice=(0, None))
+        )
+        self.assertFalse(
+            self._build_wrapped_sdpa_with_kv_cache(wrapper, cache_slice=(0, self.C - 1))
+        )

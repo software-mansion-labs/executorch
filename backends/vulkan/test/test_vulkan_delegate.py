@@ -8,11 +8,13 @@
 
 import ctypes
 import functools
+import operator
 import unittest
 from typing import Tuple
 
 import executorch.backends.vulkan.test.utils as test_utils
 import torch
+import torch.nn.functional as F
 from executorch.backends.transforms.convert_dtype_pass import I64toI32
 from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
 from executorch.backends.vulkan.vulkan_preprocess import VulkanBackend
@@ -24,8 +26,10 @@ from executorch.exir import (
     EdgeCompileConfig,
     EdgeProgramManager,
     ExecutorchProgramManager,
+    to_edge,
     to_edge_transform_and_lower,
 )
+from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.extension.pybindings.portable_lib import (  # @manual
     _load_for_executorch_from_buffer,
 )
@@ -193,6 +197,33 @@ class TestVulkanBackend(unittest.TestCase):
             0,
         )
         return
+
+    def check_op_not_partitioned(
+        self, model, sample_inputs, dynamic_shapes, target
+    ) -> None:
+        """Check that the partitioner leaves every `target` node on the CPU.
+
+        Used where the op is rejected because of a symbolic arg: 1.4.1 cannot
+        lower the partition that would then hold only the SymInt arithmetic
+        feeding it, so this checks the partitioner's tags instead of lowering.
+        """
+        program = export(
+            model, sample_inputs, dynamic_shapes=dynamic_shapes, strict=True
+        )
+        edge_program = to_edge(
+            program, compile_config=EdgeCompileConfig(_skip_dim_order=False)
+        )
+        result = VulkanPartitioner({"require_dynamic_shapes": True}).partition(
+            edge_program.exported_program()
+        )
+        nodes = [
+            node
+            for node in result.tagged_exported_program.graph.nodes
+            if node.target == target
+        ]
+        self.assertTrue(nodes)
+        for node in nodes:
+            self.assertNotIn("delegation_tag", node.meta)
 
     def check_vk_delegation(self, et_program: ExecutorchProgramManager):
         self.assertEqual(
@@ -1192,6 +1223,20 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
+    def test_vulkan_backend_binary_op_zero_dim(self):
+        # Both operands, and therefore the output, are 0-dimensional. This is
+        # what a reduction to a scalar followed by arithmetic produces, e.g. the
+        # log-mel normalisation in Whisper's preprocessor.
+        class ZeroDimModule(torch.nn.Module):
+            def forward(self, x):
+                m = x.max()
+                return (m - (m - 1.0)).reshape(1)
+
+        self.lower_module_and_test_output(
+            ZeroDimModule(),
+            (torch.randn(size=(64,), dtype=torch.float32),),
+        )
+
     @disable_test("layer norm compute shader not working with swiftshader")
     def test_vulkan_backend_native_layer_norm(self):
         class NativeLayerNormModule(torch.nn.Module):
@@ -1381,39 +1426,157 @@ class TestVulkanBackend(unittest.TestCase):
 
     def test_vulkan_backend_slice_scatter(self):
         class SliceScatter(torch.nn.Module):
-            def __init__(self, dim, start, step):
+            def __init__(self, dim, start, end, step):
                 super().__init__()
                 self.dim = dim
                 self.start = start
+                self.end = end
                 self.step = step
 
             def forward(self, x, src):
                 return torch.slice_scatter(
-                    x, src, dim=self.dim, start=self.start, step=self.step
+                    x, src, dim=self.dim, start=self.start, end=self.end, step=self.step
                 )
 
-        # dim=1 with step=3 is the interleaving a YOLO pose head emits, and it
-        # is the interesting case for channels-packed storage: one output texel
-        # spans four positions along the scattered dim, so its components come
-        # from src and self alternately.
+        def make_input(shape, dtype):
+            if dtype == torch.bool:
+                return torch.rand(size=shape) > 0.5
+            if dtype == torch.int32:
+                return torch.randint(-100, 100, size=shape, dtype=dtype)
+            return torch.rand(size=shape, dtype=dtype)
+
+        # dim=1 with step=3 is the interleaving a YOLO pose head emits. On a
+        # rank-3 tensor dim=1 is H, so those cases cover strided rows; the
+        # rank-4 dim=1 cases scatter along C, the packed dim, where one output
+        # texel spans four channels whose components come from src and self
+        # alternately.
         cases = [
-            # (self_shape, src_shape, dim, start, step)
-            ((1, 12, 7), (1, 4, 7), 1, 0, 3),
-            ((1, 12, 7), (1, 4, 7), 1, 1, 3),
-            ((1, 12, 7), (1, 4, 7), 1, 2, 3),
-            ((2, 6, 5), (2, 6, 2), 2, 1, 2),
-            ((3, 8, 4), (2, 8, 4), 0, 1, 1),
+            # (self_shape, src_shape, dim, start, end, step)
+            ((1, 12, 7), (1, 4, 7), 1, 0, None, 3),
+            ((1, 12, 7), (1, 4, 7), 1, 1, None, 3),
+            ((1, 12, 7), (1, 4, 7), 1, 2, None, 3),
+            ((2, 6, 5), (2, 6, 2), 2, 1, None, 2),
+            ((3, 8, 4), (2, 8, 4), 0, 1, None, 1),
+            ((1, 10, 5), (1, 3, 5), 1, 1, None, 3),
+            # Channel count that is not a multiple of 4.
+            ((2, 6, 3, 5), (2, 3, 3, 5), 1, 1, None, 2),
+            ((1, 10, 1, 5), (1, 3, 1, 5), 1, 1, None, 3),
+            # Negative dim and end, and an end past the dim size.
+            ((1, 12, 7), (1, 3, 7), -2, 2, -1, 3),
+            ((2, 6, 5), (2, 6, 2), 2, 3, 100, 1),
         ]
-        for self_shape, src_shape, dim, start, step in cases:
-            with self.subTest(shape=self_shape, dim=dim, start=start, step=step):
+        for self_shape, src_shape, dim, start, end, step in cases:
+            with self.subTest(
+                shape=self_shape, dim=dim, start=start, end=end, step=step
+            ):
                 sample_inputs = (
                     torch.rand(size=self_shape, dtype=torch.float32),
                     torch.rand(size=src_shape, dtype=torch.float32),
                 )
                 self.lower_module_and_test_output(
-                    SliceScatter(dim, start, step),
+                    SliceScatter(dim, start, end, step),
                     sample_inputs,
                 )
+
+        # The rank-4 shape puts step=3 along C=10: src and self alternate
+        # across the four lanes of a texel and the last texel is a tail.
+        dtype_shapes = [((1, 10, 5), (1, 3, 5)), ((1, 10, 1, 5), (1, 3, 1, 5))]
+        for self_shape, src_shape in dtype_shapes:
+            for dtype in (torch.float16, torch.int32, torch.bool):
+                with self.subTest(shape=self_shape, dtype=dtype):
+                    self.lower_module_and_test_output(
+                        SliceScatter(1, 1, None, 3),
+                        (make_input(self_shape, dtype), make_input(src_shape, dtype)),
+                    )
+
+    def test_vulkan_backend_slice_scatter_mixed_dtype(self):
+        # aten casts src to self's dtype, but the Vulkan shader needs one dtype
+        # for all three tensors, so a mixed-dtype slice_scatter must stay on
+        # the CPU and still produce aten's result.
+        class SliceScatter(torch.nn.Module):
+            def forward(self, x, src):
+                return torch.slice_scatter(x, src, dim=1, start=1, step=3)
+
+        sample_inputs = (
+            torch.rand(size=(1, 10, 5), dtype=torch.float32),
+            torch.randint(-100, 100, size=(1, 3, 5), dtype=torch.int32),
+        )
+        model = SliceScatter().eval()
+        et_program = lower_module(model, sample_inputs).to_executorch()
+        self.check_no_delegation(et_program)
+        self.run_delegated_model_and_check_output(et_program, model, sample_inputs)
+
+    def test_vulkan_backend_slice_scatter_huge_step(self):
+        # A step near INT64_MAX selects only `start`. The window size used to
+        # be computed as (end - start + step - 1) / step, which overflows
+        # int64. Eager aten does the same arithmetic, so the reference is
+        # built by hand instead of by running the module.
+        class SliceScatter(torch.nn.Module):
+            def __init__(self, step):
+                super().__init__()
+                self.step = step
+
+            def forward(self, x, src):
+                return torch.slice_scatter(
+                    x, src, dim=0, start=0, end=8, step=self.step
+                )
+
+        int64_max = 2**63 - 1
+        x = torch.rand(size=(8,), dtype=torch.float32)
+        src = torch.rand(size=(1,), dtype=torch.float32)
+        expected = x.clone()
+        expected[0] = src[0]
+        for step in (int64_max, int64_max - 7):
+            with self.subTest(step=step):
+                et_program = lower_module(
+                    SliceScatter(step).eval(), (x, src)
+                ).to_executorch()
+                self.check_vk_delegation(et_program)
+                executorch_module = _load_for_executorch_from_buffer(et_program.buffer)
+                model_output = executorch_module.run_method("forward", (x, src))
+                self.assert_outputs_equal(model_output, expected)
+
+    def test_vulkan_backend_slice_scatter_dynamic(self):
+        class SliceScatter(torch.nn.Module):
+            def __init__(self, dim, start):
+                super().__init__()
+                self.dim = dim
+                self.start = start
+
+            def forward(self, x, src):
+                return torch.slice_scatter(x, src, dim=self.dim, start=self.start)
+
+        class SymbolicStart(torch.nn.Module):
+            def forward(self, x, src):
+                return torch.slice_scatter(
+                    x, src, dim=1, start=x.shape[1] - src.shape[1]
+                )
+
+        # A dynamic dim other than the scattered one is read from the tensor
+        # metadata at runtime, so it is delegated and must resize correctly.
+        seq = Dim("seq", min=2, max=12)
+        self.lower_module_and_test_output(
+            SliceScatter(2, -3),
+            (torch.rand(1, 12, 8), torch.rand(1, 12, 3)),
+            dynamic_shapes={"x": {1: seq}, "src": {1: seq}},
+            test_inputs=[(torch.rand(1, 5, 8), torch.rand(1, 5, 3))],
+        )
+
+        # The window is baked in at build time, so a dynamic scattered dim
+        # (which moves a negative start) or a symbolic start must stay on CPU.
+        self.lower_module_and_test_output(
+            SliceScatter(1, -2),
+            (torch.rand(1, 12, 8), torch.rand(1, 2, 8)),
+            dynamic_shapes={"x": {1: seq}, "src": None},
+            expect_no_delegates=True,
+        )
+        n = Dim("n", min=1, max=8)
+        self.check_op_not_partitioned(
+            SymbolicStart(),
+            (torch.rand(1, 16, 8), torch.rand(1, 8, 8)),
+            {"x": None, "src": {1: n}},
+            exir_ops.edge.aten.slice_scatter.default,
+        )
 
     def test_vulkan_backend_minimum(self):
         class MinimumModule(torch.nn.Module):
@@ -1460,6 +1623,69 @@ class TestVulkanBackend(unittest.TestCase):
 
         self.lower_module_and_test_output(
             ViewModule(),
+            sample_inputs,
+        )
+
+    def test_vulkan_backend_redundant_view_to_output(self):
+        # Returning a value and a redundant view of it: once the view is
+        # removed, both outputs are the same node. The serializer must still
+        # emit two output ids, or the runtime's argument count check fails.
+        class RedundantViewToOutputModule(torch.nn.Module):
+            def forward(self, x):
+                y = x + 1
+                return y, y.view(2, 48)
+
+        sample_inputs = (torch.randn(size=(2, 48), dtype=torch.float32),)
+
+        self.lower_module_and_test_output(
+            RedundantViewToOutputModule(),
+            sample_inputs,
+        )
+
+    def test_vulkan_backend_buffer_mutation_aliasing_user_output(self):
+        # A mutated buffer returned through a redundant view. The partitioner
+        # tags mutated buffers into the delegate, so the mutation is applied in
+        # place. Once the view is removed the buffer-mutation
+        # slot and the user output are the same node, but only the user output
+        # gets a slot in the delegate call, so keeping both would leave the
+        # serialized graph expecting one argument more than the call provides.
+        #
+        # Run it twice: the state has to carry over, which is what says the
+        # mutation is really being applied in place rather than quietly
+        # dropped along with its output slot.
+        class MutationAliasModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("state", torch.zeros(2, 48))
+
+            def forward(self, x):
+                self.state.add_(x)
+                return self.state.view(2, 48)
+
+        sample_inputs = (torch.ones(size=(2, 48), dtype=torch.float32),)
+        test_inputs = [(torch.ones(size=(2, 48), dtype=torch.float32),)]
+
+        self.lower_module_and_test_output(
+            MutationAliasModule(),
+            sample_inputs,
+            test_inputs=test_inputs,
+        )
+
+    def test_vulkan_backend_view_chain_collapsing_to_input_shape(self):
+        # A chain of views whose net effect is the original shape. Fusing the
+        # chain leaves a view onto the shape it started from, which the
+        # redundant-op sweep then removes; the output count must survive both
+        # rewrites.
+        class ViewChainModule(torch.nn.Module):
+            def forward(self, x):
+                y = x + 1
+                z = y.view(4, 24).view(8, 12).view(2, 48)
+                return y, z
+
+        sample_inputs = (torch.randn(size=(2, 48), dtype=torch.float32),)
+
+        self.lower_module_and_test_output(
+            ViewChainModule(),
             sample_inputs,
         )
 
@@ -1624,6 +1850,23 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
+    def test_vulkan_backend_split_with_sizes_dynamic(self):
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                return torch.split(x, (3, 6, 1, 3), dim=-1)
+
+        sample_inputs = (torch.randn(size=(1, 8, 13), dtype=torch.float32),)
+        seq_len = Dim("seq_len", min=2, max=16)
+        self.lower_module_and_test_output(
+            TestModule(),
+            sample_inputs,
+            dynamic_shapes={"x": {1: seq_len}},
+            test_inputs=[
+                (torch.randn(size=(1, 3, 13), dtype=torch.float32),),
+                (torch.randn(size=(1, 16, 13), dtype=torch.float32),),
+            ],
+        )
+
     def test_vulkan_backend_split_tensor(self):
         class TestModule(torch.nn.Module):
             def __init__(self):
@@ -1667,6 +1910,29 @@ class TestVulkanBackend(unittest.TestCase):
         self.lower_module_and_test_output(
             TestModule(),
             sample_inputs,
+        )
+
+    def test_vulkan_backend_constant_pad_nd_symbolic_pad(self):
+        """A pad amount derived from a dynamic dim, as LSTM padding produces.
+
+        Without the guard this partitions and then aborts at prepack with
+        "Expected value to have type IntList, got VALUELIST instead", because
+        the pad list is serialized as a VALUELIST of Int/SymInt.
+        """
+
+        class TestModule(torch.nn.Module):
+            def forward(self, x):
+                # Pad up to a static length, the shape every unrolled LSTM
+                # wants its input in.
+                return torch.nn.functional.pad(x, (0, 0, 0, 16 - x.shape[1]))
+
+        sample_inputs = (torch.randn(size=(1, 12, 8), dtype=torch.float32),)
+        seq = Dim("seq", min=2, max=16)
+        self.check_op_not_partitioned(
+            TestModule(),
+            sample_inputs,
+            {"x": {1: seq}},
+            exir_ops.edge.aten.constant_pad_nd.default,
         )
 
     def test_vulkan_backend_repeat(self):
@@ -1907,6 +2173,112 @@ class TestVulkanBackend(unittest.TestCase):
                 ArangeModule(i),
                 (torch.randint(low=-100, high=100, size=(5, 5)),),  # dummy input
             )
+
+    def test_vulkan_backend_index_select_batch_dynamic_channels(self):
+        # Selecting along the batch dim walks the z axis in units of channel
+        # texels, so the step depends on the channel count. Vary the channels
+        # below the built size: a step frozen at build time reads the wrong
+        # texel once the count drops.
+        class IndexSelectModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.index = torch.tensor([1, 3, 0, 2])
+
+            def forward(self, x):
+                return torch.index_select(x, 0, self.index)
+
+        sample_inputs = (torch.randn(size=(5, 8, 3, 4), dtype=torch.float32),)
+        dynamic_shapes = {"x": {1: Dim("channels", min=1, max=8)}}
+        test_inputs = [
+            (torch.randn(5, 1, 3, 4),),
+            (torch.randn(5, 3, 3, 4),),
+            (torch.randn(5, 4, 3, 4),),
+            (torch.randn(5, 5, 3, 4),),
+            (torch.randn(5, 8, 3, 4),),
+        ]
+
+        self.lower_module_and_test_output(
+            IndexSelectModule(),
+            sample_inputs,
+            dynamic_shapes=dynamic_shapes,
+            test_inputs=test_inputs,
+        )
+
+    def test_vulkan_backend_index_select_width_dynamic_shapes(self):
+        class IndexSelectModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.index = torch.tensor([2, 0, 1])
+
+            def forward(self, x):
+                return torch.index_select(x, 2, self.index)
+
+        sample_inputs = (torch.randn(size=(2, 3, 4, 6), dtype=torch.float32),)
+        dynamic_shapes = {"x": {3: Dim("width", min=1, max=6)}}
+        test_inputs = [
+            (torch.randn(2, 3, 4, 1),),
+            (torch.randn(2, 3, 4, 3),),
+            (torch.randn(2, 3, 4, 6),),
+        ]
+
+        self.lower_module_and_test_output(
+            IndexSelectModule(),
+            sample_inputs,
+            dynamic_shapes=dynamic_shapes,
+            test_inputs=test_inputs,
+        )
+
+    def test_vulkan_backend_index_select_channel_dynamic_shapes(self):
+        # The channel path takes a separate shader and a separate resize
+        # callback from the one above.
+        class IndexSelectModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.index = torch.tensor([3, 1, 0, 1])
+
+            def forward(self, x):
+                return torch.index_select(x, 1, self.index)
+
+        sample_inputs = (torch.randn(size=(2, 5, 4, 6), dtype=torch.float32),)
+        dynamic_shapes = {"x": {3: Dim("width", min=1, max=6)}}
+        test_inputs = [
+            (torch.randn(2, 5, 4, 1),),
+            (torch.randn(2, 5, 4, 4),),
+            (torch.randn(2, 5, 4, 6),),
+        ]
+
+        self.lower_module_and_test_output(
+            IndexSelectModule(),
+            sample_inputs,
+            dynamic_shapes=dynamic_shapes,
+            test_inputs=test_inputs,
+        )
+
+    def test_vulkan_backend_embedding_dynamic_shapes(self):
+        # The output picks up the index tensor's shape, so it has to be resized
+        # with it rather than left at the size it was built with.
+        class EmbeddingModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embedding = torch.nn.Embedding(10, 8)
+
+            def forward(self, x):
+                return self.embedding(x)
+
+        sample_inputs = (torch.randint(0, 10, (2, 6), dtype=torch.int32),)
+        dynamic_shapes = {"x": {1: Dim("seq", min=1, max=6)}}
+        test_inputs = [
+            (torch.randint(0, 10, (2, 1), dtype=torch.int32),),
+            (torch.randint(0, 10, (2, 3), dtype=torch.int32),),
+            (torch.randint(0, 10, (2, 6), dtype=torch.int32),),
+        ]
+
+        self.lower_module_and_test_output(
+            EmbeddingModule(),
+            sample_inputs,
+            dynamic_shapes=dynamic_shapes,
+            test_inputs=test_inputs,
+        )
 
     def test_vulkan_backend_embedding_1d(self):
         class EmbeddingModule(torch.nn.Module):
@@ -2230,6 +2602,118 @@ class TestVulkanBackend(unittest.TestCase):
             ConvGroupNormModule(),
             sample_inputs,
         )
+
+    def test_vulkan_backend_instance_norm(self):
+        # ReplaceInstanceNormPass rewrites a batch-1 instance norm with constant
+        # affine args into group norm with one group per channel.
+        class ConvInstanceNormModule(torch.nn.Module):
+            def __init__(self, channels):
+                super().__init__()
+                self.conv = torch.nn.Conv2d(3, channels, kernel_size=3, padding=1)
+                self.norm = torch.nn.InstanceNorm2d(channels, affine=True)
+                torch.nn.init.normal_(self.norm.weight)
+                torch.nn.init.normal_(self.norm.bias)
+
+            def forward(self, x):
+                return torch.relu(self.norm(self.conv(x)))
+
+        for channels in (16, 13):
+            with self.subTest(channels=channels):
+                model = ConvInstanceNormModule(channels)
+                sample_inputs = (torch.randn(1, 3, 32, 32),)
+                edge_program = lower_module(model.eval(), sample_inputs)
+                self.assertEqual(
+                    [
+                        node.target
+                        for node in edge_program.exported_program().graph.nodes
+                        if node.op == "call_function"
+                        and node.target != operator.getitem
+                    ],
+                    [torch.ops.higher_order.executorch_call_delegate],
+                )
+                self.lower_module_and_test_output(model, sample_inputs)
+
+    def test_vulkan_backend_instance_norm_large_offset(self):
+        # A mean far from zero relative to the standard deviation. Computing the
+        # variance as E[x^2] - E[x]^2 in fp32 rounds it to zero or below here.
+        class InstanceNormModule(torch.nn.Module):
+            def __init__(self, channels):
+                super().__init__()
+                self.norm = torch.nn.InstanceNorm2d(channels, affine=True)
+
+            def forward(self, x):
+                return self.norm(x)
+
+        cases = [
+            # Unit weight and zero bias: [8192, 8193] has a variance of 0.25, so it
+            # normalizes to about +-1.
+            ("two_values", InstanceNormModule(1), torch.tensor([[[[8192.0, 8193.0]]]])),
+            ("offset_1000", InstanceNormModule(8), 1000 + torch.rand(1, 8, 16, 16)),
+        ]
+        for name, model, x in cases:
+            with self.subTest(name):
+                self.lower_module_and_test_output(
+                    model.eval(), (x,), atol=2e-3, rtol=1e-3
+                )
+
+    def test_vulkan_backend_instance_norm_not_rewritable(self):
+        # Group norm prepacks its affine args, so an instance norm whose affine
+        # args are not constants by the time group norm sees them must stay on
+        # the CPU: a batch above 1 repeats them at runtime, and model inputs are
+        # not constants at all.
+        class InstanceNormModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.norm = torch.nn.InstanceNorm2d(8, affine=True)
+
+            def forward(self, x):
+                return torch.relu(self.norm(x + 1.0))
+
+        class InputAffineModule(torch.nn.Module):
+            def forward(self, x, weight, bias):
+                return torch.relu(F.instance_norm(x + 1.0, weight=weight, bias=bias))
+
+        # The repeats of the affine args are delegated while the norm is not, so
+        # these also check that the delegate still computes them.
+        class InstanceNorm1dModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.conv = torch.nn.Conv1d(8, 8, 3, padding=1)
+                self.norm = torch.nn.InstanceNorm1d(8, affine=True)
+                torch.nn.init.normal_(self.norm.weight)
+                torch.nn.init.normal_(self.norm.bias)
+
+            def forward(self, x):
+                return torch.relu(self.norm(self.conv(x)))
+
+        class ComputedWeightModule(InstanceNormModule):
+            def forward(self, x):
+                weight = self.norm.weight * 2
+                return F.instance_norm(x + 1.0, weight=weight, bias=self.norm.bias)
+
+        cases = [
+            ("batch_2", InstanceNormModule(), (torch.randn(2, 8, 5, 6),)),
+            (
+                "input_affine",
+                InputAffineModule(),
+                (torch.randn(1, 8, 5, 6), torch.randn(8), torch.randn(8)),
+            ),
+            ("instance_norm_1d", InstanceNorm1dModule(), (torch.randn(1, 8, 20),)),
+            ("computed_weight", ComputedWeightModule(), (torch.randn(1, 8, 5, 6),)),
+        ]
+        for name, model, sample_inputs in cases:
+            with self.subTest(name):
+                edge_program = lower_module(model.eval(), sample_inputs)
+                targets = [
+                    node.target
+                    for node in edge_program.exported_program().graph.nodes
+                    if node.op == "call_function"
+                ]
+                self.assertIn(
+                    exir_ops.edge.aten._native_batch_norm_legit.no_stats, targets
+                )
+                self.assertIn(torch.ops.higher_order.executorch_call_delegate, targets)
+                self.lower_module_and_test_output(model, sample_inputs)
 
     def test_vulkan_backend_group_norm_different_groups(self):
         class GroupNormModule(torch.nn.Module):

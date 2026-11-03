@@ -102,6 +102,15 @@ def define_common_targets():
     )
 
     runtime.python_library(
+        name = "replace_in_place_ops",
+        srcs = ["replace_in_place_ops.py"],
+        visibility = ["PUBLIC"],
+        deps = [
+            "//caffe2:torch",
+        ],
+    )
+
+    runtime.python_library(
         name = "remove_clone_ops",
         srcs = ["remove_clone_ops.py"],
         visibility = ["PUBLIC"],
@@ -257,6 +266,19 @@ def define_common_targets():
     )
 
     runtime.python_test(
+        name = "test_fuse_batch_norm_with_conv",
+        srcs = [
+            "test/test_fuse_batch_norm_with_conv.py",
+        ],
+        deps = [
+            "//caffe2:torch",
+            ":fuse_batch_norm_with_conv",
+            "//executorch/exir:lib",
+            "//executorch/exir/dialects:lib",
+        ],
+    )
+
+    runtime.python_test(
         name = "test_quantize_fused_convbn_bias_pass",
         srcs = [
             "test/test_quantize_fused_convbn_bias_pass.py",
@@ -334,6 +356,17 @@ def define_common_targets():
             "//caffe2:torch",
             "//executorch/exir:lib",
             ":rank_0_to_rank_1",
+        ],
+    )
+
+    runtime.python_test(
+        name = "test_replace_in_place_ops",
+        srcs = [
+            "test/test_replace_in_place_ops.py",
+        ],
+        deps = [
+            "//caffe2:torch",
+            ":replace_in_place_ops",
         ],
     )
 

@@ -44,6 +44,13 @@ def filter_fn(node: torch.fx.Node) -> bool:
         torch.int64,
     ]:
         return False
+    # HTP FloorDiv and Mod stop at rank 4; a higher-rank floor_divide runs on CPU,
+    # which needs it decomposed.
+    if (
+        node.target == torch.ops.aten.floor_divide.default
+        and node.meta["val"].dim() > 4
+    ):
+        return False
     return True
 
 

@@ -67,26 +67,41 @@ void add_slice_scatter_node(
   const std::vector<int64_t> self_sizes = graph.sizes_of(self);
   const int64_t dim_size = self_sizes.at(dim);
 
-  const int64_t step = graph.extract_scalar<int64_t>(step_ref);
+  // start/end are normalized against dim_size and baked into push constants
+  // below, so they must be fixed for the lifetime of the graph. The
+  // partitioner only delegates nodes whose start/end are constants and whose
+  // scattered dim is static; refuse anything else rather than scatter into a
+  // stale window after a resize.
+  VK_CHECK_COND(
+      !graph.val_is_symint(start_ref) && !graph.val_is_symint(end_ref),
+      "Vulkan slice_scatter requires constant start/end");
+
+  int64_t step = graph.extract_scalar<int64_t>(step_ref);
   VK_CHECK_COND(step > 0, "Vulkan slice_scatter requires step > 0");
 
   const std::optional<int64_t> opt_start =
       graph.extract_optional_scalar<int64_t>(start_ref);
   const std::optional<int64_t> opt_end =
       graph.extract_optional_scalar<int64_t>(end_ref);
-  const int64_t start =
-      normalize_slice_idx(opt_start.value_or(0), dim_size, 0);
+  const int64_t start = normalize_slice_idx(opt_start.value_or(0), dim_size, 0);
   const int64_t end =
       normalize_slice_idx(opt_end.value_or(dim_size), dim_size, dim_size);
 
   // The shader decides src-vs-self per output element from (start, end, step)
   // alone, so it never reads outside src as long as src is exactly as long as
   // the strided window. aten guarantees this; assert rather than clamp, since
-  // a mismatch would otherwise read out of bounds.
-  const int64_t window = start < end ? (end - start + step - 1) / step : 0;
+  // a mismatch would otherwise read out of bounds. Written so that no
+  // intermediate exceeds end - start: ceil-division via `+ step - 1` would
+  // overflow int64 for a step near INT64_MAX.
+  const int64_t window = start < end ? (end - start - 1) / step + 1 : 0;
   VK_CHECK_COND(
       graph.sizes_of(src).at(dim) == window,
       "Vulkan slice_scatter: src size along dim does not match the slice");
+
+  // Any step >= the window extent selects only `start`, so clamping it to
+  // dim_size changes nothing but keeps it in int32 range (a step of 2**32
+  // would otherwise narrow to 0 and the shader would divide by it).
+  step = std::min<int64_t>(step, std::max<int64_t>(dim_size, 1));
 
   // The shader hard-codes texture indexing for all three tensors.
   VK_CHECK_COND(
@@ -110,9 +125,9 @@ void add_slice_scatter_node(
     int32_t step;
   } params{
       dim_whcn,
-      static_cast<int32_t>(start),
-      static_cast<int32_t>(end),
-      static_cast<int32_t>(step)};
+      utils::safe_downcast<int32_t>(start),
+      utils::safe_downcast<int32_t>(end),
+      utils::safe_downcast<int32_t>(step)};
 
   std::string kernel_name("slice_scatter_texture3d");
   kernel_name.reserve(kShaderNameReserve);

@@ -71,14 +71,19 @@ build_android_native_library() {
   fi
   cmake --build "${CMAKE_OUT}" -j "${CMAKE_JOBS}" --target install --config "${EXECUTORCH_CMAKE_BUILD_TYPE}"
 
-  # Copy artifacts to ABI specific directory
+  # Copy artifacts to ABI specific directory. Recreate it rather than copying
+  # over it: CMake leaves the outputs of a target that has since been switched
+  # off in place, and a stale backend .so staged here would be packaged into
+  # the AAR as if it had just been built.
   local SO_STAGE_DIR="cmake-out-android-so/${ANDROID_ABI}"
+  rm -rf "${SO_STAGE_DIR}"
   mkdir -p ${SO_STAGE_DIR}
   cp "${CMAKE_OUT}"/extension/android/libexecutorch_jni.so "${SO_STAGE_DIR}/libexecutorch.so"
 
   # The native libraries link the NDK C++ runtime dynamically, so the AAR has to
-  # carry it. Apps that already ship libc++_shared.so (React Native, for one)
-  # collapse the two copies at packaging time.
+  # carry it. An app that also pulls libc++_shared.so from another dependency
+  # (fbjni ships one) has two files at the same path, which AGP treats as an
+  # error rather than collapsing; the AAR sets jniLibs.pickFirsts for it.
   local ANDROID_TRIPLE
   case "${ANDROID_ABI}" in
     arm64-v8a)   ANDROID_TRIPLE=aarch64-linux-android ;;
@@ -90,14 +95,15 @@ build_android_native_library() {
   cp "${ANDROID_NDK}"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/"${ANDROID_TRIPLE}"/libc++_shared.so \
     "${SO_STAGE_DIR}/"
 
-  # Copy standalone Vulkan backend shared library if built. Used by React
-  # Native Executorch as an opt-in artifact when the app enables Vulkan.
-  if [ -f "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so ]; then
+  # Standalone backend shared libraries, when they were asked for. Gate on the
+  # option rather than on the file existing, so a build that turned one off
+  # cannot pick up the .so a previous build left in CMAKE_OUT. Used by React
+  # Native ExecuTorch as opt-in artifacts.
+  if [ "${EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED}" == "ON" ]; then
     cp "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so "${SO_STAGE_DIR}/"
   fi
 
-  # Same for XNNPACK as a standalone shared library.
-  if [ -f "${CMAKE_OUT}"/extension/android/libxnnpack_executorch_backend.so ]; then
+  if [ "${EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED}" == "ON" ]; then
     cp "${CMAKE_OUT}"/extension/android/libxnnpack_executorch_backend.so "${SO_STAGE_DIR}/"
   fi
 

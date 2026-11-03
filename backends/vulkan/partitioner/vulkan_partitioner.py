@@ -7,7 +7,18 @@
 # pyre-strict
 
 import logging
-from typing import Any, Callable, Dict, final, List, Mapping, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    final,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Set,
+    Tuple,
+)
 
 import executorch.backends.vulkan.patterns as vk_patterns
 import executorch.backends.vulkan.utils as utils
@@ -19,6 +30,7 @@ from executorch.backends.vulkan.op_registry import (
     has_impl,
     OpFeatures,
     OpKey,
+    unwrap_identity_repeat,
     vulkan_supported_ops,
 )
 
@@ -41,7 +53,7 @@ from executorch.exir.dialects._ops import ops as exir_ops
 
 from torch.export.exported_program import ExportedProgram
 
-from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
+from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner, Partition
 from torch.fx.passes.operator_support import OperatorSupportBase
 
 # pyre-ignore
@@ -67,12 +79,16 @@ class VulkanSupportedOperators(OperatorSupportBase):
         fusable_subgraphs: Optional[List[PatternMatch]] = None,
         nn_module_blocklist: Optional[Set[str]] = None,
         nn_module_allowlist: Optional[Set[str]] = None,
+        constant_nodes: Optional[Set[torch.fx.Node]] = None,
     ) -> None:
         super().__init__()
         self.texture_limits: utils.ImageExtents = texture_limits
         self.buffer_limit = buffer_limit
         self.require_dynamic_shapes = require_dynamic_shape
         self.skip_bool_tensors = skip_bool_tensors
+        self.constant_nodes: Set[torch.fx.Node] = (
+            constant_nodes if constant_nodes is not None else set()
+        )
         self.operator_blocklist: Set[OpKey] = (
             operator_blocklist if operator_blocklist is not None else set()
         )
@@ -87,6 +103,7 @@ class VulkanSupportedOperators(OperatorSupportBase):
 
         self.nn_module_blocklist = nn_module_blocklist
         self.nn_module_allowlist = nn_module_allowlist
+        self._rejected_nodes: Set[torch.fx.Node] = set()
 
     def op_node_is_compatible(  # noqa: C901: Function is too complex
         self, node: torch.fx.Node, features: Optional[OpFeatures] = None
@@ -195,9 +212,16 @@ class VulkanSupportedOperators(OperatorSupportBase):
                 f"[Vulkan Partitioner] Due to [{reason}], skipping {utils.node_io_str(node)}"
             )
 
+    def reject(self, node: torch.fx.Node, reason: str) -> None:
+        """Mark node as unsupported from now on, overriding its support check."""
+        self.log_skip(node, reason)
+        self._rejected_nodes.add(node)
+
     def is_node_supported(
         self, submodules: Mapping[str, torch.nn.Module], node: torch.fx.Node
     ) -> bool:
+        if node in self._rejected_nodes:
+            return False
         r = self._is_node_supported(node)
         return r
 
@@ -268,6 +292,15 @@ class VulkanSupportedOperators(OperatorSupportBase):
             self.log_skip(node, "op args not supported")
             return False
 
+        if (
+            features.are_node_inputs_supported_with_constants_fn is not None
+            and not features.are_node_inputs_supported_with_constants_fn(
+                node, self.constant_nodes
+            )
+        ):
+            self.log_skip(node, "op args are not constant where required")
+            return False
+
         if not features.supports_highdim and utils.op_contains_high_dim_tensor(node):
             self.log_skip(node, "op does not support high dim tensors")
             return False
@@ -315,6 +348,35 @@ def parse_compile_options(compile_options: Dict[str, Any]) -> List[CompileSpec]:
         # Unhandled options are ignored
 
     return compile_specs
+
+
+def instance_norms_split_from_affine_repeats(
+    partitions: Iterable[Partition],
+) -> Set[torch.fx.Node]:
+    """
+    The batch norms without stats in ``partitions`` whose affine args are read
+    through an identity ``repeat`` (as F.instance_norm does for a batch of 1)
+    that is not in the same partition.
+
+    Such a norm receives the repeat's output as a runtime input, which
+    ReplaceInstanceNormPass cannot unwrap to a constant. Even a delegated repeat
+    can land in another partition, for instance when it has other users on a path
+    that leaves the norm's partition and re-enters it.
+    """
+    partition_of = {
+        node: partition.id for partition in partitions for node in partition.nodes
+    }
+    split = set()
+    for node, partition_id in partition_of.items():
+        if node.target != exir_ops.edge.aten._native_batch_norm_legit.no_stats:
+            continue
+        for affine_arg in (node.args[1], node.args[2]):
+            if (
+                unwrap_identity_repeat(affine_arg) is not affine_arg
+                and partition_of.get(affine_arg) != partition_id
+            ):
+                split.add(node)
+    return split
 
 
 @final
@@ -388,22 +450,35 @@ class VulkanPartitioner(Partitioner):
         else:
             texture_limits = utils.DEFAULT_TEXTURE_LIMITS
         buffer_limit: int = self.options.get("buffer_limit", utils.DEFAULT_BUFFER_LIMIT)
+        operator_support = VulkanSupportedOperators(
+            texture_limits,
+            buffer_limit,
+            require_dynamic_shape=self.options.get("require_dynamic_shapes", False),
+            skip_bool_tensors=self.options.get("skip_bool_tensors", False),
+            operator_blocklist=self.operator_blocklist,
+            operator_allowlist=self.operator_allowlist,
+            fusable_subgraphs=fusable_subgraphs,
+            nn_module_blocklist=self.nn_module_blocklist,
+            nn_module_allowlist=self.nn_module_allowlist,
+            constant_nodes=utils.get_constant_nodes(exported_program),
+        )
         capability_partitioner = CapabilityBasedPartitioner(
             exported_program.graph_module,
-            VulkanSupportedOperators(
-                texture_limits,
-                buffer_limit,
-                require_dynamic_shape=self.options.get("require_dynamic_shapes", False),
-                skip_bool_tensors=self.options.get("skip_bool_tensors", False),
-                operator_blocklist=self.operator_blocklist,
-                operator_allowlist=self.operator_allowlist,
-                fusable_subgraphs=fusable_subgraphs,
-                nn_module_blocklist=self.nn_module_blocklist,
-                nn_module_allowlist=self.nn_module_allowlist,
-            ),
+            operator_support,
             allows_single_node_partition=True,
         )
         partition_list = capability_partitioner.propose_partitions()
+        # Support is checked node by node, but an instance norm is only delegable
+        # if the repeats of its affine args share its partition. Keep the norms
+        # that ended up apart on the CPU and partition again until none do.
+        split_norms = instance_norms_split_from_affine_repeats(partition_list)
+        while split_norms:
+            for node in split_norms:
+                operator_support.reject(
+                    node, "affine arg repeat is not in the same partition"
+                )
+            partition_list = capability_partitioner.propose_partitions()
+            split_norms = instance_norms_split_from_affine_repeats(partition_list)
         for partition in partition_list:
             for node in partition.nodes:
                 tag = f"tag{partition.id}"

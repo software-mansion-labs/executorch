@@ -202,6 +202,18 @@ define_overridable_option(
   EXECUTORCH_BUILD_VGF "Build the Arm VGF backend" BOOL OFF
 )
 define_overridable_option(
+  EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED
+  "Build the XNNPACK backend as its own shared library instead of linking it into the Android JNI library"
+  BOOL
+  OFF
+)
+define_overridable_option(
+  EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED
+  "Build the Vulkan backend as its own shared library instead of linking it into the Android JNI library"
+  BOOL
+  OFF
+)
+define_overridable_option(
   EXECUTORCH_COREML_BUILD_EXECUTOR_RUNNER "Build CoreML executor runner." BOOL
   OFF
 )
@@ -355,6 +367,15 @@ check_required_options_on(
 
 check_required_options_on(
   IF_ON EXECUTORCH_BUILD_QNN REQUIRES EXECUTORCH_BUILD_EXTENSION_TENSOR
+)
+
+check_required_options_on(
+  IF_ON EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED REQUIRES
+  EXECUTORCH_BUILD_XNNPACK
+)
+
+check_required_options_on(
+  IF_ON EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED REQUIRES EXECUTORCH_BUILD_VULKAN
 )
 
 check_required_options_on(

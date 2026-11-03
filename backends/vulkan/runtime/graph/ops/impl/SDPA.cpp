@@ -30,6 +30,61 @@ bool is_single_token(ComputeGraph* graph, const ValueRef& q_projected) {
   return graph->size_at<uint32_t>(-3, q_projected) == 1;
 }
 
+// start_pos may be serialized as either SymInt (dynamic-shape text_decoder
+// prefill/decode) or Int (static-shape vision_encoder with constant 0). The
+// op schema declares SymInt, but recent vulkan_preprocess passes serialize
+// Python literal constants as Int. Dispatch on the actual value type.
+int32_t read_input_pos(ComputeGraph* graph, const ValueRef input_pos_symint) {
+  return graph->val_is_symint(input_pos_symint)
+      ? graph->read_symint(input_pos_symint)
+      : graph->extract_scalar<int32_t>(input_pos_symint);
+}
+
+// Context length past which the separate attn-weights and softmax pair is
+// faster than the fused dispatch. The fused shader reduces the whole row
+// inside one work group, so its parallelism is capped at num_q_heads work
+// groups; the separate pair spreads the same work over one work group per
+// context texel. Below the cutoff the saved dispatch and the saved round trip
+// of attn_weights through global memory dominate; above it the lost
+// parallelism does.
+//
+// The fused shader sizes its shared attn_weights row to exactly this cutoff:
+// MAX_CONTEXT_TEXEL_LEN in sdpa_compute_attn_weights_coop.glsl must equal
+// kFusedSoftmaxMaxContextTexels. Raising the cutoff means raising both.
+constexpr int64_t kFusedSoftmaxMaxContextTexels = 64;
+constexpr int64_t kFusedSoftmaxMaxContextLen =
+    kFusedSoftmaxMaxContextTexels * 4;
+
+// The fused shader's shared memory: four row arrays (one per texel component)
+// plus the softmax helper's two 64-entry reductions, all fp32 in the worst
+// case. Keep it within the 16 KiB maxComputeSharedMemorySize that Vulkan
+// guarantees, so no device rejects the pipeline.
+static_assert(
+    (4 * kFusedSoftmaxMaxContextTexels + 2 * 64) * sizeof(float) <= 16384,
+    "fused QK+softmax shared memory exceeds the Vulkan minimum limit");
+
+// Whether the decode path should use the single fused QK+softmax dispatch
+// instead of the separate attn-weights and softmax pair.
+//
+// All three nodes are added to the graph, because which one is wanted depends
+// on the sequence length, and that is only known once sizes are current: a
+// dynamic-shape export reports the max bound at graph build time, never 1.
+// Each node's global work group picker calls this and collapses to a zero work
+// group when it is not the chosen path, which DispatchNode::encode skips.
+// Pickers are re-run from DynamicDispatchNode::trigger_resize, so the choice
+// is re-made every token and follows the context length as it grows.
+bool use_fused_qk_softmax(
+    ComputeGraph* graph,
+    const ValueRef q_projected,
+    const ValueRef input_pos_symint) {
+  if (!is_single_token(graph, q_projected)) {
+    return false;
+  }
+  const int64_t context_len = graph->size_at<int64_t>(-3, q_projected) +
+      read_input_pos(graph, input_pos_symint);
+  return context_len <= kFusedSoftmaxMaxContextLen;
+}
+
 //
 // Resize functions
 //
@@ -45,13 +100,7 @@ void resize_compute_attn_weights_node(
   const uint32_t num_q_heads = graph->size_at<uint32_t>(-2, q_projected);
   const uint32_t seq_len = graph->size_at<uint32_t>(-3, q_projected);
 
-  // start_pos may be serialized as either SymInt (dynamic-shape text_decoder
-  // prefill/decode) or Int (static-shape vision_encoder with constant 0). The
-  // op schema declares SymInt, but recent vulkan_preprocess passes serialize
-  // Python literal constants as Int. Dispatch on the actual value type.
-  const int32_t input_pos_val = graph->val_is_symint(input_pos_symint)
-      ? graph->read_symint(input_pos_symint)
-      : graph->extract_scalar<int32_t>(input_pos_symint);
+  const int32_t input_pos_val = read_input_pos(graph, input_pos_symint);
 
   const uint32_t context_len = seq_len + input_pos_val;
 
@@ -165,7 +214,10 @@ vkapi::ShaderInfo pick_sdpa_compute_attn_weights_shader_impl(
   // <base>_<variant>_<storage>_<storage>_<dtype>. This matches the gemma-fork
   // picker's convention so the audio path can route through these
   // (multi-row-correct) shaders.
-  if (has_mask) {
+  if (has_mask && graph->dim_of(args.at(1).refs.at(2)) == 2) {
+    // The LLM SDPA's 2D [S, C] attn_mask (see sdpa_impl).
+    shader_name += "_mask2d";
+  } else if (has_mask) {
     if (mask_per_head) {
       shader_name += has_softcap ? "_mask_phmask_softcap" : "_mask_phmask";
     } else {
@@ -193,10 +245,9 @@ vkapi::ShaderInfo pick_sdpa_compute_attn_weights_coop_softmax_shader(
   const bool has_mask = args.at(1).refs.size() >= 3;
 
   std::string shader_name = "sdpa_compute_attn_weights_coop_softmax";
-
+  shader_name += has_mask ? "_mask" : "_nomask";
   add_storage_type_suffix(shader_name, graph->storage_type_of(q_projected));
   add_storage_type_suffix(shader_name, graph->storage_type_of(k_cache));
-  shader_name += has_mask ? "_mask" : "_nomask";
   add_dtype_suffix(shader_name, graph->dtype_of(q_projected));
 
   return VK_KERNEL_FROM_STR(shader_name);
@@ -285,8 +336,13 @@ utils::uvec3 pick_sdpa_compute_attn_weights_coop_softmax_global_wg_size(
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args) {
   (void)shader;
-  (void)resize_args;
   const ValueRef q_projected = args.at(1).refs.at(0);
+  const ValueRef input_pos_symint = resize_args.at(0);
+
+  // Prefill, and decode past the cutoff, are served by the separate nodes.
+  if (!use_fused_qk_softmax(graph, q_projected, input_pos_symint)) {
+    return {0u, 0u, 0u};
+  }
 
   const uint32_t num_q_heads = graph->size_at<uint32_t>(-2, q_projected);
   const uint32_t seq_len = graph->size_at<uint32_t>(-3, q_projected);
@@ -424,7 +480,8 @@ void add_sdpa_compute_attn_weights_node(
     const ValueRef attn_mask = kDummyValueRef,
     const bool force_tiled = false,
     const bool mask_per_head = false,
-    const float softcap_value = 0.0f) {
+    const float softcap_value = 0.0f,
+    const bool has_fused_qk_softmax = false) {
   const int32_t head_dim_size = graph.size_at<int32_t>(-1, q_projected);
   const float scale_val = (inv_scale_override >= 0.0f)
       ? inv_scale_override
@@ -438,6 +495,13 @@ void add_sdpa_compute_attn_weights_node(
       graph.sizes_ubo(q_projected),
       graph.sizes_ubo(k_cache),
       graph.get_or_create_int_param_buffer(input_pos_symint)};
+  // A 2D attn_mask is the LLM SDPA's [S, C] additive mask, which replaces the
+  // causal mask; its shader variant also reads the mask sizes. With it,
+  // sdpa_impl passes a C - S symint in place of the real input_pos. The 4D
+  // masks of the Gemma SDPA ops select the `_mask` variants instead.
+  if (has_mask && graph.dim_of(attn_mask) == 2) {
+    param_ubos.append(graph.sizes_ubo(attn_mask));
+  }
 
   std::vector<ArgGroup> arg_groups;
   arg_groups.push_back({attn_weights, vkapi::kWrite});
@@ -486,10 +550,27 @@ void add_sdpa_compute_attn_weights_node(
     push_constants.push_back(PushConstantDataInfo(&pcs[0], sizeof(float) * 2));
   }
 
+  // Decode is served by the single fused QK+softmax node, if the graph holds
+  // one for the same attention. Only then may this node stand down; a graph
+  // without it (e.g. the raw attn-weights test op) must keep producing scaled
+  // and masked logits.
+  auto pick_global_wg_fn =
+      [has_fused_qk_softmax](
+          ComputeGraph* g,
+          const vkapi::ShaderInfo& shader,
+          const std::vector<ArgGroup>& a,
+          const std::vector<ValueRef>& r) -> utils::uvec3 {
+    if (has_fused_qk_softmax &&
+        use_fused_qk_softmax(g, a.at(1).refs.at(0), r.at(0))) {
+      return {0u, 0u, 0u};
+    }
+    return pick_sdpa_compute_attn_weights_global_wg_size(g, shader, a, r);
+  };
+
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
       pick_shader_fn,
-      pick_sdpa_compute_attn_weights_global_wg_size,
+      pick_global_wg_fn,
       pick_sdpa_compute_attn_weights_local_wg_size,
       // Inputs and Outputs
       arg_groups,
@@ -508,6 +589,11 @@ void add_sdpa_compute_attn_weights_node(
 // Decode-only fused attn-weights compute + softmax. Writes softmax-normalized
 // attn_weights directly to `attn_weights_softmax` (the buffer compute_out
 // reads) so the standalone softmax dispatch can be skipped at decode.
+//
+// It is added alongside the separate attn-weights and softmax nodes, which
+// must be created with has_fused_qk_softmax = true; their work group pickers
+// then make sure exactly one of the two paths dispatches for the current
+// context length (see use_fused_qk_softmax).
 //
 // Geometry differs from add_sdpa_compute_attn_weights_node: one WG per
 // (s, q_h) with 64 workers iterating ALL c4 cooperatively (vs. one WG per
@@ -567,7 +653,8 @@ void add_sdpa_attn_weights_softmax_node(
     const ValueRef attn_weights,
     const ValueRef q_projected,
     const ValueRef input_pos_symint,
-    const ValueRef attn_weights_softmax) {
+    const ValueRef attn_weights_softmax,
+    const bool has_fused_qk_softmax = false) {
   std::string shader_name = "sdpa_attn_weights_softmax";
   add_storage_type_suffix(
       shader_name, graph.storage_type_of(attn_weights_softmax));
@@ -577,10 +664,23 @@ void add_sdpa_attn_weights_softmax_node(
       graph.sizes_ubo(q_projected),
       graph.get_or_create_int_param_buffer(input_pos_symint)};
 
+  // Decode folds this into the fused QK+softmax node, if there is one.
+  auto pick_global_wg_fn =
+      [has_fused_qk_softmax](
+          ComputeGraph* g,
+          const vkapi::ShaderInfo& shader,
+          const std::vector<ArgGroup>& a,
+          const std::vector<ValueRef>& r) -> utils::uvec3 {
+    if (has_fused_qk_softmax && use_fused_qk_softmax(g, r.at(0), r.at(1))) {
+      return {0u, 0u, 0u};
+    }
+    return pick_sdpa_attn_weights_softmax_global_wg_size(g, shader, a, r);
+  };
+
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
       VK_KERNEL_FROM_STR(shader_name),
-      pick_sdpa_attn_weights_softmax_global_wg_size,
+      pick_global_wg_fn,
       pick_sdpa_attn_weights_softmax_local_wg_size,
       // Inputs and Outputs
       {{attn_weights_softmax, vkapi::kWrite}, {attn_weights, vkapi::kRead}},
@@ -647,6 +747,58 @@ void add_sdpa_compute_out_node(
       resize_sdpa_compute_out_node));
 }
 
+void check_attn_mask_sizes(
+    ComputeGraph& graph,
+    const ValueRef attn_mask,
+    const ValueRef q,
+    const ValueRef k) {
+  VK_CHECK_COND(
+      graph.size_at<int64_t>(-2, attn_mask) == graph.size_at<int64_t>(-3, q) &&
+          graph.size_at<int64_t>(-1, attn_mask) ==
+              graph.size_at<int64_t>(-3, k),
+      "attn_mask must have shape [S, C] = [",
+      graph.size_at<int64_t>(-3, q),
+      ", ",
+      graph.size_at<int64_t>(-3, k),
+      "], got [",
+      graph.size_at<int64_t>(-2, attn_mask),
+      ", ",
+      graph.size_at<int64_t>(-1, attn_mask),
+      "]");
+}
+
+// For a masked LLM SDPA, sets out_symint = C - S (the number of keys in k
+// minus the number of queries), which the SDPA shaders read in place of
+// input_pos so that they attend to every key. Also checks that the mask still
+// has shape [S, C] after a resize, since the shaders would otherwise silently
+// skip its missing rows or columns.
+void resize_attn_mask_input_pos_node(
+    ComputeGraph* graph,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)args;
+  const ValueRef q = resize_args.at(0);
+  const ValueRef k = resize_args.at(1);
+  const ValueRef attn_mask = resize_args.at(2);
+  const ValueRef out_symint = resize_args.at(3);
+  check_attn_mask_sizes(*graph, attn_mask, q, k);
+  graph->set_symint(
+      out_symint,
+      graph->size_at<int32_t>(-3, k) - graph->size_at<int32_t>(-3, q));
+}
+
+ValueRef add_attn_mask_input_pos_node(
+    ComputeGraph& graph,
+    const ValueRef q,
+    const ValueRef k,
+    const ValueRef attn_mask) {
+  const ValueRef out_symint = graph.add_symint(
+      graph.size_at<int32_t>(-3, k) - graph.size_at<int32_t>(-3, q));
+  graph.execute_nodes().emplace_back(new ExecuteNode(
+      resize_attn_mask_input_pos_node, {q, k, attn_mask, out_symint}));
+  return out_symint;
+}
+
 //
 // High level operator impl
 //
@@ -703,11 +855,47 @@ void sdpa_impl(ComputeGraph& graph, const std::vector<ValueRef>& args) {
   VK_CHECK_COND(
       graph.val_is_none(dropout_p) ||
       graph.extract_scalar<double>(dropout_p) == 0);
-  VK_CHECK_COND(graph.val_is_none(scale));
-  // is_causal is assumed to be true in the current implementation.
-  VK_CHECK_COND(
-      graph.val_is_none(is_causal) || graph.extract_scalar<bool>(is_causal));
-  VK_CHECK_COND(graph.val_is_none(attn_mask));
+
+  // As in the CPU op, an attn_mask replaces the causal mask: it is a 2D
+  // [S, C] additive mask over every key in k_cache, and cannot be combined
+  // with is_causal. Without one, the attention is assumed to be causal. The
+  // partitioner (op_registry.py) keeps other configurations on CPU.
+  const bool has_mask = graph.val_is_not_none(attn_mask);
+  ValueRef mask = kDummyValueRef;
+  if (has_mask) {
+    VK_CHECK_COND(
+        graph.val_is_none(is_causal) || !graph.extract_scalar<bool>(is_causal),
+        "attn_mask and is_causal cannot both be set");
+    VK_CHECK_COND(graph.dim_of(attn_mask) == 2, "attn_mask must be 2D");
+    // A constant mask arrives as a TensorRef, since the fused op handles its
+    // own prepacking. Its dtype is compared after prepacking, which applies
+    // the same Half -> Float fallback as q on devices without fp16 buffers.
+    mask = graph.val_is_tref(attn_mask)
+        ? prepack_standard(
+              graph,
+              attn_mask,
+              graph.storage_type_of(q_projected),
+              utils::kWidthPacked)
+        : attn_mask;
+    VK_CHECK_COND(
+        graph.dtype_of(mask) == graph.dtype_of(q_projected),
+        "attn_mask must have the same dtype as q");
+    check_attn_mask_sizes(graph, mask, q_projected, k_cache);
+    VK_CHECK_COND(
+        graph.storage_type_of(mask) == graph.storage_type_of(q_projected),
+        "attn_mask must have the same storage type as q");
+    // The shaders index a buffer mask as contiguous [S, C] rows, and a
+    // texture mask with the standard axis map.
+    VK_CHECK_COND(
+        graph.storage_type_of(mask) == utils::kBuffer
+            ? graph.is_contiguous_buffer_tensor(mask)
+            : graph.is_contiguous_texture_tensor(mask),
+        "attn_mask must be contiguous and width packed");
+  } else {
+    VK_CHECK_COND(
+        graph.val_is_none(is_causal) || graph.extract_scalar<bool>(is_causal),
+        "attention without an attn_mask must be causal");
+  }
 
   const int64_t num_q_heads = graph.size_at<int64_t>(-2, q_projected);
   int64_t max_seq_len = graph.size_at<int64_t>(-3, q_projected);
@@ -716,17 +904,26 @@ void sdpa_impl(ComputeGraph& graph, const std::vector<ValueRef>& args) {
   const utils::StorageType attn_weights_storage =
       graph.storage_type_of(q_projected);
 
-  // If using buffer storage for attn weights, we need to ensure that the buffer
-  // numel limit is not exceeded. If needed, manually adjust max_seq_len based
-  // on the buffer numel limit.
+  // The attn_weights S and context dims are padded up to a multiple of 4 to
+  // match resize_compute_attn_weights_node(), which virtual_resizes to
+  // align_up_4(seq_len)/align_up_4(context_len). With buffer-backed
+  // attn_weights the SDPA shaders index each head at a per-head stride of
+  // align_up_4(S) * div_up_4(context) texels, so the allocation must reserve
+  // that padded extent; otherwise heads past the first few read and write out
+  // of bounds once S or C is not a multiple of 4. A texture can likewise not
+  // be resized past its allocated extent.
+  const int64_t padded_context_len = utils::align_up_4(max_context_len);
+
+  // If using buffer storage for attn weights, ensure the buffer numel limit is
+  // not exceeded by the padded allocation.
   if (attn_weights_storage == utils::kBuffer) {
     const int64_t max_buffer_numel = graph.max_buffer_numel();
-    if (num_q_heads * max_seq_len * max_context_len >= max_buffer_numel) {
-      // Compute the maximum possible value for max_seq_len that will hit
-      // the buffer numel limit.
-      max_seq_len = max_buffer_numel / (num_q_heads * max_context_len);
-      // Adjust down to the nearest multiple of 4 to make sure the limit is
-      // not hit.
+    if (num_q_heads * utils::align_up_4(max_seq_len) * padded_context_len >=
+        max_buffer_numel) {
+      // Largest max_seq_len whose padded allocation stays under the limit.
+      max_seq_len = max_buffer_numel / (num_q_heads * padded_context_len);
+      // Round down to a multiple of 4 (so align_up_4 is a no-op below) and keep
+      // the allocation strictly below the limit.
       if (max_seq_len % 4 != 0) {
         max_seq_len = (max_seq_len / 4) * 4;
       } else {
@@ -738,8 +935,8 @@ void sdpa_impl(ComputeGraph& graph, const std::vector<ValueRef>& args) {
   std::vector<int64_t> attn_weight_full_sizes = {
       1, // batch
       num_q_heads,
-      max_seq_len,
-      max_context_len};
+      utils::align_up_4(max_seq_len),
+      padded_context_len};
 
   TmpTensor attn_weights(
       &graph,
@@ -755,29 +952,59 @@ void sdpa_impl(ComputeGraph& graph, const std::vector<ValueRef>& args) {
       attn_weights_storage,
       utils::kWidthPacked);
 
-  // At decode (S=1), fuse the matmul + softmax into a single dispatch.
-  // The fused shader writes softmax-normalized values directly to
-  // attn_weights_softmax (the buffer compute_out reads), eliminating the
-  // separate softmax dispatch and the round-trip on attn_weights.
-  const bool fuse_softmax = is_single_token(&graph, q_projected);
+  const float inv_scale_override = graph.val_is_none(scale)
+      ? -1.0f
+      : graph.extract_scalar<float>(scale);
 
-  if (fuse_softmax) {
+  // The SDPA shaders attend to the first input_pos + S keys. A masked
+  // attention attends to all C keys in k_cache, so give them C - S in place of
+  // input_pos. No key tile can be skipped, so with a mask every step costs
+  // O(C) rather than O(input_pos + S).
+  const ValueRef attn_input_pos = has_mask
+      ? add_attn_mask_input_pos_node(graph, q_projected, k_cache, mask)
+      : input_pos_symint;
+
+  // Decode (S == 1) is served by a single fused QK+softmax dispatch, prefill by
+  // the separate pair below. Both are built: the sequence length is only known
+  // once sizes are current, since a dynamic-shape export reports the max bound
+  // at graph build time. Each node's global work group picker collapses to zero
+  // when it is not the chosen path, and DispatchNode::encode skips it. The
+  // fused shader has no variant for the 2D attn_mask, so a masked attention
+  // always takes the separate pair.
+  const bool has_fused_qk_softmax = !has_mask;
+  if (has_fused_qk_softmax) {
     add_sdpa_compute_attn_weights_with_softmax_node(
-        graph, q_projected, k_cache, input_pos_symint, attn_weights_softmax);
-  } else {
-    add_sdpa_compute_attn_weights_node(
-        graph, q_projected, k_cache, input_pos_symint, attn_weights);
-
-    add_sdpa_attn_weights_softmax_node(
         graph,
-        attn_weights,
         q_projected,
-        input_pos_symint,
-        attn_weights_softmax);
+        k_cache,
+        attn_input_pos,
+        attn_weights_softmax,
+        inv_scale_override);
   }
 
+  add_sdpa_compute_attn_weights_node(
+      graph,
+      q_projected,
+      k_cache,
+      attn_input_pos,
+      attn_weights,
+      inv_scale_override,
+      mask,
+      /*force_tiled=*/false,
+      /*mask_per_head=*/false,
+      /*softcap_value=*/0.0f,
+      has_fused_qk_softmax);
+
+  add_sdpa_attn_weights_softmax_node(
+      graph,
+      attn_weights,
+      q_projected,
+      attn_input_pos,
+      attn_weights_softmax,
+      has_fused_qk_softmax);
+
   add_sdpa_compute_out_node(
-      graph, attn_weights_softmax, v_cache, q_projected, input_pos_symint, out);
+      graph, attn_weights_softmax, v_cache, q_projected, attn_input_pos, out);
 }
 
 void sdpa_with_kv_cache_impl(
@@ -801,11 +1028,21 @@ void sdpa_with_kv_cache_impl(
 
   (void)sequence_len;
 
+  // The caches start from their serialized (zero) contents: a masked attention
+  // reads every key in the cache, including the ones not written yet.
   utils::StorageType cache_storage = graph.storage_type_of(q_projected);
-  const ValueRef k_cache =
-      graph.add_tensor_like(k_cache_data, cache_storage, utils::kWidthPacked);
-  const ValueRef v_cache =
-      graph.add_tensor_like(v_cache_data, cache_storage, utils::kWidthPacked);
+  const ValueRef k_cache = prepack_standard(
+      graph,
+      k_cache_data,
+      cache_storage,
+      utils::kWidthPacked,
+      /*passthrough=*/true);
+  const ValueRef v_cache = prepack_standard(
+      graph,
+      v_cache_data,
+      cache_storage,
+      utils::kWidthPacked,
+      /*passthrough=*/true);
 
   update_cache_impl(graph, {k_projected, k_cache, input_pos_symint, -1});
   update_cache_impl(graph, {v_projected, v_cache, input_pos_symint, -1});
@@ -835,13 +1072,16 @@ void compute_attn_weight_with_kv_cache_impl(
   const ValueRef input_pos_symint = args[arg_idx++];
   const ValueRef sequence_len = args[arg_idx++];
   const ValueRef attn_mask = args[arg_idx++];
-  (void)attn_mask;
   const ValueRef dropout_p = args[arg_idx++];
   (void)dropout_p;
   const ValueRef is_causal = args[arg_idx++];
   (void)is_causal;
   const ValueRef scale = args[arg_idx++];
   (void)scale;
+
+  VK_CHECK_COND(
+      graph.val_is_none(attn_mask),
+      "attn_mask is not supported by compute_attn_weight_with_kv_cache");
 
   // Output tensors
   const ValueRef out = args[arg_idx++];

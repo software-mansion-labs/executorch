@@ -1408,6 +1408,7 @@ ComputeGraph setup_compute_graph(
   // DynamicDispatchNode to run its resize function on each execute(),
   // exercising the op's resize formula even when input shapes are unchanged.
   config.force_resize = test_case.get_force_resize();
+  config.force_narrow_int4_tile = test_case.get_force_narrow_int4_tile();
   ComputeGraph graph(config);
 
   std::vector<ValueRef> input_values;
