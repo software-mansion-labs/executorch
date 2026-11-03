@@ -366,6 +366,38 @@ utils::uvec3 create_conv2d_global_wg_size(
   }
 }
 
+// Determines which convolution method a dispatch uses.
+//
+// Depthwise and transposed convolutions have shader names of their own, but
+// the name alone cannot separate pointwise from sliding window: the sliding
+// window shader is itself named "conv2d", and a pointwise convolution also
+// takes that name when its weights are prepacked. Those two are therefore
+// separated by the weight's spatial extent. Shared by the global and local
+// workgroup size functions below so that the two cannot disagree about the
+// same dispatch.
+Conv2dMethod infer_conv2d_method_from_shader(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const ValueRef weight_data) {
+  const std::string& kernel_name = shader.kernel_name;
+  // Checked before the plain "conv2d" test below, which "conv2d_dw" and
+  // "conv2d_pw" would otherwise match too.
+  if (kernel_name.find("conv2d_dw") != std::string::npos) {
+    return Conv2dMethod::Depthwise;
+  }
+  if (kernel_name.find("conv2d_pw") != std::string::npos) {
+    return Conv2dMethod::Pointwise;
+  }
+  if (kernel_name.find("conv_transpose2d") != std::string::npos) {
+    return Conv2dMethod::Transposed;
+  }
+  const auto& weight_sizes = graph->get_tref(weight_data)->sizes;
+  if (weight_sizes.at(2) == 1 && weight_sizes.at(3) == 1) {
+    return Conv2dMethod::Pointwise;
+  }
+  return Conv2dMethod::SlidingWindow;
+}
+
 // Custom global workgroup size function for conv2d
 utils::uvec3 conv2d_global_wg_size(
     ComputeGraph* graph,
@@ -375,23 +407,8 @@ utils::uvec3 conv2d_global_wg_size(
   const ValueRef out = args.at(0).refs.at(0);
   const ValueRef weight_data = resize_args.at(0);
 
-  // Determine method from shader name
-  Conv2dMethod method;
-  if (shader.kernel_name.find("conv2d_pw") != std::string::npos ||
-      (shader.kernel_name.find("conv2d") != std::string::npos &&
-       shader.kernel_name.find("conv_transpose2d") == std::string::npos)) {
-    // Check if it's pointwise by examining weight sizes
-    const auto& weight_sizes = graph->get_tref(weight_data)->sizes;
-    if (weight_sizes.at(2) == 1 && weight_sizes.at(3) == 1) {
-      method = Conv2dMethod::Pointwise;
-    } else {
-      method = Conv2dMethod::SlidingWindow;
-    }
-  } else if (shader.kernel_name.find("conv_transpose2d") != std::string::npos) {
-    method = Conv2dMethod::Transposed;
-  } else {
-    method = Conv2dMethod::SlidingWindow;
-  }
+  const Conv2dMethod method =
+      infer_conv2d_method_from_shader(graph, shader, weight_data);
 
   // Determine stride_equals_dilation from shader name
   bool stride_equals_dilation =
@@ -420,28 +437,9 @@ utils::uvec3 conv2d_local_wg_size(
     const std::vector<ValueRef>& resize_args) {
   (void)args;
 
-  // Backport of infer_conv2d_method_from_shader from upstream main. The test
-  // here used to be "conv2d_pw" OR ("conv2d" AND NOT "conv_transpose2d"),
-  // whose second clause matches every conv2d shader there is, so the
-  // SlidingWindow branch below was unreachable and direct and depthwise
-  // convolutions were sized with the pointwise formula.
   const ValueRef weight_data = resize_args.at(0);
-  const std::string& kernel_name = shader.kernel_name;
-  Conv2dMethod method;
-  // Checked before the plain "conv2d" test, which conv2d_dw and conv2d_pw
-  // would otherwise match too.
-  if (kernel_name.find("conv2d_dw") != std::string::npos) {
-    method = Conv2dMethod::Depthwise;
-  } else if (kernel_name.find("conv2d_pw") != std::string::npos) {
-    method = Conv2dMethod::Pointwise;
-  } else if (kernel_name.find("conv_transpose2d") != std::string::npos) {
-    method = Conv2dMethod::Transposed;
-  } else {
-    const auto& weight_sizes = graph->get_tref(weight_data)->sizes;
-    method = (weight_sizes.at(2) == 1 && weight_sizes.at(3) == 1)
-        ? Conv2dMethod::Pointwise
-        : Conv2dMethod::SlidingWindow;
-  }
+  const Conv2dMethod method =
+      infer_conv2d_method_from_shader(graph, shader, weight_data);
 
   if (method == Conv2dMethod::Pointwise) {
     uint32_t local_wg_size_y = 1;
