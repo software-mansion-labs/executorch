@@ -31,6 +31,7 @@ from executorch.backends.qualcomm.tests.models import (
     Reciprocal,
     TopKandIndex,
 )
+from executorch.backends.qualcomm.utils.constants import QCOM_BLOCK_SIZE
 from executorch.backends.qualcomm.utils.utils import (
     generate_htp_compiler_spec,
     generate_qnn_executorch_compiler_spec,
@@ -692,6 +693,11 @@ class TestPasses(unittest.TestCase):
             is_linear_per_channel=True,
         )
         quantizer.set_block_size_map(block_size_map)
+        configs = quantizer.default_quant_config.per_block_quant_config_list
+        before = [
+            (c.block_size, dict(c.weight.observer_or_fake_quant_ctr.p.keywords))
+            for c in configs
+        ]
         prepared = prepare_pt2e(gm, quantizer)
         for _ in range(2):
             prepared(*sample_input)
@@ -702,7 +708,61 @@ class TestPasses(unittest.TestCase):
             if isinstance(module, PerBlockParamObserver)
         )
         self.assertEqual(observed, sorted(block_size_map.values()))
+        # the shared configs are left as they were
+        after = [
+            (c.block_size, dict(c.weight.observer_or_fake_quant_ctr.p.keywords))
+            for c in configs
+        ]
+        self.assertEqual(after, before)
+        self.assertTrue(all(QCOM_BLOCK_SIZE not in kw for _, kw in after))
         convert_pt2e(prepared)(*sample_input)
+
+    def test_recipe_keeps_each_per_block_strategy_block_size(self):
+        from executorch.backends.qualcomm.quantizer.observers.per_block_param_observer import (
+            PerBlockParamObserver,
+        )
+        from executorch.backends.qualcomm.quantizer.quant_recipe import (
+            QuantGranularity,
+            QuantRecipe,
+        )
+        from torchao.quantization.pt2e import MinMaxObserver
+
+        class TwoLinear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.a = torch.nn.Linear(512, 32)
+                self.b = torch.nn.Linear(32, 16)
+
+            def forward(self, x):
+                return self.b(self.a(x))
+
+        recipe = QuantRecipe(
+            QuantDtype.use_16a4w,
+            False,
+            act_observer=MinMaxObserver,
+            granularity=QuantGranularity.PER_TENSOR,
+        )
+        for regex, block_size in ((r"^a$", (1, 32)), (r"^b$", (1, 16))):
+            recipe.add_regex(
+                {regex},
+                QuantDtype.use_16a4w_block,
+                False,
+                act_observer=MinMaxObserver,
+                granularity=QuantGranularity.PER_BLOCK,
+                extra_kwargs={"block_size": block_size},
+            )
+        quantizer = QnnQuantizer()
+        quantizer.set_recipe(recipe)
+        sample_input = (torch.randn(3, 512),)
+        gm = torch.export.export(TwoLinear().eval(), sample_input).module()
+        prepared = prepare_pt2e(gm, quantizer)
+        prepared(*sample_input)
+        observed = sorted(
+            tuple(m.block_size)
+            for m in prepared.modules()
+            if isinstance(m, PerBlockParamObserver)
+        )
+        self.assertEqual(observed, [(1, 16), (1, 32)])
 
     def test_fp16a8w_conv_on_cpu_stays_fp16(self):
         """fp16a8w runs conv in fp16, but the HTP only takes it for 1x1 kernels, so a
