@@ -112,3 +112,27 @@ if(EXECUTORCH_MLX_ENABLE_SANITIZERS)
     mlx_eval_threshold_test PRIVATE ${_mlx_sanitizer_link_options}
   )
 endif()
+
+# Temp-slot release. Drives the interpreter over hand-built programs; no
+# model/tokenizer needed.
+et_cxx_test(
+  mlx_temp_release_test
+  SOURCES
+  ${CMAKE_CURRENT_LIST_DIR}/mlx_temp_release_test.cpp
+  EXTRA_LIBS
+  mlxdelegate
+  mlx_schema
+  mlx
+)
+target_include_directories(
+  mlx_temp_release_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../runtime
+)
+if(EXECUTORCH_MLX_ENABLE_SANITIZERS)
+  target_compile_options(
+    mlx_temp_release_test PRIVATE -fsanitize=address,undefined
+                                  -fno-omit-frame-pointer
+  )
+  target_link_options(
+    mlx_temp_release_test PRIVATE ${_mlx_sanitizer_link_options}
+  )
+endif()
