@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import functools
+import logging
 from typing import Optional
 
 import torch
@@ -14,6 +16,8 @@ from torch._export.utils import is_buffer, is_lifted_tensor_constant, is_param
 from torch.export import ExportedProgram
 
 _int64_max_dim_val = torch.iinfo(torch.int64).max - 1
+
+logger = logging.getLogger(__name__)
 
 
 def get_shape(input_node: torch.fx.Node):
@@ -34,17 +38,41 @@ def get_shape(input_node: torch.fx.Node):
     return upper_bound_shape
 
 
+def _is_mutated_buffer(node: torch.fx.Node, exported_program: ExportedProgram) -> bool:
+    """Whether `node` is a buffer the program writes back to."""
+    signature = exported_program.graph_signature
+    name = signature.inputs_to_buffers.get(node.name)
+    return name is not None and name in signature.buffers_to_mutate.values()
+
+
 # Dequantized constants are still known at build time. Quantized weights
 # reach mm/addmm through one of these, and backends rely on the rewrite to
 # `linear` to fuse the pair back into a quantized matmul, so they have to
-# count as constant here.
-_DEQUANT_TARGETS = (
+# count as constant here. Quantize ops are listed too because a weight that
+# was never constant-folded reaches the matmul as dq(q(param)).
+_QDQ_TARGETS = (
     exir_ops.edge.quantized_decomposed.dequantize_per_tensor.default,
     exir_ops.edge.quantized_decomposed.dequantize_per_tensor.tensor,
     exir_ops.edge.quantized_decomposed.dequantize_per_channel.default,
+    exir_ops.edge.quantized_decomposed.dequantize_per_channel_group.default,
     exir_ops.edge.quantized_decomposed.dequantize_per_token.default,
     exir_ops.edge.torchao.dequantize_affine.default,
+    exir_ops.edge.quantized_decomposed.quantize_per_tensor.default,
+    exir_ops.edge.quantized_decomposed.quantize_per_tensor.tensor,
+    exir_ops.edge.quantized_decomposed.quantize_per_channel.default,
+    exir_ops.edge.quantized_decomposed.quantize_per_channel_group.default,
+    exir_ops.edge.quantized_decomposed.quantize_per_token.default,
+    exir_ops.edge.torchao.quantize_affine.default,
 )
+
+
+@functools.cache
+def _warn_no_exported_program() -> None:
+    logger.warning(
+        "addmm/mm to linear: no ExportedProgram was passed, so matmuls whose "
+        "weight is a placeholder (including parameters) are not rewritten to "
+        "linear. Pass the owning program to enable the rewrite."
+    )
 
 
 def is_constant_tensor(
@@ -60,8 +88,8 @@ def is_constant_tensor(
     """
     if node.op == "get_attr":
         return True
-    if node.op == "call_function" and node.target in _DEQUANT_TARGETS:
-        # Constant only if everything it dequantizes is itself constant.
+    if node.op == "call_function" and node.target in _QDQ_TARGETS:
+        # Constant only if every tensor it (de)quantizes is itself constant.
         return all(
             is_constant_tensor(arg, exported_program)
             for arg in node.args
@@ -71,13 +99,20 @@ def is_constant_tensor(
         return False
     if exported_program is None:
         # Without the owning program a lifted parameter cannot be told apart
-        # from a user input. Placeholders were always rewritten before, so keep
-        # accepting them rather than regressing callers that pass no program.
+        # from a user input, and prepacking a user input would bake in whatever
+        # the first call passed. Every in-tree caller threads the program, so
+        # take the safe side and leave the matmul alone.
+        _warn_no_exported_program()
+        return False
+    if is_param(exported_program, node) or is_lifted_tensor_constant(
+        exported_program, node
+    ):
         return True
-    return (
-        is_param(exported_program, node)
-        or is_buffer(exported_program, node)
-        or is_lifted_tensor_constant(exported_program, node)
+    # A buffer the program mutates is state, not a build-time constant:
+    # prepacking it would freeze the value the delegate was built with and go
+    # on returning it after the buffer has moved on.
+    return is_buffer(exported_program, node) and not _is_mutated_buffer(
+        node, exported_program
     )
 
 
