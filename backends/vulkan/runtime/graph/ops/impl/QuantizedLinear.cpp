@@ -312,7 +312,9 @@ vkapi::ShaderInfo pick_linear_qw_shader(
   if (weight_is_4bit && is_gemv_case) {
     kernel_name += "_coop";
   } else if (
-      weight_is_4bit && graph->device_is_mali()) {
+      weight_is_4bit &&
+      (graph->device_is_mali() ||
+       graph->graphconfig().force_narrow_int4_tile)) {
     // Mali cannot afford the default 4x8 output tile. Measured on a Mali-G76
     // with the FLOAT linear kernel, where widening the tile from 4x4 to 4x8 is
     // the only change: 5.07 s -> 27.45 s, 5.4x. The same widening costs 1.12x
@@ -839,6 +841,7 @@ void quantized_linear_impl(
   // 1. Device does not support int8 dot product
   // 2. Input is not quantized
   if (!graph.can_use_int8_dot_product() ||
+      graph.graphconfig().force_narrow_int4_tile ||
       input_quant_config.granularity == kNoQuantization) {
     add_linear_qw_node(
         graph,
