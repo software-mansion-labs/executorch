@@ -276,8 +276,10 @@ vkapi::ShaderInfo pick_linear_qw_shader(
       weight_is_4bit && graph->dtype_of(packed_weight_scales) == vkapi::kFloat;
 
   // Use the coopmat shader for 4-bit, non-gemv, buffer-output, half-dtype
-  // dispatches when shape alignment allows; tiled remains the fallback.
-  if (weight_is_4bit && !is_gemv_case) {
+  // dispatches when shape alignment allows; tiled remains the fallback. The
+  // coopmat shader reads the scales in the output dtype, so fp32 scales take
+  // the tiled path.
+  if (weight_is_4bit && !is_gemv_case && !scale_is_fp32) {
     const int64_t group_size =
         graph->extract_scalar<int64_t>(resize_args.at(0));
     if (can_use_q4gsw_coopmat(
@@ -359,7 +361,7 @@ vkapi::ShaderInfo pick_linear_dqa_qw_shader(
   // Use the coopmat<int8> shader for 4-bit dq8ca dispatches when the device
   // enumerates VK_COMPONENT_TYPE_SINT8_KHR in its cooperative matrix property
   // list and the shape aligns; tiled otherwise.
-  if (weight_is_4bit && !is_gemv_case &&
+  if (weight_is_4bit && !is_gemv_case && !scale_is_fp32 &&
       graph->context()->adapter_ptr()->supports_int8_cooperative_matrix()) {
     const int64_t group_size =
         graph->extract_scalar<int64_t>(resize_args.at(0));
@@ -765,6 +767,20 @@ void add_linear_dqa_qw_node(
 // High level operator impl
 //
 
+// Every quantized linear shader reads the weight scales in the output dtype,
+// but an fp16 model quantized from a bf16 or fp32 checkpoint may keep fp32
+// scales. Convert them while prepacking instead of letting the shader
+// misinterpret the bytes.
+static ValueRef prepack_weight_scales_as(
+    ComputeGraph& graph,
+    const ValueRef data,
+    const vkapi::ScalarType dtype) {
+  const ValueRef tensor = graph.add_tensor(
+      graph.sizes_of(data), dtype, utils::kBuffer, utils::kWidthPacked);
+  add_prepack_standard_node(graph, data, tensor);
+  return tensor;
+}
+
 void quantized_linear_impl(
     ComputeGraph& graph,
     const QuantizationConfig& input_quant_config,
@@ -792,8 +808,16 @@ void quantized_linear_impl(
 
   const ValueRef packed_weight =
       prepack_quantized_linear_weight(graph, weight_quant_config, weight_data);
-  const ValueRef packed_weight_scales = prepack_standard(
-      graph, weight_scales_data, utils::kBuffer, utils::kWidthPacked);
+  // The 4-bit tiled and coop shaders have _scalefp32 variants that read fp32
+  // scales directly, so keep those in fp32. Every other path reads the scales
+  // in the output dtype.
+  const bool keep_fp32_scales = weight_quant_config.nbits == 4 &&
+      graph.dtype_of(weight_scales_data) == vkapi::kFloat;
+  const ValueRef packed_weight_scales = keep_fp32_scales
+      ? prepack_standard(
+            graph, weight_scales_data, utils::kBuffer, utils::kWidthPacked)
+      : prepack_weight_scales_as(
+            graph, weight_scales_data, graph.dtype_of(output));
   // Weight affine quant not supported at the moment
   const ValueRef packed_weight_zeros = kDummyValueRef;
 
