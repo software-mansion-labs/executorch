@@ -11,7 +11,12 @@ import random
 import unittest
 from typing import List
 
+import executorch.backends.vulkan.custom_ops_lib  # noqa: F401
 import torch
+from executorch.backends.vulkan.partitioner.vulkan_partitioner import VulkanPartitioner
+from executorch.backends.vulkan.serialization import (
+    vulkan_graph_builder as graph_builder_module,
+)
 
 from executorch.backends.vulkan.serialization.vulkan_graph_schema import (
     IntList,
@@ -27,6 +32,7 @@ from executorch.backends.vulkan.serialization.vulkan_graph_serialize import (
     serialize_vulkan_graph,
     VulkanDelegateHeader,
 )
+from executorch.exir import to_edge_transform_and_lower
 
 
 class TestSerialization(unittest.TestCase):
@@ -45,6 +51,39 @@ class TestSerialization(unittest.TestCase):
             tensors.append(tensor)
 
         return tensors
+
+    def test_mutation_aliasing_user_output_gets_one_slot(self) -> None:
+        # A mutated buffer returned through a view: once the view is removed
+        # the mutation and the user output are the same node. The partitioner
+        # tags mutated buffers into the delegate, so the mutation is applied in
+        # place and only the user output takes a slot.
+        class Model(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.register_buffer("state", torch.zeros(2, 48))
+
+            def forward(self, x):
+                self.state.add_(x)
+                return self.state.view(2, 48)
+
+        captured: List[int] = []
+        original = graph_builder_module.VkGraphBuilder.build_graph
+
+        def spy(builder_self, _original=original, _captured=captured):
+            graph = _original(builder_self)
+            _captured.append(len(graph.output_ids))
+            return graph
+
+        graph_builder_module.VkGraphBuilder.build_graph = spy
+        try:
+            program = torch.export.export(Model(), (torch.ones(2, 48),), strict=True)
+            to_edge_transform_and_lower(
+                program, partitioner=[VulkanPartitioner()]
+            ).to_executorch()
+        finally:
+            graph_builder_module.VkGraphBuilder.build_graph = original
+
+        self.assertEqual(captured, [1])
 
     def test_serialize_vulkan_binary(self) -> None:
         vk_graph = VkGraph(

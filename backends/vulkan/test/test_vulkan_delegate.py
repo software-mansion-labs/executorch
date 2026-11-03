@@ -1612,6 +1612,69 @@ class TestVulkanBackend(unittest.TestCase):
             sample_inputs,
         )
 
+    def test_vulkan_backend_redundant_view_to_output(self):
+        # Returning a value and a redundant view of it: once the view is
+        # removed, both outputs are the same node. The serializer must still
+        # emit two output ids, or the runtime's argument count check fails.
+        class RedundantViewToOutputModule(torch.nn.Module):
+            def forward(self, x):
+                y = x + 1
+                return y, y.view(2, 48)
+
+        sample_inputs = (torch.randn(size=(2, 48), dtype=torch.float32),)
+
+        self.lower_module_and_test_output(
+            RedundantViewToOutputModule(),
+            sample_inputs,
+        )
+
+    def test_vulkan_backend_buffer_mutation_aliasing_user_output(self):
+        # A mutated buffer returned through a redundant view. The partitioner
+        # tags mutated buffers into the delegate, so the mutation is applied in
+        # place. Once the view is removed the buffer-mutation
+        # slot and the user output are the same node, but only the user output
+        # gets a slot in the delegate call, so keeping both would leave the
+        # serialized graph expecting one argument more than the call provides.
+        #
+        # Run it twice: the state has to carry over, which is what says the
+        # mutation is really being applied in place rather than quietly
+        # dropped along with its output slot.
+        class MutationAliasModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("state", torch.zeros(2, 48))
+
+            def forward(self, x):
+                self.state.add_(x)
+                return self.state.view(2, 48)
+
+        sample_inputs = (torch.ones(size=(2, 48), dtype=torch.float32),)
+        test_inputs = [(torch.ones(size=(2, 48), dtype=torch.float32),)]
+
+        self.lower_module_and_test_output(
+            MutationAliasModule(),
+            sample_inputs,
+            test_inputs=test_inputs,
+        )
+
+    def test_vulkan_backend_view_chain_collapsing_to_input_shape(self):
+        # A chain of views whose net effect is the original shape. Fusing the
+        # chain leaves a view onto the shape it started from, which the
+        # redundant-op sweep then removes; the output count must survive both
+        # rewrites.
+        class ViewChainModule(torch.nn.Module):
+            def forward(self, x):
+                y = x + 1
+                z = y.view(4, 24).view(8, 12).view(2, 48)
+                return y, z
+
+        sample_inputs = (torch.randn(size=(2, 48), dtype=torch.float32),)
+
+        self.lower_module_and_test_output(
+            ViewChainModule(),
+            sample_inputs,
+        )
+
     def test_vulkan_backend_view_int(self):
         class ViewModule(torch.nn.Module):
             def __init__(self):
