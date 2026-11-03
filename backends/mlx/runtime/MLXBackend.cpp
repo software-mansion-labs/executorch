@@ -234,8 +234,10 @@ class MLXBackend final : public ::executorch::runtime::BackendInterface {
 
       // Per-model lazy-graph evaluation threshold (optional runtime spec,
       // keyed per delegate). Configured here, before the init chain runs
-      // below, so the init chain is covered by the same setting. 0/unset
-      // disables the mechanism and is the default.
+      // below, so the init chain is covered by the same setting. 0 disables
+      // the mechanism. Unset defaults to 512 MB on this fork, the budget the
+      // fork shipped before (Whisper-small: 12 barriers in encode, 0 in decode).
+      handle->interpreter.set_eval_threshold_bytes(size_t{512} << 20);
       if (auto spec = context.get_runtime_spec<int>(kEvalThresholdBytesKey);
           spec.ok()) {
         const int bytes = spec.get();
