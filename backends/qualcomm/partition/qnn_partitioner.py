@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 from executorch.backends.qualcomm.builders import node_visitor_manager
-from executorch.backends.qualcomm.builders.node_visitor import dq_ops
 from executorch.backends.qualcomm.builders.qnn_constants import OpContextLoader
 from executorch.backends.qualcomm.builders.utils import is_parameter
 from executorch.backends.qualcomm.qnn_preprocess import QnnBackend
@@ -50,6 +49,13 @@ from .utils import filter_fn, generate_qnn_executorch_option, get_skip_decomp_ta
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+# dequantize ops with a CPU out variant; others cannot fall back
+CPU_DQ_OPS = {
+    exir_ops.edge.quantized_decomposed.dequantize_per_tensor.default,
+    exir_ops.edge.quantized_decomposed.dequantize_per_tensor.tensor,
+    exir_ops.edge.quantized_decomposed.dequantize_per_channel.default,
+}
 
 
 class QnnOperatorSupport(OperatorSupportBase):
@@ -231,23 +237,16 @@ class QnnPartitioner(Partitioner):
         partitions: List[Partition], edge_program: torch.export.ExportedProgram
     ) -> List[Partition]:
         """
-        FoldQDQ keeps the dequantize of a quantized parameter and marks it (and the
-        nodes feeding it) QCOM_BYPASS_NODE, so it is force-passed and delegated with its
-        consumer, where the encoding is folded into the weight. If the consumer is not
-        delegated (rejected by op validation, or in skip_node_id_set), the dequantize
-        would be lowered on its own as a QNN Dequantize, which rejects per-channel
-        encodings and fails context binary generation. Leave it on CPU with its consumer.
+        A parameter dequantize whose consumer is not delegated stays on CPU. A QNN
+        Dequantize alone rejects per-channel encodings.
         """
         for partition in partitions:
             stack = [
                 node
                 for node in partition.nodes
-                if node.target in dq_ops
+                if node.target in CPU_DQ_OPS
                 and node.meta.get(QCOM_BYPASS_NODE, False)
-                and (
-                    is_parameter(node.args[0], edge_program)
-                    or node.args[0].op == "get_attr"
-                )
+                and is_parameter(node.args[0], edge_program)
             ]
             while stack:
                 node = stack.pop()
