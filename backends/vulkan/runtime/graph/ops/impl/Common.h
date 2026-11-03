@@ -113,6 +113,8 @@ utils::uvec3 default_pick_local_wg_size(
  * H unique rows = H * K unique elements from the input tensor and W unique cols
  * = W * K elements from the weight tensor, resulting in (W + H) * K unique
  * elements in total.
+ *
+ * On Adreno the shape is not square: see pick_adreno_hw_wg_size.
  */
 utils::uvec3 pick_hw_square_wg_size(
     ComputeGraph* graph,
@@ -120,6 +122,13 @@ utils::uvec3 pick_hw_square_wg_size(
     const utils::uvec3& global_workgroup_size,
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args);
+
+/**
+ * The Adreno branch of pick_hw_square_wg_size, separate so it can be tested
+ * without a device. Prefers a 2:1 x:y shape (16x4x1 at 64 threads) and never
+ * returns 8x8x1 or 4x16x1, which Adreno miscomputes (#22327).
+ */
+utils::uvec3 pick_adreno_hw_wg_size(const utils::uvec3& global_workgroup_size);
 
 utils::uvec3 pick_wc_square_wg_size(
     ComputeGraph* graph,

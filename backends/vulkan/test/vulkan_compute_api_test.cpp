@@ -31,6 +31,8 @@
 
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Int8x4Staging.h>
 
+#include <executorch/backends/vulkan/runtime/graph/ops/impl/Common.h>
+
 using namespace vkcompute;
 using namespace vkcompute::api;
 
@@ -3334,6 +3336,33 @@ TEST(VulkanComputeGraphTest, test_int8x4_staging_round_trip) {
   for (const auto& sizes : standard_sizes_to_test) {
     for (const auto layout : layouts) {
       test_int8x4_staging_round_trip(sizes, layout);
+    }
+  }
+}
+
+TEST(VulkanWorkGroupSizeTest, adreno_hw_wg_size) {
+  EXPECT_EQ(
+      pick_adreno_hw_wg_size({96u, 375u, 1u}), utils::uvec3({16u, 4u, 1u}));
+  EXPECT_EQ(
+      pick_adreno_hw_wg_size({14u, 375u, 1u}), utils::uvec3({16u, 4u, 1u}));
+  // Narrow X, tall Y.
+  EXPECT_EQ(
+      pick_adreno_hw_wg_size({13u, 375u, 1u}), utils::uvec3({2u, 32u, 1u}));
+  EXPECT_EQ(
+      pick_adreno_hw_wg_size({8u, 1024u, 1u}), utils::uvec3({2u, 32u, 1u}));
+  EXPECT_EQ(
+      pick_adreno_hw_wg_size({4u, 1024u, 1u}), utils::uvec3({2u, 32u, 1u}));
+  // Narrow X and short Y: 2x32x1 would idle more than 16x4x1.
+  EXPECT_EQ(pick_adreno_hw_wg_size({8u, 8u, 4u}), utils::uvec3({16u, 4u, 1u}));
+  EXPECT_EQ(pick_adreno_hw_wg_size({8u, 16u, 1u}), utils::uvec3({16u, 4u, 1u}));
+
+  for (uint32_t x = 1u; x <= 64u; ++x) {
+    for (uint32_t y = 1u; y <= 128u; ++y) {
+      for (uint32_t z = 1u; z <= 2u; ++z) {
+        const utils::uvec3 lwg = pick_adreno_hw_wg_size({x, y, z});
+        EXPECT_NE(lwg, utils::uvec3({8u, 8u, 1u}));
+        EXPECT_NE(lwg, utils::uvec3({4u, 16u, 1u}));
+      }
     }
   }
 }
