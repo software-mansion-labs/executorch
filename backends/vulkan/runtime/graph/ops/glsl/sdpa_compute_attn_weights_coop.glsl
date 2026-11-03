@@ -26,6 +26,8 @@ $if MASK_PER_HEAD == 1:
   #define MASK_PER_HEAD
 $if HAS_SOFTCAP == 1:
   #define HAS_SOFTCAP
+$if MASK_2D == 1:
+  #define HAS_MASK_2D
 
 #define TILE_K4 ${TILE_K4}
 #define TILE_N4 ${TILE_N4}
@@ -56,10 +58,14 @@ ${layout_declare_tensor(B, "r", "t_q", DTYPE, IO_STORAGE, is_scalar_array=False)
 ${layout_declare_tensor(B, "r", "t_k", DTYPE, K_CACHE_STORAGE, is_scalar_array=False)}
 $if HAS_MASK == 1:
   ${layout_declare_tensor(B, "r", "t_attn_mask", DTYPE, IO_STORAGE, is_scalar_array=False)}
+$if MASK_2D == 1:
+  ${layout_declare_tensor(B, "r", "t_mask", DTYPE, IO_STORAGE, is_scalar_array=True)}
 
 ${layout_declare_ubo(B, "ivec4", "q_projected_sizes")}
 ${layout_declare_ubo(B, "ivec4", "k_cache_sizes")}
 ${layout_declare_ubo(B, "int", "input_pos")}
+$if MASK_2D == 1:
+  ${layout_declare_ubo(B, "ivec4", "mask_sizes")}
 
 $if HAS_SOFTCAP == 1:
   layout(push_constant) uniform restrict Block {
@@ -149,7 +155,8 @@ bool compute_attn_weight_tile(
   FPInputTile q_tile;
   FPWeightTile w_tile;
 
-#ifdef HAS_MASK
+#if defined(HAS_MASK) || defined(HAS_MASK_2D)
+  // The additive attn_mask replaces the causal mask, so no tile can be skipped.
   bool tile_in_mask_region = false;
 #else
   // If the tile is completely inside the mask region, then there is no need to
@@ -217,6 +224,9 @@ void apply_scale_and_mask_to_tile(
   // Audio extension (Phase 2B): tanh(x/cap) * cap, AFTER mask add.
   apply_softcap_tile(out_tile, T(softcap), T(inv_softcap));
 #endif
+#elif defined(HAS_MASK_2D)
+  apply_scale(out_tile, inv_scale);
+  apply_attn_mask(out_tile, c, s);
 #else
   apply_scale_and_mask(
     out_tile,
