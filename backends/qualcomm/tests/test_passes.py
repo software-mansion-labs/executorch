@@ -578,7 +578,7 @@ class TestPasses(unittest.TestCase):
                 self.skipTest(f"QNN SDK not available: {e}")
 
     def _assert_cpu_conv_keeps_its_weight_dequantize(
-        self, quant_dtype, use_fp16, skip_node_id_set=None, emit=True
+        self, quant_dtype, use_fp16, skip_node_id_set=None
     ):
         """A quantized conv kept off QNN must take its per-channel weight dequantize
         with it. FoldQDQ force-passes that dequantize, so it used to be lowered alone
@@ -637,8 +637,7 @@ class TestPasses(unittest.TestCase):
         self.assertTrue(dequants)
         for dequant in dequants:
             self.assertEqual(list(dequant.users), convs)
-        if emit:
-            edge.to_executorch()
+        edge.to_executorch()
 
     def test_skipped_conv_keeps_its_weight_dequantize_on_cpu(self):
         self._assert_cpu_conv_keeps_its_weight_dequantize(
@@ -648,10 +647,9 @@ class TestPasses(unittest.TestCase):
         )
 
     def test_rejected_conv_keeps_its_weight_dequantize_on_cpu(self):
-        # the HTP rejects fp16-activation/int8-weight depthwise conv. Not emitted:
-        # InsertCastForFpActQuantizedWeight casts the CPU conv's bias meta to fp16.
+        # the HTP rejects fp16-activation/int8-weight depthwise conv
         self._assert_cpu_conv_keeps_its_weight_dequantize(
-            QuantDtype.use_fp16a8w, use_fp16=True, emit=False
+            QuantDtype.use_fp16a8w, use_fp16=True
         )
 
     def test_block_size_is_per_node(self):
@@ -750,14 +748,21 @@ class TestPasses(unittest.TestCase):
         convs = [
             node
             for node in program.graph.nodes
-            if node.op == "call_function"
-            and getattr(node.target, "__name__", "") == "aten.convolution.default"
+            if node.target == exir_ops.edge.aten.convolution.default
         ]
         self.assertEqual([conv.name for conv in convs], ["aten_convolution_default_1"])
         weight, bias = convs[0].args[1], convs[0].args[2]
         self.assertEqual(weight.kwargs.get("out_dtype"), torch.float16)
-        bias_name = program.graph_signature.inputs_to_parameters[bias.name]
-        self.assertEqual(program.state_dict[bias_name].dtype, torch.float16)
+        self.assertEqual(weight.meta["val"].dtype, torch.float16)
+        self.assertEqual(bias.meta["val"].dtype, torch.float16)
+        bias_name = program.graph_signature.inputs_to_buffers[bias.name]
+        # an fp16 copy of the caller's bias
+        torch.testing.assert_close(
+            program.state_dict[bias_name],
+            quantized.state_dict()["k3.bias"].detach().to(torch.float16),
+            rtol=0,
+            atol=0,
+        )
         # the cast must not reach back into the caller's module
         self.assertEqual(
             {t.dtype for t in quantized.state_dict().values() if t.is_floating_point()},
