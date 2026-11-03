@@ -12,6 +12,7 @@ from executorch.backends.qualcomm._passes import (
     FoldQDQ,
     InsertIOQDQ,
     InsertReshapeForReduceOps,
+    LiftConstantScalarOperands,
     RemoveRedundancy,
 )
 from executorch.backends.qualcomm._passes.qnn_pass_manager import (
@@ -770,6 +771,40 @@ class TestPasses(unittest.TestCase):
                 self.skipTest(f"QNN SDK not available: {e}")
             raise
         edge.to_executorch()
+
+    def test_lift_int_floor_divide_scalar(self):
+        """A Python scalar divisor, as in `indices // num_classes`, is lifted to an
+        int32 constant so the integer floor_divide stays exact."""
+
+        class IntFloorDivScalar(torch.nn.Module):
+            def __init__(self, divisor):
+                super().__init__()
+                self.divisor = divisor
+
+            def forward(self, x):
+                return x // self.divisor
+
+        int_inputs = (torch.randint(-10, 10, (3, 4), dtype=torch.int32),)
+        for divisor in (3, -4):
+            with self.subTest(msg=f"int_floor_divide_scalar_{divisor}"):
+                module = IntFloorDivScalar(divisor)
+                gm = torch.export.export(module, int_inputs).module()
+                gm = LiftConstantScalarOperands()(gm).graph_module
+                floor_divide = next(
+                    n
+                    for n in gm.graph.nodes
+                    if n.op == "call_function"
+                    and n.target is torch.ops.aten.floor_divide.default
+                )
+                lifted = floor_divide.args[1]
+                self.assertTrue(
+                    isinstance(lifted, torch.fx.Node) and lifted.op == "get_attr",
+                    f"divisor should be a lifted get_attr, got {lifted}",
+                )
+                constant = getattr(gm, lifted.target)
+                self.assertEqual(constant.dtype, torch.int32)
+                self.assertEqual(constant.item(), divisor)
+                torch.testing.assert_close(gm(*int_inputs), module(*int_inputs))
 
     def test_fuse_batch_norm_with_conv(self):
         """In HTP fp16 a standalone BatchNorm multiplies the convolution's rounding
