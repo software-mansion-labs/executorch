@@ -9,8 +9,6 @@
 #include <executorch/backends/vulkan/runtime/graph/Logging.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Common.h>
 
-#include <algorithm>
-
 namespace vkcompute {
 
 //
@@ -124,36 +122,14 @@ utils::uvec3 default_pick_local_wg_size(
 // shaders have no shared memory and no barriers and their invocations are
 // independent, so the result cannot legitimately depend on the group shape.
 // A 2:1 x:y ratio, which yields 16x4x1 at the default 64 threads, is correct
-// across every run measured and is the cheapest correct shape; 2x32x1 is also
-// correct. Only measured on Adreno 840. See #22327.
-namespace {
-
-uint64_t dispatched_invocations(
-    const utils::uvec3& lwg,
-    const utils::uvec3& global_workgroup_size) {
-  uint64_t total = 1u;
-  for (uint32_t axis = 0u; axis < 3u; ++axis) {
-    const uint64_t local = lwg[axis];
-    const uint64_t global = std::max<uint64_t>(global_workgroup_size[axis], 1u);
-    total *= utils::div_up(global, local) * local;
-  }
-  return total;
-}
-
-} // namespace
-
+// across every run measured and is the cheapest correct shape. 2x32x1 is also
+// correct but 1.4x slower on narrow grids. Only measured on Adreno 840. See
+// #22327.
 utils::uvec3 pick_adreno_hw_wg_size(const utils::uvec3& global_workgroup_size) {
-  const utils::uvec3 wide_x{16u, 4u, 1u};
-  // A grid narrower than 14 leaves much of a 16-wide group idle. Use 2x32x1
-  // instead when it dispatches fewer invocations, which it does unless Y is
-  // short too.
-  const utils::uvec3 narrow_x{2u, 32u, 1u};
-  if (global_workgroup_size[0u] < 14u &&
-      dispatched_invocations(narrow_x, global_workgroup_size) <
-          dispatched_invocations(wide_x, global_workgroup_size)) {
-    return narrow_x;
-  }
-  return wide_x;
+  // A grid narrower than the group idles some X lanes, which still costs less
+  // than 2x32x1 does.
+  (void)global_workgroup_size;
+  return {16u, 4u, 1u};
 }
 
 utils::uvec3 pick_hw_square_wg_size(
