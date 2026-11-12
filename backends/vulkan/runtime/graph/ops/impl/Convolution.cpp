@@ -637,6 +637,188 @@ void add_conv2d_node(
       resize_conv2d_node));
 }
 
+// Buffer-backed conv1d with stride 1 and one group: conv1d_lds, a shared-memory
+// tiled implicit matmul over the weight's rows x the output columns with
+// in_channels * kernel_size terms (conv1d_direct for at most 4 rows). The
+// optional tensors, `phases` and `crop` are et_vk.conv1d_fused's fusions.
+struct Conv1dFusion {
+  ValueRef in_snake = kDummyValueRef;
+  ValueRef out_snake = kDummyValueRef;
+  ValueRef residual = kDummyValueRef;
+  int32_t phases = 1;
+  int32_t crop = 0;
+};
+
+void add_conv1d_lds_node(
+    ComputeGraph& graph,
+    const ValueRef in,
+    const ValueRef weight,
+    const ValueRef bias,
+    const int32_t dilation_size,
+    const int32_t padding_size,
+    const Conv1dFusion& fusion,
+    const ValueRef out,
+    const std::vector<ValueRef>& resize_args,
+    const ExecuteNode::ResizeFunction& resize_fn) {
+  const ValueRef arg_weight =
+      prepack_standard(graph, weight, utils::kBuffer, utils::kWidthPacked);
+  const ValueRef arg_bias = prepack_biases(
+      graph,
+      bias,
+      weight,
+      /*transposed = */ false,
+      utils::kBuffer,
+      utils::kWidthPacked);
+  auto present = [&](const ValueRef v) {
+    return v != kDummyValueRef && !graph.val_is_none(v);
+  };
+  // Unused bindings get any buffer; the shader does not read them.
+  int32_t flags = 0;
+  ValueRef in_snake = arg_bias;
+  ValueRef out_snake = arg_bias;
+  ValueRef residual = in;
+  if (present(fusion.in_snake)) {
+    in_snake = prepack_standard(
+        graph, fusion.in_snake, utils::kBuffer, utils::kWidthPacked);
+    flags |= 1;
+  }
+  if (present(fusion.out_snake)) {
+    out_snake = prepack_standard(
+        graph, fusion.out_snake, utils::kBuffer, utils::kWidthPacked);
+    flags |= 2;
+  }
+  if (present(fusion.residual)) {
+    residual = fusion.residual;
+    flags |= 4;
+  }
+
+  const std::vector<int64_t> weight_sizes = graph.sizes_of(weight);
+  const int64_t rows = weight_sizes.at(0);
+  const int32_t kernel_size = static_cast<int32_t>(weight_sizes.at(2));
+  const bool direct = rows <= 4 && fusion.phases == 1 && (flags & 6) == 0 &&
+      4 + dilation_size * (kernel_size - 1) <= 32;
+  const bool short_tile = !direct && rows <= 32;
+  std::string kernel_name(
+      direct ? "conv1d_direct"
+             : (short_tile ? "conv1d_lds_m32" : "conv1d_lds"));
+  add_dtype_suffix(kernel_name, graph.dtype_of(out));
+
+  // Matmul columns: the convolution's own output length.
+  const int32_t span = dilation_size * (kernel_size - 1) - 2 * padding_size;
+  auto global_wg = [direct, short_tile, span](
+                       ComputeGraph* g,
+                       const vkapi::ShaderInfo& shader,
+                       const std::vector<ArgGroup>& a,
+                       const std::vector<ValueRef>& r) -> utils::uvec3 {
+    (void)shader;
+    (void)r;
+    const ValueRef o = a.at(0).refs.at(0);
+    const ValueRef i = a.at(1).refs.at(0);
+    if (direct) {
+      return {utils::div_up(g->size_at<uint32_t>(-1, o), 4u), 1u, 1u};
+    }
+    const uint32_t columns =
+        static_cast<uint32_t>(g->size_at<int32_t>(-1, i) - span);
+    const uint32_t rows =
+        static_cast<uint32_t>(g->sizes_of(a.at(1).refs.at(1)).at(0));
+    if (short_tile) {
+      return {
+          utils::div_up(columns, 64u) * 16u, utils::div_up(rows, 32u) * 4u, 1u};
+    }
+    return {
+        utils::div_up(columns, 64u) * 8u, utils::div_up(rows, 64u) * 8u, 1u};
+  };
+  auto local_wg = [direct, short_tile](
+                      ComputeGraph* g,
+                      const vkapi::ShaderInfo& shader,
+                      const utils::uvec3& global,
+                      const std::vector<ArgGroup>& a,
+                      const std::vector<ValueRef>& r) -> utils::uvec3 {
+    (void)g;
+    (void)shader;
+    (void)global;
+    (void)a;
+    (void)r;
+    if (direct) {
+      return {64u, 1u, 1u};
+    }
+    return short_tile ? utils::uvec3{16u, 4u, 1u} : utils::uvec3{8u, 8u, 1u};
+  };
+
+  graph.execute_nodes().emplace_back(new DynamicDispatchNode(
+      graph,
+      VK_KERNEL_FROM_STR(kernel_name),
+      global_wg,
+      local_wg,
+      {{out, vkapi::kWrite},
+       {{in, arg_weight, arg_bias, in_snake, out_snake, residual},
+        vkapi::kRead}},
+      {graph.sizes_ubo(in), graph.sizes_ubo(out)},
+      {},
+      {kernel_size,
+       dilation_size,
+       padding_size,
+       fusion.phases,
+       fusion.crop,
+       flags},
+      resize_args,
+      resize_fn));
+}
+
+void resize_conv1d_fused_node(
+    ComputeGraph* graph,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& extra_args) {
+  const ValueRef out = args.at(0).refs.at(0);
+  const ValueRef self = args.at(1).refs.at(0);
+  const std::vector<int64_t>& weight_sizes =
+      graph->get_tref(extra_args.at(0))->sizes;
+  const int64_t dilation = graph->extract_scalar<int64_t>(extra_args.at(1));
+  const int64_t padding = graph->extract_scalar<int64_t>(extra_args.at(2));
+  const int64_t phases = graph->extract_scalar<int64_t>(extra_args.at(3));
+  const std::vector<int64_t> in_sizes = graph->sizes_of(self);
+  const int64_t length = in_sizes.at(2);
+  std::vector<int64_t> out_sizes = in_sizes;
+  out_sizes.at(1) = weight_sizes.at(0) / phases;
+  out_sizes.at(2) = phases > 1
+      ? length * phases
+      : length + 2 * padding - dilation * (weight_sizes.at(2) - 1);
+  graph->virtual_resize(out, out_sizes);
+}
+
+// et_vk.conv1d_fused(x, weight, bias, dilation, padding, in_snake, out_snake,
+// residual, phases, crop) -> out: conv1d_lds with its fusions; buffers only.
+void conv1d_fused(ComputeGraph& graph, const std::vector<ValueRef>& args) {
+  const ValueRef in = args.at(0);
+  const ValueRef out = args.at(10);
+  const int64_t terms =
+      graph.size_at<int64_t>(-2, in) * graph.sizes_of(args.at(1)).at(2);
+  VK_CHECK_COND(
+      graph.is_buffer_storage(in) && graph.is_buffer_storage(out) &&
+          graph.packed_dim_of(in) == WHCN::kWidthDim &&
+          graph.packed_dim_of(out) == WHCN::kWidthDim && terms % 16 == 0,
+      "conv1d_fused needs width-packed buffers and in_channels * kernel_size "
+      "divisible by 16");
+  Conv1dFusion fusion;
+  fusion.in_snake = args.at(5);
+  fusion.out_snake = args.at(6);
+  fusion.residual = args.at(7);
+  fusion.phases =
+      static_cast<int32_t>(graph.extract_scalar<int64_t>(args.at(8)));
+  fusion.crop = static_cast<int32_t>(graph.extract_scalar<int64_t>(args.at(9)));
+  add_conv1d_lds_node(
+      graph,
+      in,
+      args.at(1),
+      args.at(2),
+      static_cast<int32_t>(graph.extract_scalar<int64_t>(args.at(3))),
+      static_cast<int32_t>(graph.extract_scalar<int64_t>(args.at(4))),
+      fusion,
+      out,
+      {args.at(1), args.at(3), args.at(4), args.at(8)},
+      resize_conv1d_fused_node);
+}
+
 void add_conv1d_node(
     ComputeGraph& graph,
     const ValueRef in,
@@ -650,6 +832,34 @@ void add_conv1d_node(
     const ValueRef out_max,
     const ValueRef out,
     const bool clamp_out) {
+  if (graph.is_buffer_storage(out)) {
+    const int64_t terms =
+        graph.size_at<int64_t>(-2, in) * graph.sizes_of(weight).at(2);
+    VK_CHECK_COND(
+        !clamp_out && graph.get_int(groups) == 1 &&
+            graph.get_int_list(stride)->at(0) == 1 &&
+            graph.is_buffer_storage(in) &&
+            graph.packed_dim_of(in) == WHCN::kWidthDim &&
+            graph.packed_dim_of(out) == WHCN::kWidthDim && terms % 16 == 0,
+        "buffer conv1d needs stride 1, one group, width-packed buffers and "
+        "in_channels * kernel_size divisible by 16");
+    // Read before adding values: the list pointers must not outlive this.
+    const int32_t dilation_size =
+        static_cast<int32_t>(graph.get_int_list(dilation)->at(0));
+    const int32_t padding_size =
+        static_cast<int32_t>(graph.get_int_list(padding)->at(0));
+    return add_conv1d_lds_node(
+        graph,
+        in,
+        weight,
+        bias,
+        dilation_size,
+        padding_size,
+        Conv1dFusion(),
+        out,
+        {weight, stride, padding, dilation},
+        resize_conv1d_node);
+  }
   ValueRef arg_weight = prepack_standard(
       graph,
       weight,
@@ -863,6 +1073,7 @@ REGISTER_OPERATORS {
   VK_REGISTER_OP(aten.convolution.default, conv);
   VK_REGISTER_OP(conv_with_clamp.default, conv);
   VK_REGISTER_OP(et_vk.conv_with_clamp.default, conv);
+  VK_REGISTER_OP(et_vk.conv1d_fused.default, conv1d_fused);
 }
 
 } // namespace vkcompute

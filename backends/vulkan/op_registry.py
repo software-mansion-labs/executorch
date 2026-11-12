@@ -927,6 +927,24 @@ def register_convolution_cpp_ops():
                 input_storage = utils.HEIGHT_PACKED_TEXTURE
                 output_storage = utils.HEIGHT_PACKED_TEXTURE
 
+            # Stride 1 and one group also run on contiguous buffers
+            # (conv1d_lds), which have no length limit.
+            stride = node.args[3]
+            if (
+                not node.args[6]
+                and groups == 1
+                and list(stride) == [1]
+                and (c_in * kernel_size) % 16 == 0
+            ):
+                input_storage = utils.TensorRepSet(
+                    utils.CONTIGUOUS_BUFFER.valid_buffer_layouts,
+                    input_storage.valid_texture_layouts,
+                )
+                output_storage = utils.TensorRepSet(
+                    utils.CONTIGUOUS_BUFFER.valid_buffer_layouts,
+                    output_storage.valid_texture_layouts,
+                )
+
         # Build per-input storage list. The convolution op has variable args:
         # aten.convolution.default: input, weight, bias, stride, padding,
         #   dilation, transposed, output_padding, groups
@@ -1190,6 +1208,42 @@ def register_apply_rotary_emb():
         inputs_dtypes=utils.FP_T,
         supports_resize=True,
         supports_highdim=True,
+    )
+
+
+@update_features(exir_ops.edge.et_vk.conv1d_fused.default)
+def register_conv1d_fused():
+    return OpFeatures(
+        inputs_storage=[
+            utils.CONTIGUOUS_BUFFER,  # x
+            utils.NO_STORAGE,  # weight (prepacked)
+            utils.NO_STORAGE,  # bias (prepacked)
+            utils.NO_STORAGE,  # dilation (non tensor)
+            utils.NO_STORAGE,  # padding (non tensor)
+            utils.NO_STORAGE,  # in_snake (prepacked)
+            utils.NO_STORAGE,  # out_snake (prepacked)
+            utils.CONTIGUOUS_BUFFER,  # residual
+            utils.NO_STORAGE,  # phases (non tensor)
+            utils.NO_STORAGE,  # crop (non tensor)
+        ],
+        outputs_storage=utils.CONTIGUOUS_BUFFER,
+        inputs_dtypes=utils.FP_T,
+        supports_resize=True,
+        supports_prepacking=True,
+    )
+
+
+@update_features(exir_ops.edge.et_vk.snake.default)
+def register_snake():
+    return OpFeatures(
+        inputs_storage=[
+            utils.CONTIGUOUS_BUFFER,  # x
+            utils.NO_STORAGE,  # params (prepacked)
+        ],
+        outputs_storage=utils.CONTIGUOUS_BUFFER,
+        inputs_dtypes=utils.FP_T,
+        supports_resize=True,
+        supports_prepacking=True,
     )
 
 

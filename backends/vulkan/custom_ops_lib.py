@@ -1345,3 +1345,73 @@ lib.define(f"{name}(Tensor latent, Tensor scales, int group_size) -> Tensor")
 lib.impl(name, q4gsw_requant_impl, "CompositeExplicitAutograd")
 lib.impl(name, q4gsw_requant_meta, "Meta")
 q4gsw_requant_op = getattr(getattr(torch.ops, namespace), name)
+
+###########
+## snake ##
+###########
+
+
+def snake_impl(x: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+    """DAC's Snake activation over x [N, C, L], in fp32: per channel,
+    x + sign * (sin(alpha * x) * rsqrt)^2 with params [3, C] = (alpha,
+    1 / sqrt|alpha|, sign of alpha), which stays finite in fp16 where 1 / alpha
+    would not."""
+    alpha, rsqrt, sign = (p.view(1, -1, 1) for p in params.float())
+    xf = x.float()
+    r = torch.sin(alpha * xf) * rsqrt
+    return (xf + sign * (r * r)).to(x.dtype)
+
+
+name = "snake"
+lib.define(f"{name}(Tensor x, Tensor params) -> Tensor")
+lib.impl(name, snake_impl, "CompositeExplicitAutograd")
+snake_op = getattr(getattr(torch.ops, namespace), name)
+
+##################
+## conv1d_fused ##
+##################
+
+
+def conv1d_fused_impl(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    dilation: int,
+    padding: int,
+    in_snake: Optional[torch.Tensor],
+    out_snake: Optional[torch.Tensor],
+    residual: Optional[torch.Tensor],
+    phases: int,
+    crop: int,
+) -> torch.Tensor:
+    """A stride-1, one-group conv1d with the neighbours of a DAC decoder's
+    convolutions fused: Snake on the input (in_snake [3, Cin], as et_vk.snake),
+    then Snake on the output (out_snake [3, C]) and a residual add. With
+    phases > 1 the output rows are `phases` interleaved phases of C channels (a
+    transposed convolution with stride `phases` in polyphase form), interleaved
+    and cropped by `crop` to phases * L."""
+    if in_snake is not None:
+        x = snake_impl(x, in_snake)
+    y = torch.nn.functional.conv1d(
+        x, weight, bias, padding=padding, dilation=dilation
+    )
+    if phases > 1:
+        length = x.shape[-1]
+        channels = y.shape[1] // phases
+        y = y.view(y.shape[0], phases, channels, -1).permute(0, 2, 3, 1)
+        y = y.reshape(y.shape[0], channels, -1)[:, :, crop : crop + length * phases]
+    if out_snake is not None:
+        y = snake_impl(y, out_snake)
+    if residual is not None:
+        y = y + residual
+    return y
+
+
+name = "conv1d_fused"
+lib.define(
+    f"{name}(Tensor x, Tensor weight, Tensor? bias, int dilation, int padding, "
+    "Tensor? in_snake, Tensor? out_snake, Tensor? residual, int phases, "
+    "int crop) -> Tensor"
+)
+lib.impl(name, conv1d_fused_impl, "CompositeExplicitAutograd")
+conv1d_fused_op = getattr(getattr(torch.ops, namespace), name)
