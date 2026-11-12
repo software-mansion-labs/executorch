@@ -335,13 +335,16 @@ void VulkanImage::create_image_view() {
       &(handles_.image_view)));
 }
 
-void VulkanImage::bind_allocation_impl(const Allocation& memory) {
+void VulkanImage::bind_allocation_impl(
+    const Allocation& memory,
+    const VkDeviceSize offset) {
   VK_CHECK_COND(!memory_, "Cannot bind an already bound allocation!");
   // To prevent multiple instances of binding the same VkImage to a memory
   // block, do not actually bind memory if this VulkanImage is a copy. Assume
   // that the original VulkanImage is responsible for binding the image.
   if (!is_copy_) {
-    VK_CHECK(vmaBindImageMemory(allocator_, memory.allocation, handles_.image));
+    VK_CHECK(vmaBindImageMemory2(
+        allocator_, memory.allocation, offset, handles_.image, nullptr));
   }
 
   // Only create the image view if the image has been bound to memory
@@ -349,8 +352,10 @@ void VulkanImage::bind_allocation_impl(const Allocation& memory) {
   create_image_view();
 }
 
-void VulkanImage::bind_allocation(const Allocation& memory) {
-  bind_allocation_impl(memory);
+void VulkanImage::bind_allocation(
+    const Allocation& memory,
+    const VkDeviceSize offset) {
+  bind_allocation_impl(memory, offset);
   memory_.allocation = memory.allocation;
 }
 

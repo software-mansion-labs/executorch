@@ -167,14 +167,14 @@ class VulkanBuffer final {
   }
 
  private:
-  void bind_allocation_impl(const Allocation& memory);
+  void bind_allocation_impl(const Allocation& memory, VkDeviceSize offset = 0);
 
  public:
   /*
    * Given a memory allocation, bind it to the underlying VkImage. The lifetime
    * of the memory allocation is assumed to be managed externally.
    */
-  void bind_allocation(const Allocation& memory);
+  void bind_allocation(const Allocation& memory, VkDeviceSize offset = 0);
 
   /*
    * Given a rvalue memory allocation, bind it to the underlying VkImage and

@@ -81,6 +81,8 @@ struct PhysicalDevice final {
   bool supports_float64_shader_types;
   bool has_unified_memory;
   bool has_timestamps;
+  // shaderRoundingModeRTEFloat16 (queried on Vulkan 1.2+ only)
+  bool supports_fp16_round_to_nearest;
   float timestamp_period;
   size_t min_ubo_alignment;
 

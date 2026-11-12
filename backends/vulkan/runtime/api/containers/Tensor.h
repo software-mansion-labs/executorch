@@ -725,7 +725,9 @@ class vTensor final {
   /*
    * Binds the underlying resource to the given memory allocation
    */
-  void bind_allocation(const vkapi::Allocation& allocation);
+  void bind_allocation(
+      const vkapi::Allocation& allocation,
+      VkDeviceSize offset = 0);
 
   /*
    * Binds and acquires a rvalue memory allocation
