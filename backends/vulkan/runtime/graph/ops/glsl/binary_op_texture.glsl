@@ -28,6 +28,12 @@ $else:
   #define VEC4_OUT_T VEC4_T
 
 #define op(X, Y, A) ${OPERATOR}
+$if DTYPE == "half":
+  #define ARITH(x) float(x)
+  #define ARITH4(x) vec4(x)
+$else:
+  #define ARITH(x) (x)
+  #define ARITH4(x) (x)
 
 ${define_active_storage_type("texture3d")}
 
@@ -94,7 +100,7 @@ void main() {
     other_texel = VEC4_T(other_texel.x);
   }
 
-  VEC4_OUT_T outtex = VEC4_OUT_T(op(in_texel, other_texel, alpha));
+  VEC4_OUT_T outtex = VEC4_OUT_T(op(ARITH4(in_texel), ARITH4(other_texel), alpha));
 
 #ifdef MASK_PADDING
   {

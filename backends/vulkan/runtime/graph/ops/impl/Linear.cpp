@@ -138,6 +138,62 @@ void add_linear_tiled_node(
       resize_linear_node));
 }
 
+// linear_lds's workgroup and output tile (see the shader).
+constexpr uint32_t kLdsThreadsX = 8;
+constexpr uint32_t kLdsThreadsY = 8;
+constexpr int64_t kLdsTileM = 64;
+constexpr int64_t kLdsTileN = 64;
+constexpr int64_t kLdsTileK = 16;
+
+utils::uvec3 pick_linear_lds_global_wg_size(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)shader;
+  (void)resize_args;
+  const ValueRef out = args.at(0).refs.at(0);
+  const uint32_t N = graph->size_at<uint32_t>(-1, out);
+  const uint32_t M = graph->size_at<uint32_t>(-2, out);
+  return {
+      utils::div_up(N, uint32_t(kLdsTileN)) * kLdsThreadsX,
+      utils::div_up(M, uint32_t(kLdsTileM)) * kLdsThreadsY,
+      1u};
+}
+
+utils::uvec3 pick_linear_lds_local_wg_size(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const utils::uvec3& global_workgroup_size,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)graph;
+  (void)shader;
+  (void)global_workgroup_size;
+  (void)args;
+  (void)resize_args;
+  return {kLdsThreadsX, kLdsThreadsY, 1u};
+}
+
+void add_linear_lds_node(
+    ComputeGraph& graph,
+    const ValueRef input,
+    const ValueRef packed_weight,
+    const ValueRef out,
+    const int64_t N) {
+  graph.execute_nodes().emplace_back(new DynamicDispatchNode(
+      graph,
+      VK_KERNEL_FROM_STR("linear_lds_half"),
+      pick_linear_lds_global_wg_size,
+      pick_linear_lds_local_wg_size,
+      {{out, vkapi::kWrite}, {{input, packed_weight}, vkapi::kRead}},
+      {graph.sizes_ubo(input), graph.sizes_ubo(out)},
+      {},
+      {},
+      {graph.add_scalar(N), graph.add_scalar(false)},
+      resize_linear_node));
+}
+
 void linear_packed_weight(
     ComputeGraph& graph,
     const std::vector<ValueRef>& args) {
@@ -160,13 +216,25 @@ void linear_packed_weight(
   int64_t K = input_sizes.back();
   int64_t N = out_sizes_vec.back();
   bool use_coopmat = is_coopmat_eligible(graph, out, M, N, K);
+  // fp16 linears that fill whole shared-memory tiles: 1.7x the register-tiled
+  // linear_vec on a Samsung Xclipse 940, with fp32 accumulation.
+  const bool use_lds = !use_coopmat && !has_bias && input_sizes.size() == 2 &&
+      graph.dtype_of(out) == vkapi::kHalf &&
+      graph.storage_type_of(out) == utils::kBuffer &&
+      graph.storage_type_of(input) == utils::kBuffer && K % kLdsTileK == 0 &&
+      N % kLdsTileN == 0;
 
   ValueRef packed_weight = prepack_fp_linear_weight(
       graph,
       weight_data,
       /*is_transposed=*/true,
       /*B=*/1,
-      /*force_buffer=*/use_coopmat);
+      /*force_buffer=*/use_coopmat || use_lds);
+
+  if (use_lds) {
+    add_linear_lds_node(graph, input, packed_weight, out, N);
+    return;
+  }
 
   ValueRef packed_bias = kDummyValueRef;
   if (has_bias) {

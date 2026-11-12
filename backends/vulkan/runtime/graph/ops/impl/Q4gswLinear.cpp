@@ -15,6 +15,8 @@
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Staging.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/utils/ShaderNameUtils.h>
 
+#include <cstdlib>
+
 namespace vkcompute {
 
 // Resize output [M, N] based on current fp_input M and packed_weight shape.
@@ -335,6 +337,11 @@ utils::uvec3 pick_q4gsw_linear_tin_gemm_gated_global_wg(
 ValueRef prepack_q4_w_4x8_nc_buffer(
     ComputeGraph& graph,
     const ValueRef weight_data) {
+  const std::string kernel_name = "pack_q4_linear_weight__w_4x8_nc_buffer";
+  const ValueRef cached = graph.get_cached_prepack(weight_data, kernel_name);
+  if (cached != kDummyValueRef) {
+    return cached;
+  }
   std::vector<int64_t> weight_sizes = graph.sizes_of(weight_data);
   const int64_t N = weight_sizes.at(0);
   const int64_t K = weight_sizes.at(1) * 2;
@@ -383,6 +390,7 @@ ValueRef prepack_q4_w_4x8_nc_buffer(
        PushConstantDataInfo(&orig_sizes, sizeof(utils::ivec2)),
        PushConstantDataInfo(&n4_pitch, sizeof(int32_t))}));
 
+  graph.cache_prepack(weight_data, kernel_name, packed_weight);
   return packed_weight;
 }
 
@@ -393,13 +401,49 @@ ValueRef prepack_q4_scales(
     ComputeGraph& graph,
     const ValueRef weight_scales_data,
     vkapi::ScalarType dtype) {
+  const std::string kernel_name =
+      std::string("q4_scales_") + vkapi::to_string(dtype);
+  const ValueRef cached =
+      graph.get_cached_prepack(weight_scales_data, kernel_name);
+  if (cached != kDummyValueRef) {
+    return cached;
+  }
   ValueRef tensor = graph.add_tensor(
       graph.sizes_of(weight_scales_data),
       dtype,
       utils::kBuffer,
       utils::kWidthPacked);
   add_prepack_standard_node(graph, weight_scales_data, tensor);
+  graph.cache_prepack(weight_scales_data, kernel_name, tensor);
   return tensor;
+}
+
+// linear_q4gsw_lds: 8 x 8 threads per 64 x 64 output tile.
+utils::uvec3 pick_q4gsw_lds_global_wg(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)shader;
+  (void)resize_args;
+  const ValueRef out = args.at(0).refs.at(0);
+  const uint32_t N = graph->size_at<uint32_t>(-1, out);
+  const uint32_t M = graph->size_at<uint32_t>(-2, out);
+  return {utils::div_up(N, 64u) * 8u, utils::div_up(M, 64u) * 8u, 1u};
+}
+
+utils::uvec3 pick_q4gsw_lds_local_wg(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const utils::uvec3& global_workgroup_size,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  (void)graph;
+  (void)shader;
+  (void)global_workgroup_size;
+  (void)args;
+  (void)resize_args;
+  return {8u, 8u, 1u};
 }
 
 //
@@ -585,6 +629,28 @@ void add_q4gsw_linear_tin_w_4x8_node(
   std::vector<int64_t> out_sizes = graph.sizes_of(output);
   const uint32_t M_val =
       utils::safe_downcast<uint32_t>(utils::val_at(-2, out_sizes));
+
+  // Shared-memory tiles with fp32 accumulation for 2D fp16 inputs whose shapes
+  // fill whole tiles; it reads the input as is, without the transposed copy.
+  const int64_t N = utils::val_at(-1, out_sizes);
+  if (apply_bias == 0 && graph.dim_of(fp_input) == 2 &&
+      graph.storage_type_of(fp_input) == utils::kBuffer &&
+      graph.storage_type_of(output) == utils::kBuffer && K % 16 == 0 &&
+      N % 64 == 0 && group_size_val % 16 == 0) {
+    graph.execute_nodes().emplace_back(new DynamicDispatchNode(
+        graph,
+        VK_KERNEL_FROM_STR("linear_q4gsw_lds_half"),
+        pick_q4gsw_lds_global_wg,
+        pick_q4gsw_lds_local_wg,
+        {{output, vkapi::kWrite},
+         {{fp_input, packed_weight, packed_scales}, vkapi::kRead}},
+        {graph.sizes_ubo(fp_input), graph.sizes_ubo(output)},
+        {},
+        {static_cast<int32_t>(group_size_val)},
+        {weight_data, fp_input},
+        resize_q4gsw_linear_node));
+    return;
+  }
 
   // Allocate the transposed-input temp tensor using the current M. The
   // transpose dispatch self-gates on M==1 so the tensor is simply unused in

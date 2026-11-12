@@ -30,13 +30,49 @@ class StagingBuffer final {
   vkapi::VulkanBuffer vulkan_buffer_;
 
   void* mapped_data_;
+  // Offset of the buffer in its allocation, which may be shared.
+  VkDeviceSize offset_ = 0;
 
  public:
   StagingBuffer(
       Context* context_p,
       const vkapi::ScalarType dtype,
       const size_t numel,
-      const vkapi::CopyDirection direction);
+      const vkapi::CopyDirection direction,
+      const bool allocate_memory = true);
+
+  /*
+   * Binds a buffer created without memory to `offset` in a persistently mapped
+   * allocation whose mapping starts at `allocation_data`.
+   */
+  inline void bind_allocation(
+      const vkapi::Allocation& allocation,
+      const VkDeviceSize offset,
+      void* const allocation_data) {
+    vulkan_buffer_.bind_allocation(allocation, offset);
+    offset_ = offset;
+    mapped_data_ = static_cast<uint8_t*>(allocation_data) + offset;
+  }
+
+  inline VkMemoryRequirements get_memory_requirements() const {
+    return vulkan_buffer_.get_memory_requirements();
+  }
+
+  inline void flush() {
+    vmaFlushAllocation(
+        vulkan_buffer_.vma_allocator(),
+        vulkan_buffer_.allocation(),
+        offset_,
+        vulkan_buffer_.mem_size());
+  }
+
+  inline void invalidate() {
+    vmaInvalidateAllocation(
+        vulkan_buffer_.vma_allocator(),
+        vulkan_buffer_.allocation(),
+        offset_,
+        vulkan_buffer_.mem_size());
+  }
 
   StagingBuffer(const StagingBuffer&) = delete;
   StagingBuffer& operator=(const StagingBuffer&) = delete;
@@ -74,11 +110,7 @@ class StagingBuffer final {
   inline void copy_from(const void* src, const size_t nbytes) {
     VK_CHECK_COND(nbytes <= this->nbytes());
     memcpy(data(), src, nbytes);
-    vmaFlushAllocation(
-        vulkan_buffer_.vma_allocator(),
-        vulkan_buffer_.allocation(),
-        0u,
-        VK_WHOLE_SIZE);
+    flush();
   }
 
   template <typename SRC_T, typename DST_T>
@@ -88,11 +120,7 @@ class StagingBuffer final {
     for (size_t i = 0; i < numel; ++i) {
       dst[i] = static_cast<DST_T>(src[i]);
     }
-    vmaFlushAllocation(
-        vulkan_buffer_.vma_allocator(),
-        vulkan_buffer_.allocation(),
-        0u,
-        VK_WHOLE_SIZE);
+    flush();
   }
 
   void cast_half_to_float_and_copy_from(
@@ -103,22 +131,14 @@ class StagingBuffer final {
 
   inline void copy_to(void* dst, const size_t nbytes) {
     VK_CHECK_COND(nbytes <= this->nbytes());
-    vmaInvalidateAllocation(
-        vulkan_buffer_.vma_allocator(),
-        vulkan_buffer_.allocation(),
-        0u,
-        VK_WHOLE_SIZE);
+    invalidate();
     memcpy(dst, data(), nbytes);
   }
 
   template <typename SRC_T, typename DST_T>
   void cast_and_copy_to(DST_T* dst, const size_t numel) {
     VK_CHECK_COND(numel <= this->numel());
-    vmaInvalidateAllocation(
-        vulkan_buffer_.vma_allocator(),
-        vulkan_buffer_.allocation(),
-        0u,
-        VK_WHOLE_SIZE);
+    invalidate();
     const SRC_T* src = reinterpret_cast<const SRC_T*>(data());
     for (size_t i = 0; i < numel; ++i) {
       dst[i] = static_cast<DST_T>(src[i]);

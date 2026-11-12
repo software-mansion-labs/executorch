@@ -110,10 +110,6 @@ void PrepackNode::encode(ComputeGraph* graph) {
 
   context->check_device_capabilities(shader_);
 
-  api::StagingBuffer staging = create_staging_buffer(graph);
-
-  std::unique_lock<std::mutex> cmd_lock = context->dispatch_lock();
-
   std::array<uint8_t, kMaxPushConstantSize> push_constants_data;
   uint32_t push_constants_offset = 0;
 
@@ -124,10 +120,75 @@ void PrepackNode::encode(ComputeGraph* graph) {
         kMaxPushConstantSize);
   }
 
+  // A buffer packed from keyed data can share its memory with the same packing
+  // in other graphs (or other nodes of this one): key it by everything the
+  // packing depends on.
+  std::string shared_key;
+  if (!graph->val_is_none(tref_) && graph->is_buffer_storage(packed_) &&
+      !graph->get_tref(tref_)->key.empty()) {
+    TensorRefPtr tref = graph->get_tref(tref_);
+    shared_key =
+        tref->key + "|" + shader_.kernel_name + "|" +
+        std::to_string(static_cast<int>(tref->dtype)) + "|" +
+        std::to_string(static_cast<int>(graph->dtype_of(packed_))) + "|" +
+        std::to_string(graph->hashed_layout_of(packed_)) + "|" +
+        std::to_string(
+            vTensorPtr(graph, packed_)->get_memory_requirements().size);
+    for (const int64_t d : tref->sizes) {
+      shared_key += "," + std::to_string(d);
+    }
+    shared_key += "|";
+    for (const int64_t d : graph->sizes_of(packed_)) {
+      shared_key += "," + std::to_string(d);
+    }
+    shared_key += "|";
+    for (uint32_t i = 0; i < push_constants_offset; i++) {
+      shared_key += std::to_string(push_constants_data[i]) + ".";
+    }
+    if (std::shared_ptr<vkapi::Allocation> shared =
+            SharedConstants::get().find(shared_key)) {
+      std::unique_lock<std::mutex> cmd_lock = context->dispatch_lock();
+      vTensorPtr packed_tensor(graph, packed_);
+      packed_tensor->bind_allocation(*shared);
+      graph->hold_shared_constant(std::move(shared));
+      if (--tref->prepack_use_count == 0) {
+        tref->free_buffer();
+      }
+      // Written by another submission: make it visible to this graph's reads.
+      vkapi::PipelineBarrier pipeline_barrier{};
+      packed_tensor->buffer(
+          pipeline_barrier,
+          vkapi::PipelineStage::COMPUTE,
+          vkapi::MemoryAccessType::WRITE);
+      packed_tensor->buffer(
+          pipeline_barrier,
+          vkapi::PipelineStage::COMPUTE,
+          vkapi::MemoryAccessType::READ);
+      context->register_barrier(pipeline_barrier);
+      return;
+    }
+  }
+
+  api::StagingBuffer staging = create_staging_buffer(graph);
+
+  std::unique_lock<std::mutex> cmd_lock = context->dispatch_lock();
+
   {
     // If the vTensor is not yet bound to a memory allocation, create a new one
     // and aquire it.
-    graph->create_dedicated_allocation_for(packed_);
+    if (!shared_key.empty()) {
+      vkapi::Adapter* const adapter = context->adapter_ptr();
+      vTensorPtr packed_tensor(graph, packed_);
+      auto allocation =
+          std::make_shared<vkapi::Allocation>(adapter->vma().create_allocation(
+              packed_tensor->get_memory_requirements(),
+              adapter->vma().gpuonly_resource_create_info()));
+      packed_tensor->bind_allocation(*allocation);
+      SharedConstants::get().insert(shared_key, allocation);
+      graph->hold_shared_constant(std::move(allocation));
+    } else {
+      graph->create_dedicated_allocation_for(packed_);
+    }
 
     vkapi::PipelineBarrier pipeline_barrier{};
     vkapi::DescriptorSet descriptor_set = context->get_descriptor_set(

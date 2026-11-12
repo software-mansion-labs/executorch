@@ -11,6 +11,8 @@
 #include <executorch/backends/vulkan/runtime/api/Context.h>
 #include <executorch/runtime/core/freeable_buffer.h>
 
+#include <string>
+
 namespace vkcompute {
 
 /*
@@ -34,6 +36,10 @@ struct TensorRef final {
   // use-after-free when multiple PrepackNodes reference the same TensorRef
   // (e.g. shared/tied weights).
   int32_t prepack_use_count{0};
+
+  // The NamedDataMap key the data was loaded with (a hash of the bytes), or
+  // empty. Packed copies of keyed data can be shared between graphs.
+  std::string key;
 
   explicit TensorRef(
       const std::vector<int64_t>& t_sizes,

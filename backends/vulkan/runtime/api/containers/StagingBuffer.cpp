@@ -133,7 +133,8 @@ StagingBuffer::StagingBuffer(
     Context* context_p,
     const vkapi::ScalarType dtype,
     const size_t numel,
-    const vkapi::CopyDirection direction)
+    const vkapi::CopyDirection direction,
+    const bool allocate_memory)
     : context_p_(context_p),
       dtype_(get_staging_dtype(context_p, dtype)),
       // For 8-bit types, align numel to the next multiple of 4. Devices that
@@ -142,7 +143,8 @@ StagingBuffer::StagingBuffer(
       vulkan_buffer_(context_p_->adapter_ptr()->vma().create_staging_buffer(
           element_size(dtype_) *
               (element_size(dtype_) == 1 ? utils::align_up_4(numel) : numel),
-          direction)),
+          direction,
+          allocate_memory)),
       mapped_data_(nullptr) {}
 
 vkapi::ScalarType get_staging_dtype(
@@ -163,22 +165,14 @@ void StagingBuffer::cast_half_to_float_and_copy_from(
   for (size_t i = 0; i < numel; ++i) {
     dst[i] = half_to_float(src[i]);
   }
-  vmaFlushAllocation(
-      vulkan_buffer_.vma_allocator(),
-      vulkan_buffer_.allocation(),
-      0u,
-      VK_WHOLE_SIZE);
+  flush();
 }
 
 void StagingBuffer::cast_float_to_half_and_copy_to(
     uint16_t* dst,
     const size_t numel) {
   VK_CHECK_COND(numel <= this->numel());
-  vmaInvalidateAllocation(
-      vulkan_buffer_.vma_allocator(),
-      vulkan_buffer_.allocation(),
-      0u,
-      VK_WHOLE_SIZE);
+  invalidate();
   const float* src = reinterpret_cast<const float*>(data());
   for (size_t i = 0; i < numel; ++i) {
     dst[i] = float_to_half(src[i]);

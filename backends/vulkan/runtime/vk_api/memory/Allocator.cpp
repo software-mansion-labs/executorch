@@ -163,7 +163,8 @@ VulkanImage Allocator::create_image(
 
 VulkanBuffer Allocator::create_staging_buffer(
     const VkDeviceSize size,
-    const CopyDirection direction) {
+    const CopyDirection direction,
+    const bool allocate_memory) {
   const VkBufferUsageFlags buffer_usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
   VmaAllocationCreateInfo alloc_create_info = {};
@@ -185,7 +186,8 @@ VulkanBuffer Allocator::create_staging_buffer(
   alloc_create_info.preferredFlags =
       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
 
-  return VulkanBuffer(allocator_, size, alloc_create_info, buffer_usage);
+  return VulkanBuffer(
+      allocator_, size, alloc_create_info, buffer_usage, allocate_memory);
 }
 
 VulkanBuffer Allocator::create_storage_buffer(

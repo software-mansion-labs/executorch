@@ -78,7 +78,10 @@ class Allocator final {
       const bool allow_transfer = false,
       const bool allocate_memory = true);
 
-  VulkanBuffer create_staging_buffer(const VkDeviceSize, const CopyDirection);
+  VulkanBuffer create_staging_buffer(
+      const VkDeviceSize,
+      const CopyDirection,
+      const bool allocate_memory = true);
 
   VulkanBuffer create_storage_buffer(
       const VkDeviceSize,

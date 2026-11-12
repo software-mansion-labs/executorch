@@ -238,7 +238,13 @@ class CausalSDPAMatch(PatternMatch):
         # We have additional optional arguments but we don't need to capture them
         # since the new op doesn't use them
 
-        self.match_found = True
+        # Only an LLM's update_cache + custom_sdpa pair fuses into
+        # sdpa_with_kv_cache; a custom_sdpa over plain tensors is left to the
+        # partitioner's per-op check.
+        self.match_found = (
+            self.update_key_cache_node is not None
+            and self.update_value_cache_node is not None
+        )
 
 
 @register_pattern_detector("causal_sdpa")
