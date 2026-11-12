@@ -927,11 +927,13 @@ def register_convolution_cpp_ops():
                 input_storage = utils.HEIGHT_PACKED_TEXTURE
                 output_storage = utils.HEIGHT_PACKED_TEXTURE
 
-            # Stride 1 and one group also run on contiguous buffers
+            # Batch 1, stride 1 and one group also run on contiguous buffers
             # (conv1d_lds), which have no length limit.
             stride = node.args[3]
             if (
                 not node.args[6]
+                and isinstance(x_shape[0], int)
+                and x_shape[0] == 1
                 and groups == 1
                 and list(stride) == [1]
                 and (c_in * kernel_size) % 16 == 0

@@ -794,11 +794,12 @@ void conv1d_fused(ComputeGraph& graph, const std::vector<ValueRef>& args) {
   const int64_t terms =
       graph.size_at<int64_t>(-2, in) * graph.sizes_of(args.at(1)).at(2);
   VK_CHECK_COND(
-      graph.is_buffer_storage(in) && graph.is_buffer_storage(out) &&
+      graph.size_at<int64_t>(-3, in) == 1 && graph.is_buffer_storage(in) &&
+          graph.is_buffer_storage(out) &&
           graph.packed_dim_of(in) == WHCN::kWidthDim &&
           graph.packed_dim_of(out) == WHCN::kWidthDim && terms % 16 == 0,
-      "conv1d_fused needs width-packed buffers and in_channels * kernel_size "
-      "divisible by 16");
+      "conv1d_fused needs batch 1, width-packed buffers and in_channels * "
+      "kernel_size divisible by 16");
   Conv1dFusion fusion;
   fusion.in_snake = args.at(5);
   fusion.out_snake = args.at(6);
@@ -836,13 +837,14 @@ void add_conv1d_node(
     const int64_t terms =
         graph.size_at<int64_t>(-2, in) * graph.sizes_of(weight).at(2);
     VK_CHECK_COND(
-        !clamp_out && graph.get_int(groups) == 1 &&
+        !clamp_out && graph.size_at<int64_t>(-3, in) == 1 &&
+            graph.get_int(groups) == 1 &&
             graph.get_int_list(stride)->at(0) == 1 &&
             graph.is_buffer_storage(in) &&
             graph.packed_dim_of(in) == WHCN::kWidthDim &&
             graph.packed_dim_of(out) == WHCN::kWidthDim && terms % 16 == 0,
-        "buffer conv1d needs stride 1, one group, width-packed buffers and "
-        "in_channels * kernel_size divisible by 16");
+        "buffer conv1d needs batch 1, stride 1, one group, width-packed "
+        "buffers and in_channels * kernel_size divisible by 16");
     // Read before adding values: the list pointers must not outlive this.
     const int32_t dilation_size =
         static_cast<int32_t>(graph.get_int_list(dilation)->at(0));
