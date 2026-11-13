@@ -418,7 +418,8 @@ ValueRef prepack_q4_scales(
   return tensor;
 }
 
-// linear_q4gsw_lds: 8 x 8 threads per 64 x 64 output tile.
+// linear_q4gsw_lds: 8 x 8 threads per 64 x 64 output tile. Self-gates at M==1,
+// which the nc-coop GEMV sibling owns.
 utils::uvec3 pick_q4gsw_lds_global_wg(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
@@ -429,6 +430,9 @@ utils::uvec3 pick_q4gsw_lds_global_wg(
   const ValueRef out = args.at(0).refs.at(0);
   const uint32_t N = graph->size_at<uint32_t>(-1, out);
   const uint32_t M = graph->size_at<uint32_t>(-2, out);
+  if (M == 1u) {
+    return {0u, 0u, 0u};
+  }
   return {utils::div_up(N, 64u) * 8u, utils::div_up(M, 64u) * 8u, 1u};
 }
 
@@ -649,6 +653,17 @@ void add_q4gsw_linear_tin_w_4x8_node(
         {static_cast<int32_t>(group_size_val)},
         {weight_data, fp_input},
         resize_q4gsw_linear_node));
+    add_q4gsw_linear_nc_coop_gemv_node(
+        graph,
+        fp_input,
+        packed_weight,
+        weight_data,
+        packed_scales,
+        packed_bias,
+        apply_bias,
+        K_val,
+        static_cast<uint32_t>(group_size_val),
+        output);
     return;
   }
 

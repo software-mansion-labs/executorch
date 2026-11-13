@@ -87,9 +87,10 @@ class SharedWorkspace final {
 };
 
 /*
- * Packed constants shared between graphs: a graph that would pack the same
- * keyed data with the same shader into an identical buffer binds the existing
- * allocation instead. Entries live as long as some graph holds them.
+ * Packed constants shared between graphs: one packing the same keyed data the
+ * same way binds the existing allocation. Entries are published before their
+ * packing has run, so graphs must not prepack concurrently. The key omits spec
+ * constants and UBO contents; no current packing varies only in those.
  */
 class SharedConstants final {
  public:

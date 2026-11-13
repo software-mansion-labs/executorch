@@ -19,9 +19,10 @@
 // tile of (m, q), 8 x 4 TN4 per thread, with the weight tile (texels of 4 terms) and the input tile (gathered from the
 // shifted windows into texels of 4 q) staged in shared memory, the next tiles prefetched, fp32 accumulation.
 // Needs (Cin * kernel_size) % 16 == 0. Fused around it (flags): Snake on the input as it is gathered (bit 0,
-// in_snake [3, Cin]); then per output Snake (bit 1, out_snake [3, C]) and a residual add (bit 2, [1, C, L]). With
-// phases > 1 the rows are `phases` interleaved phases of C = M / phases channels (a transposed convolution in
-// polyphase form): y[r C + c, q] lands at out[c, q phases + r - crop], kept inside [0, L) for out [1, C, L].
+// in_snake [3, Cin]); then per output Snake (bit 1, out_snake [3, C]), a residual add (bit 2, [1, C, L]) and a clamp
+// to [out_min, out_max] (bit 3, et_vk.conv_with_clamp). With phases > 1 the rows are `phases` interleaved phases of
+// C = M / phases channels (a transposed convolution in polyphase form): y[r C + c, q] lands at
+// out[c, q phases + r - crop], kept inside [0, L) for out [1, C, L].
 #define TX ${TX}
 #define TY ${TY}
 #define TM 8
@@ -62,6 +63,8 @@ ${layout_declare_spec_const(C, "int", "padding", "0")}
 ${layout_declare_spec_const(C, "int", "phases", "1")}
 ${layout_declare_spec_const(C, "int", "crop", "0")}
 ${layout_declare_spec_const(C, "int", "flags", "0")}
+${layout_declare_spec_const(C, "float", "out_min", "0.0")}
+${layout_declare_spec_const(C, "float", "out_max", "0.0")}
 
 shared VEC4_T As[BK4][BM + 1];
 shared VEC4_T Bs[BK4 * 4][BN4 + 1];
@@ -192,6 +195,9 @@ void main() {
             }
             if ((flags & 4) != 0) {
               v += float(t_residual[c * L + t]);
+            }
+            if ((flags & 8) != 0) {
+              v = clamp(v, out_min, out_max);
             }
             t_out[c * L + t] = T(v);
           }

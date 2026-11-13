@@ -80,6 +80,17 @@ utils::uvec3 pick_linear_global_wg_size(
   return {utils::div_up_4(N), utils::div_up(M, tile_m), B};
 }
 
+utils::uvec3 pick_linear_m1_global_wg_size(
+    ComputeGraph* graph,
+    const vkapi::ShaderInfo& shader,
+    const std::vector<ArgGroup>& args,
+    const std::vector<ValueRef>& resize_args) {
+  if (graph->size_at<uint32_t>(-2, args.at(0).refs.at(0)) != 1u) {
+    return {0u, 0u, 0u};
+  }
+  return pick_linear_global_wg_size(graph, shader, args, resize_args);
+}
+
 void add_linear_tiled_node(
     ComputeGraph& graph,
     const ValueRef input,
@@ -89,7 +100,8 @@ void add_linear_tiled_node(
     const ValueRef out,
     int32_t weight_B,
     float alpha,
-    float beta) {
+    float beta,
+    bool m1_only) {
   VK_CHECK_COND(graph.packed_dim_of(input) == WHCN::kWidthDim);
   VK_CHECK_COND(graph.packed_dim_of(out) == WHCN::kWidthDim);
   std::vector<int64_t> out_sizes = graph.sizes_of(out);
@@ -122,7 +134,7 @@ void add_linear_tiled_node(
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
       pick_linear_shader,
-      pick_linear_global_wg_size,
+      m1_only ? pick_linear_m1_global_wg_size : pick_linear_global_wg_size,
       pick_hw_square_wg_size,
       // Inputs and Outputs
       {{out, vkapi::kWrite}, {read_inputs, vkapi::kRead}},
@@ -155,6 +167,10 @@ utils::uvec3 pick_linear_lds_global_wg_size(
   const ValueRef out = args.at(0).refs.at(0);
   const uint32_t N = graph->size_at<uint32_t>(-1, out);
   const uint32_t M = graph->size_at<uint32_t>(-2, out);
+  // M==1 is left to the tiled sibling (add_linear_tiled_node with m1_only).
+  if (M == 1u) {
+    return {0u, 0u, 0u};
+  }
   return {
       utils::div_up(N, uint32_t(kLdsTileN)) * kLdsThreadsX,
       utils::div_up(M, uint32_t(kLdsTileM)) * kLdsThreadsY,
@@ -233,6 +249,17 @@ void linear_packed_weight(
 
   if (use_lds) {
     add_linear_lds_node(graph, input, packed_weight, out, N);
+    add_linear_tiled_node(
+        graph,
+        input,
+        packed_weight,
+        kDummyValueRef,
+        /*has_bias=*/false,
+        out,
+        /*weight_B=*/1,
+        /*alpha=*/1.0f,
+        /*beta=*/1.0f,
+        /*m1_only=*/true);
     return;
   }
 

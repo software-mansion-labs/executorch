@@ -11,9 +11,10 @@
 #define PRECISION ${PRECISION}
 #define T ${texel_load_component_type(DTYPE, "buffer")}
 
-// conv1d_lds for at most 4 output channels (bindings and spec constants alike; Snake on the input is the only fusion
-// used, flags bit 0), where the 64-row tiles would sit nearly empty: each invocation computes 4 consecutive outputs
-// of every channel, from a window of the input held in registers (WIN >= 4 + dilation * (kernel_size - 1)).
+// conv1d_lds for at most 4 output channels (bindings and spec constants alike; Snake on the input, flags bit 0, and
+// the clamp, bit 3, are the only fusions used), where the 64-row tiles would sit nearly empty: each invocation
+// computes 4 consecutive outputs of every channel, from a window of the input held in registers
+// (WIN >= 4 + dilation * (kernel_size - 1)).
 #define WIN 32
 
 ${define_required_extensions("buffer", DTYPE)}
@@ -41,6 +42,8 @@ ${layout_declare_spec_const(C, "int", "padding", "0")}
 ${layout_declare_spec_const(C, "int", "phases", "1")}
 ${layout_declare_spec_const(C, "int", "crop", "0")}
 ${layout_declare_spec_const(C, "int", "flags", "0")}
+${layout_declare_spec_const(C, "float", "out_min", "0.0")}
+${layout_declare_spec_const(C, "float", "out_max", "0.0")}
 
 void main() {
   const int L_in = in_sizes.x;
@@ -86,7 +89,11 @@ void main() {
     const float bias = float(t_bias[c]);
     [[unroll]] for (int e = 0; e < 4; ++e) {
       if (l0 + e < L) {
-        t_out[c * L + l0 + e] = T(acc[c][e] + bias);
+        float v = acc[c][e] + bias;
+        if ((flags & 8) != 0) {
+          v = clamp(v, out_min, out_max);
+        }
+        t_out[c * L + l0 + e] = T(v);
       }
     }
   }
