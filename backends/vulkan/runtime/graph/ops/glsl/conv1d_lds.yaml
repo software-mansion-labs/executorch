@@ -10,6 +10,7 @@ conv1d_lds:
     TX: 8
     TY: 8
     TN4: 2
+    QUANT: none
   generate_variant_forall:
     DTYPE:
       - VALUE: half
@@ -20,3 +21,10 @@ conv1d_lds:
       TX: 16
       TY: 4
       TN4: 1
+    - NAME: conv1d_lds_q8
+      QUANT: q8
+    - NAME: conv1d_lds_m32_q8
+      TX: 16
+      TY: 4
+      TN4: 1
+      QUANT: q8

@@ -11,11 +11,11 @@
 #define PRECISION ${PRECISION}
 #define T ${texel_load_component_type(DTYPE, "buffer")}
 
-// conv1d_lds for at most 4 output channels (bindings and spec constants alike; Snake on the input, flags bit 0, and
-// the clamp, bit 3, are the only fusions used), where the 64-row tiles would sit nearly empty: each invocation
-// computes 4 consecutive outputs of every channel, from a window of the input held in registers
-// (WIN >= 4 + dilation * (kernel_size - 1)).
-#define WIN 32
+// conv1d_lds (same bindings and spec constants; Snake on the input and the clamp, flags bits 0 and 3, are the only
+// fusions) where its matmul tiles would not pay: fewer than 16 terms per output or terms not a multiple of 16 (a
+// 1-channel input, depthwise), or at most 4 rows. Each invocation computes 4 consecutive outputs of one channel from a
+// window of its inputs held in registers (WIN >= 3 stride + dilation (kernel_size - 1) + 1).
+#define WIN 64
 
 ${define_required_extensions("buffer", DTYPE)}
 
@@ -42,6 +42,9 @@ ${layout_declare_spec_const(C, "int", "padding", "0")}
 ${layout_declare_spec_const(C, "int", "phases", "1")}
 ${layout_declare_spec_const(C, "int", "crop", "0")}
 ${layout_declare_spec_const(C, "int", "flags", "0")}
+${layout_declare_spec_const(C, "int", "stride", "1")}
+${layout_declare_spec_const(C, "int", "groups", "1")}
+${layout_declare_spec_const(C, "int", "group_size", "4")}
 ${layout_declare_spec_const(C, "float", "out_min", "0.0")}
 ${layout_declare_spec_const(C, "float", "out_max", "0.0")}
 
@@ -51,16 +54,18 @@ void main() {
   const int L = out_sizes.x;
   const int C = out_sizes.y;
   const int l0 = int(gl_GlobalInvocationID.x) * 4;
-  if (l0 >= L) {
+  const int co = int(gl_GlobalInvocationID.y);
+  if (l0 >= L || co >= C) {
     return;
   }
-  const int span = 4 + dilation * (kernel_size - 1);
+  const int cin_g = Cin / groups;
+  const int cin0 = (co / (C / groups)) * cin_g;
+  const int span = 3 * stride + dilation * (kernel_size - 1) + 1;
+  const int start = l0 * stride - padding;
 
-  vec4 acc[4];
-  [[unroll]] for (int c = 0; c < 4; ++c) {
-    acc[c] = vec4(0);
-  }
-  for (int ci = 0; ci < Cin; ++ci) {
+  vec4 acc = vec4(0);
+  for (int cl = 0; cl < cin_g; ++cl) {
+    const int ci = cin0 + cl;
     float alpha = 0.0, rsqrt = 0.0, sign = 0.0;
     if ((flags & 1) != 0) {
       alpha = t_in_snake[ci];
@@ -69,7 +74,7 @@ void main() {
     }
     float win[WIN];
     for (int w = 0; w < span; ++w) {
-      const int src = l0 - padding + w;
+      const int src = start + w;
       float x = src >= 0 && src < L_in ? float(t_in[ci * L_in + src]) : 0.0;
       if ((flags & 1) != 0) {
         const float s = sin(alpha * x) * rsqrt;
@@ -79,22 +84,18 @@ void main() {
     }
     for (int k = 0; k < kernel_size; ++k) {
       const int o = k * dilation;
-      const vec4 xs = vec4(win[o], win[o + 1], win[o + 2], win[o + 3]);
-      for (int c = 0; c < C; ++c) {
-        acc[c] = fma(vec4(float(t_weight[(c * Cin + ci) * kernel_size + k])), xs, acc[c]);
-      }
+      const float w = float(t_weight[(co * cin_g + cl) * kernel_size + k]);
+      acc = fma(vec4(w), vec4(win[o], win[o + stride], win[o + 2 * stride], win[o + 3 * stride]), acc);
     }
   }
-  for (int c = 0; c < C; ++c) {
-    const float bias = float(t_bias[c]);
-    [[unroll]] for (int e = 0; e < 4; ++e) {
-      if (l0 + e < L) {
-        float v = acc[c][e] + bias;
-        if ((flags & 8) != 0) {
-          v = clamp(v, out_min, out_max);
-        }
-        t_out[c * L + l0 + e] = T(v);
+  const float bias = float(t_bias[co]);
+  [[unroll]] for (int e = 0; e < 4; ++e) {
+    if (l0 + e < L) {
+      float v = acc[e] + bias;
+      if ((flags & 8) != 0) {
+        v = clamp(v, out_min, out_max);
       }
+      t_out[co * L + l0 + e] = T(v);
     }
   }
 }

@@ -195,6 +195,8 @@ void add_linear_lds_node(
     ComputeGraph& graph,
     const ValueRef input,
     const ValueRef packed_weight,
+    const ValueRef packed_bias,
+    const bool has_bias,
     const ValueRef out,
     const int64_t N) {
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
@@ -202,10 +204,11 @@ void add_linear_lds_node(
       VK_KERNEL_FROM_STR("linear_lds_half"),
       pick_linear_lds_global_wg_size,
       pick_linear_lds_local_wg_size,
-      {{out, vkapi::kWrite}, {{input, packed_weight}, vkapi::kRead}},
+      {{out, vkapi::kWrite},
+       {{input, packed_weight, packed_bias}, vkapi::kRead}},
       {graph.sizes_ubo(input), graph.sizes_ubo(out)},
       {},
-      {},
+      {has_bias ? 1 : 0},
       {graph.add_scalar(N), graph.add_scalar(false)},
       resize_linear_node));
 }
@@ -234,7 +237,9 @@ void linear_packed_weight(
   bool use_coopmat = is_coopmat_eligible(graph, out, M, N, K);
   // fp16 linears that fill whole shared-memory tiles: 1.7x the register-tiled
   // linear_vec on a Samsung Xclipse 940, with fp32 accumulation.
-  const bool use_lds = !use_coopmat && !has_bias && input_sizes.size() == 2 &&
+  const bool use_lds = !use_coopmat &&
+      (input_sizes.size() == 2 ||
+       (input_sizes.size() == 3 && input_sizes.at(0) == 1)) &&
       graph.dtype_of(out) == vkapi::kHalf &&
       graph.storage_type_of(out) == utils::kBuffer &&
       graph.storage_type_of(input) == utils::kBuffer && K % kLdsTileK == 0 &&
@@ -248,13 +253,18 @@ void linear_packed_weight(
       /*force_buffer=*/use_coopmat || use_lds);
 
   if (use_lds) {
-    add_linear_lds_node(graph, input, packed_weight, out, N);
+    // Without a bias, the weight stands in for the unread binding.
+    const ValueRef packed_bias = has_bias
+        ? prepack_standard(graph, bias, utils::kBuffer, utils::kWidthPacked)
+        : packed_weight;
+    add_linear_lds_node(
+        graph, input, packed_weight, packed_bias, has_bias, out, N);
     add_linear_tiled_node(
         graph,
         input,
         packed_weight,
-        kDummyValueRef,
-        /*has_bias=*/false,
+        has_bias ? packed_bias : kDummyValueRef,
+        has_bias,
         out,
         /*weight_B=*/1,
         /*alpha=*/1.0f,

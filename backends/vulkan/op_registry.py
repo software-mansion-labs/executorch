@@ -927,16 +927,20 @@ def register_convolution_cpp_ops():
                 input_storage = utils.HEIGHT_PACKED_TEXTURE
                 output_storage = utils.HEIGHT_PACKED_TEXTURE
 
-            # Batch 1, stride 1 and one group also run on contiguous buffers
-            # (conv1d_lds), which have no length limit.
-            stride = node.args[3]
+            # Batch 1 also runs on contiguous buffers, which have no length
+            # limit: conv1d_lds where a group's in_channels * kernel_size is a
+            # multiple of 16, conv1d_direct where its input window fits.
+            stride, dilation = node.args[3][0], node.args[5][0]
+            terms = c_in // groups * kernel_size if isinstance(groups, int) else 0
             if (
                 not node.args[6]
                 and isinstance(x_shape[0], int)
                 and x_shape[0] == 1
-                and groups == 1
-                and list(stride) == [1]
-                and (c_in * kernel_size) % 16 == 0
+                and terms > 0
+                and (
+                    terms % 16 == 0
+                    or 3 * stride + dilation * (kernel_size - 1) + 1 <= 64
+                )
             ):
                 input_storage = utils.TensorRepSet(
                     utils.CONTIGUOUS_BUFFER.valid_buffer_layouts,
@@ -1241,6 +1245,64 @@ def register_snake():
         inputs_storage=[
             utils.CONTIGUOUS_BUFFER,  # x
             utils.NO_STORAGE,  # params (prepacked)
+        ],
+        outputs_storage=utils.CONTIGUOUS_BUFFER,
+        inputs_dtypes=utils.FP_T,
+        supports_resize=True,
+        supports_prepacking=True,
+    )
+
+
+@update_features(exir_ops.edge.et_vk.conv1d_q8.default)
+def register_conv1d_q8():
+    none = utils.NO_STORAGE
+    return OpFeatures(
+        inputs_storage=[
+            utils.CONTIGUOUS_BUFFER,  # x
+            none,  # weight (prepacked)
+            none,  # scales (prepacked)
+            none,  # bias (prepacked)
+            none,  # kernel_size
+            none,  # stride
+            none,  # padding
+            none,  # dilation
+            none,  # groups
+            none,  # in_snake (prepacked)
+            none,  # out_snake (prepacked)
+            utils.CONTIGUOUS_BUFFER,  # residual
+        ],
+        outputs_storage=utils.CONTIGUOUS_BUFFER,
+        inputs_dtypes=[utils.FP_T, utils.INT_T, utils.FP_T, utils.FP_T]
+        + [utils.NONE_T] * 5
+        + [utils.FP_T] * 3,
+        outputs_dtypes=utils.FP_T,
+        supports_resize=True,
+        supports_prepacking=True,
+    )
+
+
+@update_features(exir_ops.edge.et_vk.linear_qgsw.default)
+def register_linear_qgsw():
+    none = utils.NO_STORAGE
+    return OpFeatures(
+        inputs_storage=[utils.CONTIGUOUS_BUFFER, none, none, none, none, none],
+        outputs_storage=utils.CONTIGUOUS_BUFFER,
+        inputs_dtypes=[utils.FP_T, utils.INT_T, utils.FP_T, utils.FP_T]
+        + [utils.NONE_T] * 2,
+        outputs_dtypes=utils.FP_T,
+        supports_resize=True,
+        supports_prepacking=True,
+    )
+
+
+@update_features(exir_ops.edge.et_vk.instance_norm.default)
+def register_instance_norm():
+    return OpFeatures(
+        inputs_storage=[
+            utils.CONTIGUOUS_BUFFER,  # x
+            utils.NO_STORAGE,  # weight (prepacked)
+            utils.NO_STORAGE,  # bias (prepacked)
+            utils.NO_STORAGE,  # eps
         ],
         outputs_storage=utils.CONTIGUOUS_BUFFER,
         inputs_dtypes=utils.FP_T,
