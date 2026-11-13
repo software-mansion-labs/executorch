@@ -40,11 +40,14 @@ layout(std430) buffer;
 ${layout_declare_tensor(B, "w", "t_output", DTYPE, "buffer", is_scalar_array=False)}
 ${layout_declare_tensor(B, "r", "t_mat1", DTYPE, "buffer", is_scalar_array=False)}
 ${layout_declare_tensor(B, "r", "t_weight_packed", DTYPE, "buffer", is_scalar_array=False)}
+${layout_declare_tensor(B, "r", "t_bias", DTYPE, "buffer", is_scalar_array=False)}
 
 ${layout_declare_ubo(B, "ivec4", "mat1_sizes")}
 ${layout_declare_ubo(B, "ivec4", "out_sizes")}
 
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
+
+${layout_declare_spec_const(C, "int", "has_bias", "0")}
 
 // As[k4][m]: 4 consecutive k of one input row. Bs[k][n4]: 4 consecutive output columns of one k. One padding
 // column each, so the strided writes spread over the banks.
@@ -132,7 +135,11 @@ void main() {
     const int m = m_0 + ty + TY * i;
     if (m < M) {
       [[unroll]] for (int j = 0; j < TN4; ++j) {
-        t_output[m * N4 + n4_0 + tx + TX * j] = VEC4_T(acc[i][j]);
+        vec4 v = acc[i][j];
+        if (has_bias != 0) {
+          v += vec4(t_bias[n4_0 + tx + TX * j]);
+        }
+        t_output[m * N4 + n4_0 + tx + TX * j] = VEC4_T(v);
       }
     }
   }
