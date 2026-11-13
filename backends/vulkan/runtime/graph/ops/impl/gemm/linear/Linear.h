@@ -21,6 +21,7 @@ void add_linear_tiled_node(
     const ValueRef out,
     int32_t weight_B = 1,
     float alpha = 1.0f,
-    float beta = 1.0f);
+    float beta = 1.0f,
+    bool m1_only = false);
 
 } // namespace vkcompute

@@ -77,13 +77,17 @@ GlobalWorkGrid conv1d_gwg(
 // Buffer-backed conv1d with stride 1 and one group: conv1d_lds, a shared-memory
 // tiled implicit matmul over the weight's rows x the output columns with
 // in_channels * kernel_size terms (conv1d_direct for at most 4 rows). The
-// optional tensors, `phases` and `crop` are et_vk.conv1d_fused's fusions.
+// optional tensors, `phases` and `crop` are et_vk.conv1d_fused's fusions; the
+// clamp is et_vk.conv_with_clamp's.
 struct Conv1dFusion {
   ValueRef in_snake = kDummyValueRef;
   ValueRef out_snake = kDummyValueRef;
   ValueRef residual = kDummyValueRef;
   int32_t phases = 1;
   int32_t crop = 0;
+  bool clamp = false;
+  float out_min = 0.0f;
+  float out_max = 0.0f;
 };
 
 void add_conv1d_lds_node(
@@ -127,6 +131,9 @@ void add_conv1d_lds_node(
   if (present(fusion.residual)) {
     residual = fusion.residual;
     flags |= 4;
+  }
+  if (fusion.clamp) {
+    flags |= 8;
   }
 
   const std::vector<int64_t> weight_sizes = graph.sizes_of(weight);
@@ -197,7 +204,9 @@ void add_conv1d_lds_node(
        padding_size,
        fusion.phases,
        fusion.crop,
-       flags},
+       flags,
+       fusion.out_min,
+       fusion.out_max},
       resize_args,
       resize_fn));
 }
@@ -274,7 +283,7 @@ void add_conv1d_direct_node(
     const int64_t terms =
         graph.size_at<int64_t>(-2, in) * graph.sizes_of(weight).at(2);
     VK_CHECK_COND(
-        !clamp_out && graph.size_at<int64_t>(-3, in) == 1 &&
+        graph.size_at<int64_t>(-3, in) == 1 &&
             graph.get_int(groups) == 1 &&
             graph.get_int_list(stride)->at(0) == 1 &&
             graph.is_buffer_storage(in) &&
@@ -287,6 +296,12 @@ void add_conv1d_direct_node(
         static_cast<int32_t>(graph.get_int_list(dilation)->at(0));
     const int32_t padding_size =
         static_cast<int32_t>(graph.get_int_list(padding)->at(0));
+    Conv1dFusion fusion;
+    if (clamp_out) {
+      fusion.clamp = true;
+      fusion.out_min = graph.extract_scalar<float>(out_min);
+      fusion.out_max = graph.extract_scalar<float>(out_max);
+    }
     return add_conv1d_lds_node(
         graph,
         in,
@@ -294,7 +309,7 @@ void add_conv1d_direct_node(
         bias,
         dilation_size,
         padding_size,
-        Conv1dFusion(),
+        fusion,
         out,
         {weight, stride, padding, dilation},
         resize_conv1d_node);
