@@ -33,8 +33,10 @@ void resize_arange_node(
     step_val = graph->extract_scalar<int64_t>(extra_args.at(2));
   }
 
+  // ceil((end - start) / step), for either sign of step.
   const std::vector<int64_t> out_sizes = {
-      utils::div_up(end_val - start_val, step_val)};
+      step_val > 0 ? utils::div_up(end_val - start_val, step_val)
+                   : utils::div_up(start_val - end_val, -step_val)};
 
   graph->virtual_resize(out, out_sizes);
 }

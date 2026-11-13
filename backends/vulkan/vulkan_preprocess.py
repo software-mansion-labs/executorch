@@ -179,7 +179,7 @@ class VulkanBackend(BackendDetails):
                 AddmmToLinearTransform(program),
                 InsertDtypePromotionPass(),
                 FusePatternsPass(),
-                Conv1dAsConv2dPass(),
+                Conv1dAsConv2dPass(texture_limits),
                 FuseClampPass(),
                 RemoveRedundantOpsTransform(),
                 ReplaceInstanceNormPass(),

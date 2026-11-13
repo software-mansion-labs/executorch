@@ -16,6 +16,12 @@ ${define_required_extensions(STORAGE, DTYPE)}
 #define T ${buffer_scalar_type(DTYPE)}
 
 #define op(X, A, B) ${OPERATOR}
+$if DTYPE == "half":
+  #define ARITH(x) float(x)
+  #define ARITH4(x) vec4(x)
+$else:
+  #define ARITH(x) (x)
+  #define ARITH4(x) (x)
 
 ${define_active_storage_type(STORAGE)}
 
@@ -61,7 +67,7 @@ void main() {
   }
 
   VEC4_T in_texel = texelFetch(t_in, pos, 0);
-  imageStore(t_out, pos, VEC4_T(op(in_texel, minimum, maximum)));
+  imageStore(t_out, pos, VEC4_T(op(ARITH4(in_texel), minimum, maximum)));
 }
 
 #endif

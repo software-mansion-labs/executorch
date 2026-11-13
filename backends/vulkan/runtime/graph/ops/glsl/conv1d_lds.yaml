@@ -1,0 +1,30 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+conv1d_lds:
+  parameter_names_with_default_values:
+    DTYPE: half
+    TX: 8
+    TY: 8
+    TN4: 2
+    QUANT: none
+  generate_variant_forall:
+    DTYPE:
+      - VALUE: half
+      - VALUE: float
+  shader_variants:
+    - NAME: conv1d_lds
+    - NAME: conv1d_lds_m32
+      TX: 16
+      TY: 4
+      TN4: 1
+    - NAME: conv1d_lds_q8
+      QUANT: q8
+    - NAME: conv1d_lds_m32_q8
+      TX: 16
+      TY: 4
+      TN4: 1
+      QUANT: q8

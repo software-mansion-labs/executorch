@@ -28,6 +28,12 @@ $else:
   #define VEC4_OUT_T VEC4_T
 
 #define op(X, Y, A) ${OPERATOR}
+$if DTYPE == "half":
+  #define ARITH(x) float(x)
+  #define ARITH4(x) vec4(x)
+$else:
+  #define ARITH(x) (x)
+  #define ARITH4(x) (x)
 
 ${define_active_storage_type("buffer")}
 
@@ -68,7 +74,7 @@ void main() {
 
   // Simple case; no broadcasting
   if (are_equal(inp, otherp)) {
-    t_out[out_bufi] = T(op(t_in[out_bufi], t_other[out_bufi], T(alpha)));
+    t_out[out_bufi] = T(op(ARITH(t_in[out_bufi]), ARITH(t_other[out_bufi]), ARITH(T(alpha))));
     return;
   }
 
@@ -83,5 +89,5 @@ void main() {
   uint inp_bufi = tensor_idx_to_linear_idx(inp, inp_tidx);
   uint other_bufi = tensor_idx_to_linear_idx(otherp, other_tidx);
 
-  t_out[out_bufi] = T(op(t_in[inp_bufi], t_other[other_bufi], T(alpha)));
+  t_out[out_bufi] = T(op(ARITH(t_in[inp_bufi]), ARITH(t_other[other_bufi]), ARITH(T(alpha))));
 }

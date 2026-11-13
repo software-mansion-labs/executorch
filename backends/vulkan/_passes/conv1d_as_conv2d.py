@@ -15,7 +15,14 @@ from executorch.backends.transforms.utils import (
     is_param_node,
     set_param_tensor,
 )
-from executorch.backends.vulkan.utils import conv1d_transposed_is_rewritable
+from executorch.backends.vulkan.serialization.vulkan_graph_schema import VkMemoryLayout
+from executorch.backends.vulkan.utils import (
+    conv1d_transposed_is_rewritable,
+    extents_are_valid,
+    ImageExtents,
+    required_image_extents,
+    upper_bound_size,
+)
 from executorch.exir.dialects._ops import ops as exir_ops
 from executorch.exir.pass_base import ExportPass, PassResult
 
@@ -56,9 +63,28 @@ class Conv1dAsConv2dPass(ExportPass):
     because the conv2d implementation reads it as a constant TensorRef.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, texture_limits: Optional[ImageExtents] = None) -> None:
         super().__init__()
         self._exported_program: Optional[ExportedProgram] = None
+        self._texture_limits = texture_limits
+
+    def _fits_textures(self, node: torch.fx.Node) -> bool:
+        """Whether the 2-D form's input and output fit channels-packed
+        textures. A 1-D convolution that does not stays 1-D: the partitioner
+        only accepted it for buffer storage (conv1d_lds)."""
+        if self._texture_limits is None:
+            return True
+        for val in (node.args[0].meta["val"], node.meta["val"]):
+            bounds = [upper_bound_size(d) for d in val.shape]
+            if any(b is None for b in bounds):
+                return False
+            extents = required_image_extents(
+                torch.Size([bounds[0], bounds[1], 1, bounds[2]]),
+                VkMemoryLayout.TENSOR_CHANNELS_PACKED,
+            )
+            if not extents_are_valid(extents, self._texture_limits):
+                return False
+        return True
 
     def _eligible(self, node: torch.fx.Node) -> bool:
         assert self._exported_program is not None
@@ -89,6 +115,8 @@ class Conv1dAsConv2dPass(ExportPass):
         if w_shape[0] < _IM2COL_MIN_C_OUT or w_shape[2] == 1:
             return False
         # im2col requires unit dilation.
+        if not self._fits_textures(node):
+            return False
         return list(node.args[5]) == [1]
 
     def _rewrite(self, graph: torch.fx.Graph, node: torch.fx.Node) -> None:
