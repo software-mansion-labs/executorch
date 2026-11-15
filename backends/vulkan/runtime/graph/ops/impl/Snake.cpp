@@ -50,9 +50,10 @@ void snake(ComputeGraph& graph, const std::vector<ValueRef>& args) {
          const std::vector<ValueRef>& r) -> utils::uvec3 {
         (void)shader;
         (void)r;
-        const uint32_t numel =
-            static_cast<uint32_t>(g->numel_of(a.at(0).refs.at(0)));
-        return {utils::div_up(numel, 4u), 1u, 1u};
+        const ValueRef in = a.at(1).refs.at(0);
+        const uint32_t L = g->size_at<uint32_t>(-1, in);
+        const uint32_t rows = static_cast<uint32_t>(g->numel_of(in)) / L;
+        return {utils::div_up(L, 4u), rows, 1u};
       },
       [](ComputeGraph* g,
          const vkapi::ShaderInfo& shader,

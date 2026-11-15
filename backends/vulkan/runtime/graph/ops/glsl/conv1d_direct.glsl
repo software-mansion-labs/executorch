@@ -75,7 +75,8 @@ void main() {
     float win[WIN];
     for (int w = 0; w < span; ++w) {
       const int src = start + w;
-      float x = src >= 0 && src < L_in ? float(t_in[ci * L_in + src]) : 0.0;
+      const float x_ld = float(t_in[ci * L_in + clamp(src, 0, L_in - 1)]);
+      float x = src >= 0 && src < L_in ? x_ld : 0.0;
       if ((flags & 1) != 0) {
         const float s = sin(alpha * x) * rsqrt;
         x += sign * s * s;

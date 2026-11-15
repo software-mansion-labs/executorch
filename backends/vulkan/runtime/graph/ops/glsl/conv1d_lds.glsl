@@ -104,7 +104,8 @@ void gather(out T rb[COLS], const int term, const int n_b, const int L_in, const
   }
   [[unroll]] for (int c = 0; c < COLS; ++c) {
     const int src = base + c * stride;
-    T v = src >= lo && src < hi ? t_in[src] : T(0);
+    const T x_ld = t_in[clamp(src, lo, hi - 1)];
+    T v = src >= lo && src < hi ? x_ld : T(0);
     if ((flags & 1) != 0) {
       const float x = float(v);
       const float s = sin(alpha * x) * rsqrt;
@@ -152,7 +153,8 @@ void main() {
   [[unroll]] for (int p = 0; p < A_PER; ++p) {
     const int idx = tid + p * NTHREADS;
     const int m = m_0 + idx / BK4;
-    ra[p] = m < M ? load_weight(row0 + m, idx % BK4, K4) : VEC4_T(0);
+    const VEC4_T a_ld = load_weight(row0 + min(m, M - 1), idx % BK4, K4);
+    ra[p] = m < M ? a_ld : VEC4_T(0);
   }
   gather(rb, kl, n_b, L_in, Cin, cin0);
 
@@ -172,7 +174,8 @@ void main() {
       [[unroll]] for (int p = 0; p < A_PER; ++p) {
         const int idx = tid + p * NTHREADS;
         const int m = m_0 + idx / BK4;
-        ra[p] = m < M ? load_weight(row0 + m, next + idx % BK4, K4) : VEC4_T(0);
+        const VEC4_T a_ld = load_weight(row0 + min(m, M - 1), next + idx % BK4, K4);
+        ra[p] = m < M ? a_ld : VEC4_T(0);
       }
       gather(rb, next * 4 + kl, n_b, L_in, Cin, cin0);
     }
@@ -196,35 +199,34 @@ void main() {
 
   [[unroll]] for (int i = 0; i < TM; ++i) {
     const int m = m_0 + ty + TY * i;
-    if (m < M) {
-      const int row = row0 + m;
-      const float bias = float(t_bias[row]);
-      const int r = row / C;
-      const int c = row - r * C;
-      float alpha = 0.0, rsqrt = 0.0, sign = 0.0;
-      if ((flags & 2) != 0) {
-        alpha = t_out_snake[c];
-        rsqrt = t_out_snake[C + c];
-        sign = t_out_snake[2 * C + c];
-      }
-      [[unroll]] for (int j = 0; j < TN4; ++j) {
-        const int q = (n4_0 + tx + TX * j) * 4;
-        [[unroll]] for (int e = 0; e < 4; ++e) {
-          const int t = (q + e) * phases + r - crop;
-          if (q + e < N && t >= 0 && t < L) {
-            float v = acc[i][j][e] + bias;
-            if ((flags & 2) != 0) {
-              const float s = sin(alpha * v) * rsqrt;
-              v += sign * s * s;
-            }
-            if ((flags & 4) != 0) {
-              v += float(t_residual[c * L + t]);
-            }
-            if ((flags & 8) != 0) {
-              v = clamp(v, out_min, out_max);
-            }
-            t_out[c * L + t] = T(v);
-          }
+    // Loads from clamped indices, stores guarded: see the tile loads.
+    const int row = row0 + min(m, M - 1);
+    const float bias = float(t_bias[row]);
+    const int r = row / C;
+    const int c = row - r * C;
+    float alpha = 0.0, rsqrt = 0.0, sign = 0.0;
+    if ((flags & 2) != 0) {
+      alpha = t_out_snake[c];
+      rsqrt = t_out_snake[C + c];
+      sign = t_out_snake[2 * C + c];
+    }
+    [[unroll]] for (int j = 0; j < TN4; ++j) {
+      const int q = (n4_0 + tx + TX * j) * 4;
+      [[unroll]] for (int e = 0; e < 4; ++e) {
+        const int t = (q + e) * phases + r - crop;
+        float v = acc[i][j][e] + bias;
+        if ((flags & 2) != 0) {
+          const float s = sin(alpha * v) * rsqrt;
+          v += sign * s * s;
+        }
+        if ((flags & 4) != 0) {
+          v += float(t_residual[c * L + clamp(t, 0, L - 1)]);
+        }
+        if ((flags & 8) != 0) {
+          v = clamp(v, out_min, out_max);
+        }
+        if (m < M && q + e < N && t >= 0 && t < L) {
+          t_out[c * L + t] = T(v);
         }
       }
     }
