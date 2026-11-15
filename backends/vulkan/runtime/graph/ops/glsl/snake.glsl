@@ -30,14 +30,16 @@ layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 void main() {
   const int L = in_sizes.x;
   const int C = in_sizes.y;
-  const int e0 = int(gl_GlobalInvocationID.x) * 4;
+  // One row (batch, channel) per y: a 1-D grid over every element would exceed 65535 workgroups.
+  const int row = int(gl_GlobalInvocationID.y);
+  const int c = row % C;
+  const int l0 = int(gl_GlobalInvocationID.x) * 4;
   [[unroll]] for (int i = 0; i < 4; ++i) {
-    const int e = e0 + i;
-    if (e < L * C) {
-      const int c = e / L;
-      const float x = float(t_in[e]);
-      const float r = sin(t_params[c] * x) * t_params[C + c];
-      t_out[e] = T(x + t_params[2 * C + c] * r * r);
+    const int l = l0 + i;
+    const float x = float(t_in[row * L + min(l, L - 1)]);
+    const float r = sin(t_params[c] * x) * t_params[C + c];
+    if (l < L) {
+      t_out[row * L + l] = T(x + t_params[2 * C + c] * r * r);
     }
   }
 }

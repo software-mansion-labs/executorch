@@ -239,7 +239,10 @@ void reduce_packed_dim() {
   val = shared_input[offset_pos_index(shared_idx_offset)];
   var = (val.x + val.y + val.z + val.w) / width;
 
-  T rstd = pow(var + T(epsilon), T(-0.5));
+  $if DTYPE == "half":
+    T rstd = T(inversesqrt(float(var) + epsilon));
+  $else:
+    T rstd = pow(var + T(epsilon), T(-0.5));
   T offset = -rstd * mean;
 
   VEC4_T v = texelFetch(t_in, lpos, 0);

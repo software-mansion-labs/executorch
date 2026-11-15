@@ -92,10 +92,12 @@ void main() {
   [[unroll]] for (int p = 0; p < A_PER; ++p) {
     const int idx = tid + p * NTHREADS;
     const int m = m_0 + idx / BK4;
-    ra[p] = m < S ? t_q[(m * Q_H + q_h) * D4 + idx % BK4] : VEC4_T(0);
+    const VEC4_T a_ld = t_q[(min(m, S - 1) * Q_H + q_h) * D4 + idx % BK4];
+    ra[p] = m < S ? a_ld : VEC4_T(0);
   }
   [[unroll]] for (int i = 0; i < 4; ++i) {
-    rb[i] = c_b + i < context_len ? t_k[((c_b + i) * KV_H + kv_h) * D4 + d4l] : VEC4_T(0);
+    const VEC4_T b_ld = t_k[(min(c_b + i, context_len - 1) * KV_H + kv_h) * D4 + d4l];
+    rb[i] = c_b + i < context_len ? b_ld : VEC4_T(0);
   }
 
   for (int k4_0 = 0; k4_0 < D4; k4_0 += BK4) {
@@ -114,10 +116,12 @@ void main() {
       [[unroll]] for (int p = 0; p < A_PER; ++p) {
         const int idx = tid + p * NTHREADS;
         const int m = m_0 + idx / BK4;
-        ra[p] = m < S ? t_q[(m * Q_H + q_h) * D4 + next + idx % BK4] : VEC4_T(0);
+        const VEC4_T a_ld = t_q[(min(m, S - 1) * Q_H + q_h) * D4 + next + idx % BK4];
+        ra[p] = m < S ? a_ld : VEC4_T(0);
       }
       [[unroll]] for (int i = 0; i < 4; ++i) {
-        rb[i] = c_b + i < context_len ? t_k[((c_b + i) * KV_H + kv_h) * D4 + next + d4l] : VEC4_T(0);
+        const VEC4_T b_ld = t_k[(min(c_b + i, context_len - 1) * KV_H + kv_h) * D4 + next + d4l];
+        rb[i] = c_b + i < context_len ? b_ld : VEC4_T(0);
       }
     }
 
@@ -142,19 +146,16 @@ void main() {
   const int mask_C = mask_sizes.x;
   [[unroll]] for (int i = 0; i < TM; ++i) {
     const int m = m_0 + ty + TY * i;
-    if (m < S) {
-      [[unroll]] for (int j = 0; j < TN4; ++j) {
-        const int n4 = n4_0 + tx + TX * j;
-        if (n4 < C4) {
-          vec4 v = acc[i][j] * inv_scale;
-          [[unroll]] for (int e = 0; e < 4; ++e) {
-            const int c = n4 * 4 + e;
-            if (c < mask_C) {
-              v[e] += float(t_mask[m * mask_C + c]);
-            }
-          }
-          t_attn_weights[(q_h * S_aligned + m) * C4 + n4] = VEC4_T(v);
-        }
+    [[unroll]] for (int j = 0; j < TN4; ++j) {
+      const int n4 = n4_0 + tx + TX * j;
+      vec4 v = acc[i][j] * inv_scale;
+      [[unroll]] for (int e = 0; e < 4; ++e) {
+        const int c = n4 * 4 + e;
+        const float mk = float(t_mask[min(m, S - 1) * mask_C + min(c, mask_C - 1)]);
+        v[e] = c < mask_C ? v[e] + mk : v[e];
+      }
+      if (m < S && n4 < C4) {
+        t_attn_weights[(q_h * S_aligned + m) * C4 + n4] = VEC4_T(v);
       }
     }
   }

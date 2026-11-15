@@ -93,7 +93,8 @@ void main() {
   [[unroll]] for (int p = 0; p < A_PER; ++p) {
     const int idx = tid + p * NTHREADS;
     const int m = m_0 + idx / BK4;
-    ra[p] = m < M ? t_mat1[m * K4 + idx % BK4] : VEC4_T(0);
+    const VEC4_T a_ld = t_mat1[min(m, M - 1) * K4 + idx % BK4];
+    ra[p] = m < M ? a_ld : VEC4_T(0);
   }
   const bool loads_b = tid < BK4 * 8;
   ivec4 rb = ivec4(0);
@@ -121,7 +122,8 @@ void main() {
       [[unroll]] for (int p = 0; p < A_PER; ++p) {
         const int idx = tid + p * NTHREADS;
         const int m = m_0 + idx / BK4;
-        ra[p] = m < M ? t_mat1[m * K4 + next + idx % BK4] : VEC4_T(0);
+        const VEC4_T a_ld = t_mat1[min(m, M - 1) * K4 + next + idx % BK4];
+        ra[p] = m < M ? a_ld : VEC4_T(0);
       }
       if (loads_b) {
         rb = t_packed_weight[(next + k4l) * N8 + n8];

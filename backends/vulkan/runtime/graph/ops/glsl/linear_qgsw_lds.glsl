@@ -118,7 +118,8 @@ void main() {
   [[unroll]] for (int p = 0; p < A_PER; ++p) {
     const int idx = tid + p * NTHREADS;
     const int m = m_0 + idx / BK4;
-    ra[p] = m < M ? t_mat1[m * K4 + idx % BK4] : VEC4_T(0);
+    const VEC4_T a_ld = t_mat1[min(m, M - 1) * K4 + idx % BK4];
+    ra[p] = m < M ? a_ld : VEC4_T(0);
   }
   load_weight(rb, tid, 0, n4_0, N4);
 
@@ -136,7 +137,8 @@ void main() {
       [[unroll]] for (int p = 0; p < A_PER; ++p) {
         const int idx = tid + p * NTHREADS;
         const int m = m_0 + idx / BK4;
-        ra[p] = m < M ? t_mat1[m * K4 + next + idx % BK4] : VEC4_T(0);
+        const VEC4_T a_ld = t_mat1[min(m, M - 1) * K4 + next + idx % BK4];
+        ra[p] = m < M ? a_ld : VEC4_T(0);
       }
       load_weight(rb, tid, next * 4, n4_0, N4);
     }
@@ -160,12 +162,12 @@ void main() {
 
   [[unroll]] for (int i = 0; i < TM; ++i) {
     const int m = m_0 + ty + TY * i;
-    if (m < M) {
-      [[unroll]] for (int j = 0; j < TN4; ++j) {
-        vec4 v = acc[i][j];
-        if (has_bias != 0) {
-          v += vec4(t_bias[n4_0 + tx + TX * j]);
-        }
+    [[unroll]] for (int j = 0; j < TN4; ++j) {
+      vec4 v = acc[i][j];
+      if (has_bias != 0) {
+        v += vec4(t_bias[n4_0 + tx + TX * j]);
+      }
+      if (m < M) {
         t_output[m * N4 + n4_0 + tx + TX * j] = VEC4_T(v);
       }
     }
