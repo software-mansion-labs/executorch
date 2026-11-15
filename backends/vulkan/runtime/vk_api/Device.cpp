@@ -96,6 +96,7 @@ PhysicalDevice::PhysicalDevice(
       supports_float64_shader_types(false),
       has_unified_memory(false),
       has_timestamps(false),
+      supports_fp16_round_to_nearest(false),
       timestamp_period(0),
       min_ubo_alignment(0),
       subgroup_size(0),
@@ -374,9 +375,21 @@ void PhysicalDevice::query_extensions_vk_1_1() {
   properties_list_top = &subgroup_size_control_properties;
 #endif /* VK_EXT_subgroup_size_control */
 
+  // Float controls are core in Vulkan 1.2; not queried below it.
+  VkPhysicalDeviceFloatControlsProperties float_controls_properties{
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+  const bool vulkan_1_2 = properties.apiVersion >= VK_API_VERSION_1_2;
+  if (vulkan_1_2) {
+    float_controls_properties.pNext = properties_list_top;
+    properties_list_top = &float_controls_properties;
+  }
+
   properties2.pNext = properties_list_top;
 
   vkGetPhysicalDeviceProperties2(handle, &properties2);
+
+  supports_fp16_round_to_nearest =
+      vulkan_1_2 && float_controls_properties.shaderRoundingModeRTEFloat16;
 
   subgroup_size = subgroup_properties.subgroupSize;
   supported_subgroup_ops = subgroup_properties.supportedOperations;

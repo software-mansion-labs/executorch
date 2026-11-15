@@ -8,6 +8,8 @@
 
 #include <executorch/backends/vulkan/runtime/graph/ops/OperatorRegistry.h>
 
+#include <memory>
+
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Common.h>
 #include <executorch/backends/vulkan/runtime/graph/ops/impl/Staging.h>
 
@@ -567,6 +569,54 @@ void add_sdpa_compute_attn_weights_node(
     return pick_sdpa_compute_attn_weights_global_wg_size(g, shader, a, r);
   };
 
+  // The LLM SDPA's 2D mask with fp16 buffers: the shared-memory tiled kernel.
+  if (has_mask && graph.dim_of(attn_mask) == 2 && !force_tiled &&
+      !mask_per_head && !has_softcap && !has_fused_qk_softmax &&
+      graph.is_buffer_storage(q_projected) &&
+      graph.is_buffer_storage(k_cache) &&
+      graph.is_buffer_storage(attn_weights) &&
+      graph.is_buffer_storage(attn_mask) &&
+      graph.dtype_of(q_projected) == vkapi::kHalf &&
+      graph.dtype_of(k_cache) == vkapi::kHalf &&
+      graph.dtype_of(attn_mask) == vkapi::kHalf && head_dim_size % 16 == 0) {
+    graph.execute_nodes().emplace_back(new DynamicDispatchNode(
+        graph,
+        VK_KERNEL_FROM_STR("sdpa_qk_lds_half"),
+        [](ComputeGraph* g,
+           const vkapi::ShaderInfo& shader,
+           const std::vector<ArgGroup>& a,
+           const std::vector<ValueRef>& r) -> utils::uvec3 {
+          (void)shader;
+          (void)r;
+          const uint32_t heads = g->size_at<uint32_t>(-2, a.at(1).refs.at(0));
+          const uint32_t S = g->size_at<uint32_t>(-3, a.at(1).refs.at(0));
+          const uint32_t C = g->size_at<uint32_t>(-3, a.at(1).refs.at(1));
+          return {
+              utils::div_up(utils::div_up_4(C), 16u) * 8u,
+              utils::div_up(S, 64u) * 8u,
+              heads};
+        },
+        [](ComputeGraph* g,
+           const vkapi::ShaderInfo& shader,
+           const utils::uvec3& global,
+           const std::vector<ArgGroup>& a,
+           const std::vector<ValueRef>& r) -> utils::uvec3 {
+          (void)g;
+          (void)shader;
+          (void)global;
+          (void)a;
+          (void)r;
+          return {8u, 8u, 1u};
+        },
+        arg_groups,
+        param_ubos,
+        {},
+        {scale_val},
+        {input_pos_symint},
+        resize_compute_attn_weights_node));
+    return;
+  }
+
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(
       graph,
       pick_shader_fn,
@@ -945,12 +995,19 @@ void sdpa_impl(ComputeGraph& graph, const std::vector<ValueRef>& args) {
       attn_weights_storage,
       utils::kWidthPacked);
 
-  TmpTensor attn_weights_softmax(
-      &graph,
-      attn_weight_full_sizes,
-      graph.dtype_of(q_projected),
-      attn_weights_storage,
-      utils::kWidthPacked);
+  // Buffer-backed weights are normalized in place: each row is read in full by
+  // the invocations that then overwrite it, so a second buffer is not needed.
+  std::unique_ptr<TmpTensor> separate_softmax;
+  if (attn_weights_storage != utils::kBuffer) {
+    separate_softmax = std::make_unique<TmpTensor>(
+        &graph,
+        attn_weight_full_sizes,
+        graph.dtype_of(q_projected),
+        attn_weights_storage,
+        utils::kWidthPacked);
+  }
+  const ValueRef attn_weights_softmax =
+      separate_softmax ? ValueRef(*separate_softmax) : ValueRef(attn_weights);
 
   const float inv_scale_override = graph.val_is_none(scale)
       ? -1.0f

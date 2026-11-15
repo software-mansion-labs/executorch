@@ -198,6 +198,14 @@ GraphConfig get_graph_config(ArrayRef<CompileSpec>& compile_specs) {
 
       config.warmup_execute_after_compile = value;
     }
+    if (strcmp(spec.key, "shared_workspace") == 0) {
+      ET_CHECK_MSG(value_size == sizeof(uint8_t), "Unexpected value size!");
+      config.shared_workspace = getBool(value_data);
+    }
+    if (strcmp(spec.key, "fp16_round_to_nearest") == 0) {
+      ET_CHECK_MSG(value_size == sizeof(uint8_t), "Unexpected value size!");
+      config.context_config.fp16_round_to_nearest = getBool(value_data);
+    }
   }
 #ifdef ET_EVENT_TRACER_ENABLED
   config.enable_querypool = true;
@@ -301,6 +309,7 @@ class GraphBuilder {
             static_cast<uint32_t>(buffer.error()));
         ref = compute_graph_->add_tensorref(
             dims_vector, dtype, std::move(buffer.get()));
+        compute_graph_->get_tref(ref)->key = data_name;
       } else {
         const uint64_t offset = constant_bytes->offset();
         VK_CHECK_COND(
@@ -716,6 +725,9 @@ class VulkanBackend final : public ::executorch::runtime::BackendInterface {
     EXECUTORCH_SCOPE_PROF("VulkanBackend::execute");
 
     ComputeGraph* compute_graph = static_cast<ComputeGraph*>(handle);
+    // Held until the outputs are copied out (GraphConfig::shared_workspace).
+    std::unique_lock<std::mutex> workspace_lock =
+        compute_graph->lock_workspace();
 
     const size_t num_inputs = compute_graph->inputs().size();
     const size_t num_outputs = compute_graph->outputs().size();

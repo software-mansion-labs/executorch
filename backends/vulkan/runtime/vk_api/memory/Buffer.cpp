@@ -151,15 +151,20 @@ VmaAllocationInfo VulkanBuffer::allocation_info() const {
   return info;
 }
 
-void VulkanBuffer::bind_allocation_impl(const Allocation& memory) {
+void VulkanBuffer::bind_allocation_impl(
+    const Allocation& memory,
+    const VkDeviceSize offset) {
   VK_CHECK_COND(!memory_, "Cannot bind an already bound allocation!");
   if (!is_copy_) {
-    VK_CHECK(vmaBindBufferMemory(allocator_, memory.allocation, handle_));
+    VK_CHECK(vmaBindBufferMemory2(
+        allocator_, memory.allocation, offset, handle_, nullptr));
   }
 }
 
-void VulkanBuffer::bind_allocation(const Allocation& memory) {
-  bind_allocation_impl(memory);
+void VulkanBuffer::bind_allocation(
+    const Allocation& memory,
+    const VkDeviceSize offset) {
+  bind_allocation_impl(memory, offset);
   memory_.allocation = memory.allocation;
 }
 

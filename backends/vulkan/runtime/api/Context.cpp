@@ -154,7 +154,7 @@ vkapi::DescriptorSet Context::get_descriptor_set(
 
   VkPipeline pipeline = pipeline_cache().retrieve(
       {pipeline_layout_cache().retrieve(shader_layout, push_constants_size),
-       shader_cache().retrieve(shader_descriptor),
+       shader_module(shader_descriptor),
        spec_constants,
        resolved_required_subgroup_size});
 
@@ -337,7 +337,7 @@ VkPipeline Context::get_shader_pipeline(
 
   VkPipeline pipeline = pipeline_cache().retrieve(
       {pipeline_layout,
-       shader_cache().retrieve(shader),
+       shader_module(shader),
        spec_constants,
        resolved_required_subgroup_size});
 

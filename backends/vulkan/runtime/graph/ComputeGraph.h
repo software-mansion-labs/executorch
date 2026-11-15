@@ -224,6 +224,20 @@ class ComputeGraph final {
   // Flag to indicate if re-encoding is required
   bool requires_reencode_ = false;
 
+  // GraphConfig::shared_workspace: each shared object's offset in the device
+  // workspace and each staging buffer's in the host one, the space the graph
+  // needs in each, and the workspaces once bound.
+  std::vector<VkDeviceSize> workspace_offsets_;
+  std::vector<std::pair<ValueRef, VkDeviceSize>> staging_offsets_;
+  VkMemoryRequirements workspace_requirements_{};
+  VkMemoryRequirements staging_requirements_{};
+  std::shared_ptr<vkapi::Allocation> workspace_;
+  std::shared_ptr<vkapi::Allocation> staging_workspace_;
+  bool workspace_bound_ = false;
+
+  // Allocations of packed constants shared with other graphs.
+  std::vector<std::shared_ptr<vkapi::Allocation>> shared_constants_;
+
  protected:
   size_t values_in_use_ = 0;
   size_t execute_count_ = 0;
@@ -979,6 +993,31 @@ class ComputeGraph final {
    */
   void create_dedicated_allocation_for(const ValueRef idx);
 
+  /*
+   * Keeps the allocation of a packed constant shared with other graphs alive
+   * for the lifetime of this graph.
+   */
+  inline void hold_shared_constant(
+      std::shared_ptr<vkapi::Allocation> allocation) {
+    shared_constants_.push_back(std::move(allocation));
+  }
+
+  /*
+   * With GraphConfig::shared_workspace, locks the workspace for one execution
+   * (inputs copied in to outputs copied out), binding it the first time.
+   * Otherwise returns an empty lock.
+   */
+  std::unique_lock<std::mutex> lock_workspace();
+
+ private:
+  // Lays the shared objects and staging buffers out in the shared workspace
+  // and reserves the space.
+  void plan_workspace();
+  // Binds the shared objects and staging buffers to the workspace, and
+  // remaining tensors to their own memory, before the first execution.
+  void bind_workspace();
+
+ public:
   //
   // Graph Preparation
   //

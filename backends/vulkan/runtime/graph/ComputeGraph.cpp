@@ -199,6 +199,9 @@ ComputeGraph::~ComputeGraph() {
     clear_deferred_cmds();
   } catch (...) {
   }
+  if (config_.shared_workspace) {
+    SharedWorkspace::get().release(this);
+  }
 }
 
 std::vector<int64_t> ComputeGraph::extract_int_or_symint_list(
@@ -606,7 +609,9 @@ ValueRef ComputeGraph::add_staging(
     const vkapi::CopyDirection direction) {
   ValueRef idx(static_cast<int>(values_.size()));
   check_no_active_value_ptrs();
-  values_.emplace_back(api::StagingBuffer(context(), dtype, numel, direction));
+  values_.emplace_back(
+      api::StagingBuffer(
+          context(), dtype, numel, direction, !config_.shared_workspace));
   return idx;
 }
 
@@ -836,7 +841,7 @@ void ComputeGraph::register_pipeline_to_create(
 
   const vkapi::ComputePipelineCache::Key desc = {
       context()->pipeline_layout_cache().retrieve(shader_layout, pc_offset),
-      context()->shader_cache().retrieve(shader_info),
+      context()->shader_module(shader_info),
       spec_constants,
       resolved_required_subgroup_size};
 
@@ -1176,6 +1181,13 @@ void ComputeGraph::prepack() {
   context_->flush();
   staging_nbytes_in_cmd_ = 0;
 
+  // With a shared workspace, the shared objects (and the staging buffers) are
+  // bound at the first execution.
+  if (config_.shared_workspace) {
+    plan_workspace();
+    return;
+  }
+
   // Initialize allocations for intermediate tensors
   for (SharedObject& shared_object : shared_objects_) {
     shared_object.allocate(this);
@@ -1189,6 +1201,99 @@ void ComputeGraph::prepack() {
   }
 }
 
+void ComputeGraph::plan_workspace() {
+  const VkDeviceSize granularity = std::max<VkDeviceSize>(
+      context_->adapter_ptr()->buffer_image_granularity(), 1);
+  VkMemoryRequirements total{0, 1, ~0u};
+  workspace_offsets_.assign(shared_objects_.size(), 0);
+  for (size_t i = 0; i < shared_objects_.size(); i++) {
+    const SharedObject& object = shared_objects_[i];
+    if (object.aggregate_memory_requirements.size == 0) {
+      continue;
+    }
+    // Granularity-aligned, so that buffers and images never share a page.
+    const VkDeviceSize alignment =
+        std::max(object.aggregate_memory_requirements.alignment, granularity);
+    workspace_offsets_[i] =
+        (total.size + alignment - 1) / alignment * alignment;
+    total.size =
+        workspace_offsets_[i] + object.aggregate_memory_requirements.size;
+    total.alignment = std::max(total.alignment, alignment);
+    for (const ValueRef user : object.users) {
+      total.memoryTypeBits &=
+          get_tensor(user)->get_memory_requirements().memoryTypeBits;
+    }
+  }
+  workspace_requirements_ = total;
+  if (total.size > 0) {
+    SharedWorkspace::get().reserve(this, SharedWorkspace::kDevice, total);
+  }
+
+  // 256 bytes covers nonCoherentAtomSize, so flushes stay within a buffer.
+  VkMemoryRequirements staging{0, 256, ~0u};
+  staging_offsets_.clear();
+  for (int i = 0; i < values_.size(); i++) {
+    if (values_.at(i).isStaging()) {
+      const VkMemoryRequirements r = get_staging(i)->get_memory_requirements();
+      const VkDeviceSize alignment = std::max<VkDeviceSize>(r.alignment, 256);
+      const VkDeviceSize offset =
+          (staging.size + alignment - 1) / alignment * alignment;
+      staging_offsets_.emplace_back(i, offset);
+      staging.size = offset + r.size;
+      staging.alignment = std::max(staging.alignment, alignment);
+      staging.memoryTypeBits &= r.memoryTypeBits;
+    }
+  }
+  staging_requirements_ = staging;
+  if (staging.size > 0) {
+    SharedWorkspace::get().reserve(this, SharedWorkspace::kHost, staging);
+  }
+}
+
+std::unique_lock<std::mutex> ComputeGraph::lock_workspace() {
+  if (!config_.shared_workspace) {
+    return {};
+  }
+  std::unique_lock<std::mutex> lock(SharedWorkspace::get().execute_mutex());
+  if (!workspace_bound_) {
+    bind_workspace();
+  }
+  return lock;
+}
+
+void ComputeGraph::bind_workspace() {
+  if (staging_requirements_.size > 0) {
+    staging_workspace_ = SharedWorkspace::get().acquire(
+        context_->adapter_ptr(), SharedWorkspace::kHost, staging_requirements_);
+    VmaAllocationInfo info;
+    vmaGetAllocationInfo(
+        staging_workspace_->allocator, staging_workspace_->allocation, &info);
+    VK_CHECK_COND(info.pMappedData != nullptr, "Staging workspace not mapped");
+    for (const auto& entry : staging_offsets_) {
+      get_staging(entry.first)
+          ->bind_allocation(
+              *staging_workspace_, entry.second, info.pMappedData);
+    }
+  }
+  if (workspace_requirements_.size > 0) {
+    workspace_ = SharedWorkspace::get().acquire(
+        context_->adapter_ptr(),
+        SharedWorkspace::kDevice,
+        workspace_requirements_);
+    for (size_t i = 0; i < shared_objects_.size(); i++) {
+      for (const ValueRef user : shared_objects_[i].users) {
+        get_tensor(user)->bind_allocation(*workspace_, workspace_offsets_[i]);
+      }
+    }
+  }
+  for (int i = 0; i < values_.size(); i++) {
+    if (values_.at(i).isTensor()) {
+      create_dedicated_allocation_for(i);
+    }
+  }
+  workspace_bound_ = true;
+}
+
 void ComputeGraph::optional_warmup_execute() {
   if (config_.warmup_execute_after_compile) {
     execute();
@@ -1196,6 +1301,11 @@ void ComputeGraph::optional_warmup_execute() {
 }
 
 void ComputeGraph::execute() {
+  // Callers hold lock_workspace(); bind here too for direct use of a graph.
+  if (config_.shared_workspace && !workspace_bound_) {
+    bind_workspace();
+  }
+
   if (deferred_cmd_list_.empty()) {
     context_->flush();
     context_->set_cmd(/*reusable = */ true);

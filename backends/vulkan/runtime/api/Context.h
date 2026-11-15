@@ -29,6 +29,9 @@ struct ContextConfig final {
   vkapi::CommandPoolConfig cmd_pool_config;
   vkapi::DescriptorPoolConfig descriptor_pool_config;
   vkapi::QueryPoolConfig query_pool_config;
+  // Round fp16 results to nearest even where the device supports choosing it
+  // (vkapi::with_fp16_round_to_nearest); other contexts use shaders as built.
+  bool fp16_round_to_nearest = false;
 };
 
 //
@@ -100,6 +103,16 @@ class Context final {
 
   inline vkapi::ShaderCache& shader_cache() {
     return adapter_ptr()->shader_cache();
+  }
+
+  // The shader module for this context: fp16 rounded to nearest even if the
+  // config asks for it and the device supports it.
+  inline VkShaderModule shader_module(const vkapi::ShaderInfo& shader) {
+    if (config_.fp16_round_to_nearest &&
+        adapter_ptr()->supports_fp16_round_to_nearest()) {
+      return shader_cache().retrieve(vkapi::with_fp16_round_to_nearest(shader));
+    }
+    return shader_cache().retrieve(shader);
   }
 
   inline vkapi::PipelineLayoutCache& pipeline_layout_cache() {

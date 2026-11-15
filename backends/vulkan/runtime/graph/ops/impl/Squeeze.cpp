@@ -76,21 +76,24 @@ void resize_squeeze_node(
   const ValueRef dims_ref = extra_args.at(0);
 
   const IntListPtr dims = graph->get_int_list(dims_ref);
+  const std::vector<int64_t> in_sizes = graph->sizes_of(in);
+  const int64_t ndim = static_cast<int64_t>(in_sizes.size());
 
-  std::vector<int64_t> out_sizes = graph->sizes_of(in);
-
-  // Remove the dimensions specified in dims if their size is 1
+  // Drop the listed dims of size 1, counting negative dims from the end. The
+  // dims list is the graph's own and must not be modified.
+  std::vector<bool> drop(ndim, false);
   for (int64_t dim : *dims) {
-    if (dim >= 0 && dim < static_cast<int64_t>(out_sizes.size()) &&
-        out_sizes[dim] == 1) {
-      out_sizes.erase(out_sizes.begin() + dim);
-      // After erasing, all subsequent dims shift left by one
-      // So we need to decrement all subsequent dims in dims
-      for (auto& d : *dims) {
-        if (d > dim) {
-          --d;
-        }
-      }
+    if (dim < 0) {
+      dim += ndim;
+    }
+    if (dim >= 0 && dim < ndim && in_sizes[dim] == 1) {
+      drop[dim] = true;
+    }
+  }
+  std::vector<int64_t> out_sizes;
+  for (int64_t i = 0; i < ndim; ++i) {
+    if (!drop[i]) {
+      out_sizes.push_back(in_sizes[i]);
     }
   }
 

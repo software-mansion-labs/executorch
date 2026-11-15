@@ -70,6 +70,8 @@ ${layout_declare_spec_const(C, "float", "inv_scale", "1.0")}
 // Gemma4 exports Q/K in DHSB layout; helpers default to DSHB.
 #define Q_LAYOUT DHSB
 #define K_LAYOUT DHSB
+// fp32 accumulation of q . k (the tile type of linear_fp_output_tile.glslh); stores round back to DTYPE.
+#define LINEAR_FP_OUTPUT_TILE_VEC4_T vec4
 #include "sdpa_fp_q_projected_tile_load.glslh"
 #include "sdpa_fp_k_cache_tile_load.glslh"
 #include "linear_fp_output_tile_fp_compute.glslh"

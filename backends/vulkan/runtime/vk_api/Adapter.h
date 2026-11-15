@@ -114,6 +114,14 @@ class Adapter final {
     return device_.handle;
   }
 
+  inline bool supports_fp16_round_to_nearest() const {
+    return physical_device_.supports_fp16_round_to_nearest;
+  }
+
+  inline VkDeviceSize buffer_image_granularity() const {
+    return physical_device_.properties.limits.bufferImageGranularity;
+  }
+
   inline bool has_unified_memory() const {
     return physical_device_.has_unified_memory;
   }

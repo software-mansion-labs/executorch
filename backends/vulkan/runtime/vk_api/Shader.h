@@ -99,6 +99,15 @@ struct ShaderInfo final {
 
 bool operator==(const ShaderInfo& _1, const ShaderInfo& _2);
 
+/*
+ * The shader with fp16 results rounded to nearest even (the SPIR-V execution
+ * mode RoundingModeRTE for 16 bits), for drivers whose default rounding is
+ * toward zero. Shaders without fp16 come back unchanged. The patched code is
+ * kept for the life of the process. The device must support it
+ * (Adapter::supports_fp16_round_to_nearest()).
+ */
+ShaderInfo with_fp16_round_to_nearest(const ShaderInfo& shader);
+
 class ShaderModule final {
  public:
   explicit ShaderModule(VkDevice device, const ShaderInfo& source);

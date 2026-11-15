@@ -1277,14 +1277,16 @@ bool vTensor::memory_is_bound() const {
   }
 }
 
-void vTensor::bind_allocation(const vkapi::Allocation& allocation) {
+void vTensor::bind_allocation(
+    const vkapi::Allocation& allocation,
+    const VkDeviceSize offset) {
   switch (storage_type()) {
     case utils::kBuffer:
-      storage_->buffer_.bind_allocation(allocation);
+      storage_->buffer_.bind_allocation(allocation, offset);
       break;
     case utils::kTexture2D:
     case utils::kTexture3D:
-      storage_->image_.bind_allocation(allocation);
+      storage_->image_.bind_allocation(allocation, offset);
       break;
   }
 }

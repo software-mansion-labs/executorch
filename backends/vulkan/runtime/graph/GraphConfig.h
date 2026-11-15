@@ -80,6 +80,12 @@ struct GraphConfig final {
   // compiled.
   bool warmup_execute_after_compile = false;
 
+  // If true, the graph's working memory (its shared objects) lives in one
+  // allocation shared with the other graphs that set this, sized for the
+  // largest of them, and their executions are serialized. Only for graphs that
+  // keep no state in working memory across executions.
+  bool shared_workspace = false;
+
   vkapi::Adapter* external_adapter;
 
   // Generate a default graph config with pre-configured settings

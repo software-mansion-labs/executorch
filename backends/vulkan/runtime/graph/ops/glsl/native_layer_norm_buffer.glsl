@@ -114,14 +114,22 @@ void main() {
   reduce_shared(worker_id);
 
   const T var_val = shared_sum[0] / T(row_width);
-  const T rstd_val = pow(var_val + T(epsilon), T(-0.5));
+  // fp16: rstd in fp32, as an fp16 epsilon is subnormal and some GPUs (Adreno) flush it to zero (inf on silent rows).
+  $if DTYPE == "half":
+    const float rstd_f = inversesqrt(float(var_val) + epsilon);
+    const T rstd_val = T(rstd_f);
+  $else:
+    const T rstd_val = pow(var_val + T(epsilon), T(-0.5));
 
   // Phase 3: Normalize and write output
   // Weight and bias are 1D tensors of size [width], indexed directly by x.
   for (uint x = worker_id; x < row_width; x += NUM_WORKERS) {
     const uint in_bufi = base_bufi + x * width_stride;
     const T in_val = t_in[in_bufi];
-    const T normalized = (in_val - mean_val) * rstd_val;
+    $if DTYPE == "half":
+      const T normalized = T((float(in_val) - float(mean_val)) * rstd_f);
+    $else:
+      const T normalized = (in_val - mean_val) * rstd_val;
     const T w = t_weight[x];
     const T b = t_bias[x];
     t_out[in_bufi] = normalized * w + b;
