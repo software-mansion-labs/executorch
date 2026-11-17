@@ -14,6 +14,15 @@
 
 namespace vkcompute {
 
+namespace {
+
+// A fixed local work group, never refitted to the global grid.
+LocalWorkGroup fixed_lwg(const utils::uvec3& size) {
+  return LocalWorkGroup(size, size[0u] * size[1u] * size[2u]);
+}
+
+} // namespace
+
 void resize_snake_node(
     ComputeGraph* graph,
     const std::vector<ArgGroup>& args,
@@ -47,25 +56,26 @@ void snake(ComputeGraph& graph, const std::vector<ValueRef>& args) {
       [](ComputeGraph* g,
          const vkapi::ShaderInfo& shader,
          const std::vector<ArgGroup>& a,
-         const std::vector<ValueRef>& r) -> utils::uvec3 {
+         const std::vector<ValueRef>& r) -> GlobalWorkGrid {
         (void)shader;
         (void)r;
         const ValueRef in = a.at(1).refs.at(0);
         const uint32_t L = g->size_at<uint32_t>(-1, in);
         const uint32_t rows = static_cast<uint32_t>(g->numel_of(in)) / L;
-        return {utils::div_up(L, 4u), rows, 1u};
+        return GlobalWorkGrid(
+            utils::uvec3{utils::div_up(L, 4u), rows, 1u}, kExplicitWorkGrid);
       },
       [](ComputeGraph* g,
          const vkapi::ShaderInfo& shader,
-         const utils::uvec3& global,
+         const GlobalWorkGrid& global,
          const std::vector<ArgGroup>& a,
-         const std::vector<ValueRef>& r) -> utils::uvec3 {
+         const std::vector<ValueRef>& r) -> LocalWorkGroup {
         (void)g;
         (void)shader;
         (void)global;
         (void)a;
         (void)r;
-        return {64u, 1u, 1u};
+        return fixed_lwg(utils::uvec3{64u, 1u, 1u});
       },
       {{out, vkapi::kWrite}, {{in, arg_params}, vkapi::kRead}},
       {graph.sizes_ubo(in)},

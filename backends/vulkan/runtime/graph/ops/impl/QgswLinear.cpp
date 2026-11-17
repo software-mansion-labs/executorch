@@ -14,6 +14,15 @@
 
 namespace vkcompute {
 
+namespace {
+
+// A fixed local work group, never refitted to the global grid.
+LocalWorkGroup fixed_lwg(const utils::uvec3& size) {
+  return LocalWorkGroup(size, size[0u] * size[1u] * size[2u]);
+}
+
+} // namespace
+
 void resize_linear_qgsw_node(
     ComputeGraph* graph,
     const std::vector<ArgGroup>& args,
@@ -69,28 +78,30 @@ void linear_qgsw(ComputeGraph& graph, const std::vector<ValueRef>& args) {
       [](ComputeGraph* g,
          const vkapi::ShaderInfo& shader,
          const std::vector<ArgGroup>& a,
-         const std::vector<ValueRef>& r) -> utils::uvec3 {
+         const std::vector<ValueRef>& r) -> GlobalWorkGrid {
         (void)shader;
         (void)r;
         const ValueRef o = a.at(0).refs.at(0);
         const int64_t n = g->size_at<int64_t>(-1, o);
         const int64_t m = g->numel_of(o) / n;
-        return {
-            utils::div_up(static_cast<uint32_t>(n), 64u) * 8u,
-            utils::div_up(static_cast<uint32_t>(m), 64u) * 8u,
-            1u};
+        return GlobalWorkGrid(
+            utils::uvec3{
+                utils::div_up(static_cast<uint32_t>(n), 64u) * 8u,
+                utils::div_up(static_cast<uint32_t>(m), 64u) * 8u,
+                1u},
+            kExplicitWorkGrid);
       },
       [](ComputeGraph* g,
          const vkapi::ShaderInfo& shader,
-         const utils::uvec3& global,
+         const GlobalWorkGrid& global,
          const std::vector<ArgGroup>& a,
-         const std::vector<ValueRef>& r) -> utils::uvec3 {
+         const std::vector<ValueRef>& r) -> LocalWorkGroup {
         (void)g;
         (void)shader;
         (void)global;
         (void)a;
         (void)r;
-        return {8u, 8u, 1u};
+        return fixed_lwg(utils::uvec3{8u, 8u, 1u});
       },
       {{out, vkapi::kWrite},
        {{in, arg_weight, arg_scales, arg_bias}, vkapi::kRead}},

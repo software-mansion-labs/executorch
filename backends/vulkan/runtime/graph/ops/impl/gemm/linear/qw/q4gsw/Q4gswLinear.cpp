@@ -19,6 +19,15 @@
 
 namespace vkcompute {
 
+namespace {
+
+// A fixed local work group, never refitted to the global grid.
+LocalWorkGroup fixed_lwg(const utils::uvec3& size) {
+  return LocalWorkGroup(size, size[0u] * size[1u] * size[2u]);
+}
+
+} // namespace
+
 // Resize output [M, N] based on current fp_input M and packed_weight shape.
 // extra_args = { weight_data_tref, fp_input }. Mirrors the style of
 // resize_linear_qw_node in QuantizedLinear.cpp.
@@ -413,7 +422,7 @@ ValueRef prepack_q4_scales(
 
 // linear_q4gsw_lds: 8 x 8 threads per 64 x 64 output tile. Self-gates at M==1,
 // which the nc-coop GEMV sibling owns.
-utils::uvec3 pick_q4gsw_lds_global_wg(
+GlobalWorkGrid pick_q4gsw_lds_global_wg(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
     const std::vector<ArgGroup>& args,
@@ -424,15 +433,17 @@ utils::uvec3 pick_q4gsw_lds_global_wg(
   const uint32_t N = graph->size_at<uint32_t>(-1, out);
   const uint32_t M = graph->size_at<uint32_t>(-2, out);
   if (M == 1u) {
-    return {0u, 0u, 0u};
+    return GlobalWorkGrid(utils::uvec3{0u, 0u, 0u}, kExplicitWorkGrid);
   }
-  return {utils::div_up(N, 64u) * 8u, utils::div_up(M, 64u) * 8u, 1u};
+  return GlobalWorkGrid(
+      utils::uvec3{utils::div_up(N, 64u) * 8u, utils::div_up(M, 64u) * 8u, 1u},
+      kExplicitWorkGrid);
 }
 
-utils::uvec3 pick_q4gsw_lds_local_wg(
+LocalWorkGroup pick_q4gsw_lds_local_wg(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
-    const utils::uvec3& global_workgroup_size,
+    const GlobalWorkGrid& global_workgroup_size,
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args) {
   (void)graph;
@@ -440,7 +451,7 @@ utils::uvec3 pick_q4gsw_lds_local_wg(
   (void)global_workgroup_size;
   (void)args;
   (void)resize_args;
-  return {8u, 8u, 1u};
+  return fixed_lwg(utils::uvec3{8u, 8u, 1u});
 }
 
 //

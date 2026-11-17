@@ -29,6 +29,15 @@ namespace vkcompute {
 
 namespace {
 
+// A fixed local work group, never refitted to the global grid.
+LocalWorkGroup fixed_lwg(const utils::uvec3& size) {
+  return LocalWorkGroup(size, size[0u] * size[1u] * size[2u]);
+}
+
+} // namespace
+
+namespace {
+
 //
 // Common dimension helper: folds the axis-swap for LLM vs fused Q layouts.
 // `input_pos_symint` is used only for LLM (context_len = S + input_pos);
@@ -557,8 +566,8 @@ void add_sdpa_compute_attn_weights_node_impl(
   if (mode == SDPAMode::LLM && is_valid(attn_mask) &&
       graph.dim_of(attn_mask) == 2 && graph.is_buffer_storage(q) &&
       graph.is_buffer_storage(k) && graph.is_buffer_storage(attn_weights) &&
-      graph.is_buffer_storage(attn_mask) &&
-      graph.dtype_of(q) == vkapi::kHalf && graph.dtype_of(k) == vkapi::kHalf &&
+      graph.is_buffer_storage(attn_mask) && graph.dtype_of(q) == vkapi::kHalf &&
+      graph.dtype_of(k) == vkapi::kHalf &&
       graph.dtype_of(attn_mask) == vkapi::kHalf &&
       graph.size_at<int32_t>(-1, q) % 16 == 0) {
     graph.execute_nodes().emplace_back(new DynamicDispatchNode(
@@ -567,28 +576,30 @@ void add_sdpa_compute_attn_weights_node_impl(
         [](ComputeGraph* g,
            const vkapi::ShaderInfo& shader,
            const std::vector<ArgGroup>& a,
-           const std::vector<ValueRef>& r) -> utils::uvec3 {
+           const std::vector<ValueRef>& r) -> GlobalWorkGrid {
           (void)shader;
           (void)r;
           const uint32_t heads = g->size_at<uint32_t>(-2, a.at(1).refs.at(0));
           const uint32_t S = g->size_at<uint32_t>(-3, a.at(1).refs.at(0));
           const uint32_t C = g->size_at<uint32_t>(-3, a.at(1).refs.at(1));
-          return {
-              utils::div_up(utils::div_up_4(C), 16u) * 8u,
-              utils::div_up(S, 64u) * 8u,
-              heads};
+          return GlobalWorkGrid(
+              utils::uvec3{
+                  utils::div_up(utils::div_up_4(C), 16u) * 8u,
+                  utils::div_up(S, 64u) * 8u,
+                  heads},
+              kExplicitWorkGrid);
         },
         [](ComputeGraph* g,
            const vkapi::ShaderInfo& shader,
-           const utils::uvec3& global,
+           const GlobalWorkGrid& global,
            const std::vector<ArgGroup>& a,
-           const std::vector<ValueRef>& r) -> utils::uvec3 {
+           const std::vector<ValueRef>& r) -> LocalWorkGroup {
           (void)g;
           (void)shader;
           (void)global;
           (void)a;
           (void)r;
-          return {8u, 8u, 1u};
+          return fixed_lwg(utils::uvec3{8u, 8u, 1u});
         },
         {{attn_weights, vkapi::kWrite}, {read_inputs, vkapi::kRead}},
         param_ubos,

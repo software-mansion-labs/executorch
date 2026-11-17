@@ -20,6 +20,15 @@
 
 namespace vkcompute {
 
+namespace {
+
+// A fixed local work group, never refitted to the global grid.
+LocalWorkGroup fixed_lwg(const utils::uvec3& size) {
+  return LocalWorkGroup(size, size[0u] * size[1u] * size[2u]);
+}
+
+} // namespace
+
 void resize_conv1d_node(
     ComputeGraph* graph,
     const std::vector<ArgGroup>& args,
@@ -186,16 +195,18 @@ void add_conv1d_lds_node(
                        ComputeGraph* g,
                        const vkapi::ShaderInfo& shader,
                        const std::vector<ArgGroup>& a,
-                       const std::vector<ValueRef>& r) -> utils::uvec3 {
+                       const std::vector<ValueRef>& r) -> GlobalWorkGrid {
     (void)shader;
     (void)r;
     const ValueRef o = a.at(0).refs.at(0);
     const ValueRef i = a.at(1).refs.at(0);
     if (direct) {
-      return {
-          utils::div_up(g->size_at<uint32_t>(-1, o), 4u),
-          g->size_at<uint32_t>(-2, o),
-          1u};
+      return GlobalWorkGrid(
+          utils::uvec3{
+              utils::div_up(g->size_at<uint32_t>(-1, o), 4u),
+              g->size_at<uint32_t>(-2, o),
+              1u},
+          kExplicitWorkGrid);
     }
     const uint32_t columns = static_cast<uint32_t>(
         (g->size_at<int32_t>(-1, i) - span - 1) / stride_size + 1);
@@ -203,31 +214,36 @@ void add_conv1d_lds_node(
         static_cast<uint32_t>(g->sizes_of(a.at(1).refs.at(1)).at(0) / groups);
     const uint32_t layers = static_cast<uint32_t>(groups);
     if (short_tile) {
-      return {
-          utils::div_up(columns, 64u) * 16u,
-          utils::div_up(rows, 32u) * 4u,
-          layers};
+      return GlobalWorkGrid(
+          utils::uvec3{
+              utils::div_up(columns, 64u) * 16u,
+              utils::div_up(rows, 32u) * 4u,
+              layers},
+          kExplicitWorkGrid);
     }
-    return {
-        utils::div_up(columns, 64u) * 8u,
-        utils::div_up(rows, 64u) * 8u,
-        layers};
+    return GlobalWorkGrid(
+        utils::uvec3{
+            utils::div_up(columns, 64u) * 8u,
+            utils::div_up(rows, 64u) * 8u,
+            layers},
+        kExplicitWorkGrid);
   };
   auto local_wg = [direct, short_tile](
                       ComputeGraph* g,
                       const vkapi::ShaderInfo& shader,
-                      const utils::uvec3& global,
+                      const GlobalWorkGrid& global,
                       const std::vector<ArgGroup>& a,
-                      const std::vector<ValueRef>& r) -> utils::uvec3 {
+                      const std::vector<ValueRef>& r) -> LocalWorkGroup {
     (void)g;
     (void)shader;
     (void)global;
     (void)a;
     (void)r;
     if (direct) {
-      return {64u, 1u, 1u};
+      return fixed_lwg(utils::uvec3{64u, 1u, 1u});
     }
-    return short_tile ? utils::uvec3{16u, 4u, 1u} : utils::uvec3{8u, 8u, 1u};
+    return fixed_lwg(utils::uvec3(
+        short_tile ? utils::uvec3{16u, 4u, 1u} : utils::uvec3{8u, 8u, 1u}));
   };
 
   graph.execute_nodes().emplace_back(new DynamicDispatchNode(

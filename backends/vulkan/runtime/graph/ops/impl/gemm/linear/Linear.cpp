@@ -22,6 +22,15 @@
 
 namespace vkcompute {
 
+namespace {
+
+// A fixed local work group, never refitted to the global grid.
+LocalWorkGroup fixed_lwg(const utils::uvec3& size) {
+  return LocalWorkGroup(size, size[0u] * size[1u] * size[2u]);
+}
+
+} // namespace
+
 struct LinearIntParams final {
   int32_t weight_B;
 };
@@ -158,7 +167,7 @@ constexpr int64_t kLdsTileM = 64;
 constexpr int64_t kLdsTileN = 64;
 constexpr int64_t kLdsTileK = 16;
 
-utils::uvec3 pick_linear_lds_global_wg_size(
+GlobalWorkGrid pick_linear_lds_global_wg_size(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
     const std::vector<ArgGroup>& args,
@@ -170,18 +179,20 @@ utils::uvec3 pick_linear_lds_global_wg_size(
   const uint32_t M = graph->size_at<uint32_t>(-2, out);
   // M==1 is left to the tiled sibling (add_linear_tiled_node with m1_only).
   if (M == 1u) {
-    return {0u, 0u, 0u};
+    return GlobalWorkGrid(utils::uvec3{0u, 0u, 0u}, kExplicitWorkGrid);
   }
-  return {
-      utils::div_up(N, uint32_t(kLdsTileN)) * kLdsThreadsX,
-      utils::div_up(M, uint32_t(kLdsTileM)) * kLdsThreadsY,
-      1u};
+  return GlobalWorkGrid(
+      utils::uvec3{
+          utils::div_up(N, uint32_t(kLdsTileN)) * kLdsThreadsX,
+          utils::div_up(M, uint32_t(kLdsTileM)) * kLdsThreadsY,
+          1u},
+      kExplicitWorkGrid);
 }
 
-utils::uvec3 pick_linear_lds_local_wg_size(
+LocalWorkGroup pick_linear_lds_local_wg_size(
     ComputeGraph* graph,
     const vkapi::ShaderInfo& shader,
-    const utils::uvec3& global_workgroup_size,
+    const GlobalWorkGrid& global_workgroup_size,
     const std::vector<ArgGroup>& args,
     const std::vector<ValueRef>& resize_args) {
   (void)graph;
@@ -189,7 +200,7 @@ utils::uvec3 pick_linear_lds_local_wg_size(
   (void)global_workgroup_size;
   (void)args;
   (void)resize_args;
-  return {kLdsThreadsX, kLdsThreadsY, 1u};
+  return fixed_lwg(utils::uvec3{kLdsThreadsX, kLdsThreadsY, 1u});
 }
 
 void add_linear_lds_node(
