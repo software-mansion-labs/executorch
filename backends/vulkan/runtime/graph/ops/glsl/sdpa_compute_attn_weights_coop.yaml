@@ -15,6 +15,7 @@ sdpa_compute_attn_weights_coop:
     # Shared attn_weights row of the FUSE_SOFTMAX variant, in texels. Must equal
     # kFusedSoftmaxMaxContextTexels in SDPA.cpp.
     MAX_CONTEXT_TEXEL_LEN: 64
+    HAS_MASK: false
   generate_variant_forall:
     combination:
       parameter_names: [IO_STORAGE, K_CACHE_STORAGE]
@@ -29,3 +30,5 @@ sdpa_compute_attn_weights_coop:
     - NAME: sdpa_compute_attn_weights_coop
     - NAME: sdpa_compute_attn_weights_coop_softmax
       FUSE_SOFTMAX: true
+    - NAME: sdpa_compute_attn_weights_coop_mask
+      HAS_MASK: true
