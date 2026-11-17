@@ -962,13 +962,18 @@ class _ExportPassBase(PassBase):
             # one mode and the untouched placeholders in another, and the mixed
             # graph is rejected later by detect_fake_mode(). Recover the
             # graph's own mode before falling back to a new one.
-            fake_tensor_mode = detect_fake_mode(
-                [
-                    node.meta["val"]
-                    for node in graph_module.graph.nodes
-                    if node.meta.get("val", None) is not None
-                ]
-            )
+            # A graph whose metadata already mixes modes has no single mode to
+            # recover; it keeps the fresh mode below, as before.
+            try:
+                fake_tensor_mode = detect_fake_mode(
+                    [
+                        node.meta["val"]
+                        for node in graph_module.graph.nodes
+                        if node.meta.get("val", None) is not None
+                    ]
+                )
+            except AssertionError:
+                fake_tensor_mode = None
 
         if fake_tensor_mode is None:
             fake_tensor_mode = FakeTensorMode(allow_non_fake_inputs=True)
