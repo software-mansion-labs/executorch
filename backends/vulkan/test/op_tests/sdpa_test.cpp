@@ -892,3 +892,17 @@ TEST(VulkanSDPATest, test_sdpa_op_gqa_group4) {
   test_vulkan_sdpa(
       0, {5, 1, 1, 1, 1, 3, 1}, head_dim, num_heads, num_kv_heads, 1);
 }
+
+// Decode within 256 tokens of context is served by the fused QK+softmax node,
+// and beyond it by the separate attn-weights and softmax pair. These decode
+// steps cross that cutoff, so one graph switches paths on resize.
+const std::vector<int> kDecodeAcrossFusedCutoff =
+    {1, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+
+TEST(VulkanSDPATest, test_sdpa_op_decode_crosses_fused_cutoff) {
+  test_vulkan_sdpa(250, kDecodeAcrossFusedCutoff, 64, 8, 2, 1);
+}
+
+TEST(VulkanSDPATest, test_sdpa_op_decode_crosses_fused_cutoff_fp16) {
+  test_vulkan_sdpa(250, kDecodeAcrossFusedCutoff, 64, 8, 2, 1, at::kHalf);
+}
