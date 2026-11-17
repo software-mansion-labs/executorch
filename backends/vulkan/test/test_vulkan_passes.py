@@ -116,6 +116,12 @@ def op_node_count(graph_module: torch.fx.GraphModule, canonical_op_name: str) ->
     return count
 
 
+def cast_count(graph_module: torch.fx.GraphModule) -> int:
+    return op_node_count(graph_module, "_to_copy.default") + op_node_count(
+        graph_module, "_to_dim_order_copy.default"
+    )
+
+
 class TestSwiGLUFusion(unittest.TestCase):
     def _fuse(self, model, inputs, dynamic_shapes=None):
         program = torch.export.export(model, inputs, dynamic_shapes=dynamic_shapes)
