@@ -279,8 +279,11 @@ def delete_constant_placeholder(exp_program: ExportedProgram, node: torch.fx.Nod
             f"Cannot delete input node {node.name} since it is not a parameter, a buffer, nor a lifted tensor constant."
         )
 
-    # Edit the spec list in place: ExportedProgramPassManager runs passes on a
-    # shallow copy of the program, which would not see a replaced signature.
+    # Edit the spec list in place, as create_constant_placeholder does: a caller
+    # holding the program ExportedProgramPassManager shallow-copied shares this
+    # list with the copy until a modifying pass makes the manager rebuild the
+    # copy's signature. Passes that expose ``exported_program`` are pointed at
+    # the copy itself by the manager and are not limited this way.
     input_specs = exp_program.graph_signature.input_specs
     input_specs[:] = [spec for spec in input_specs if spec.arg.name != node.name]
 
