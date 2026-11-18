@@ -199,18 +199,6 @@ announce_configured_options(EXECUTORCH_BUILD_NATIVE_VULKAN)
 announce_configured_options(EXECUTORCH_BUILD_NATIVE_GGML)
 announce_configured_options(EXECUTORCH_BUILD_NATIVE_VISION_RUNNER)
 define_overridable_option(
-  EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED
-  "Build the XNNPACK backend as its own shared library instead of linking it into the Android JNI library"
-  BOOL
-  OFF
-)
-define_overridable_option(
-  EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED
-  "Build the Vulkan backend as its own shared library instead of linking it into the Android JNI library"
-  BOOL
-  OFF
-)
-define_overridable_option(
   EXECUTORCH_BUILD_WEBGPU "Build the WebGPU backend" BOOL OFF
 )
 define_overridable_option(
@@ -242,6 +230,18 @@ define_overridable_option(
 )
 define_overridable_option(
   EXECUTORCH_BUILD_VGF "Build the Arm VGF backend" BOOL OFF
+)
+define_overridable_option(
+  EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED
+  "Build the XNNPACK backend as its own shared library instead of linking it into the Android JNI library"
+  BOOL
+  OFF
+)
+define_overridable_option(
+  EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED
+  "Build the Vulkan backend as its own shared library instead of linking it into the Android JNI library"
+  BOOL
+  OFF
 )
 define_overridable_option(
   EXECUTORCH_COREML_BUILD_EXECUTOR_RUNNER "Build CoreML executor runner." BOOL

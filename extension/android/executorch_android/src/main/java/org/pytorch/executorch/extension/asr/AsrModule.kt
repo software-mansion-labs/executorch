@@ -11,7 +11,6 @@ package org.pytorch.executorch.extension.asr
 import java.io.Closeable
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
-import org.pytorch.executorch.ExecuTorchRuntime
 import org.pytorch.executorch.ExecutorchRuntimeException
 import org.pytorch.executorch.annotations.Experimental
 
@@ -65,9 +64,7 @@ class AsrModule(
 
   companion object {
     init {
-      // Goes through the runtime so that a backend built as its own shared
-      // library is loaded too, and after libexecutorch.so.
-      ExecuTorchRuntime.getRuntime()
+      System.loadLibrary("executorch")
     }
 
     @JvmStatic

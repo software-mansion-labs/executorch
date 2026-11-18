@@ -57,6 +57,7 @@ build_android_native_library() {
     -DEXECUTORCH_BUILD_VULKAN="${EXECUTORCH_BUILD_VULKAN}" \
     -DEXECUTORCH_BUILD_VULKAN_BACKEND_SHARED="${EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED}" \
     -DEXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED="${EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED}" \
+    -DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON \
     -DXNNPACK_ENABLE_ARM_SME2="${XNNPACK_ENABLE_ARM_SME2}" \
     -DFLATCC_ALLOW_WERROR=OFF \
     -DSUPPORT_REGEX_LOOKAHEAD=ON \
@@ -79,18 +80,7 @@ build_android_native_library() {
   mkdir -p ${SO_STAGE_DIR}
   cp "${CMAKE_OUT}"/extension/android/libexecutorch_jni.so "${SO_STAGE_DIR}/libexecutorch.so"
 
-  # Standalone backend shared libraries, when they were asked for. Gate on the
-  # option rather than on the file existing, so a build that turned one off
-  # cannot pick up the .so a previous build left in CMAKE_OUT.
-  if [ "${EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED}" == "ON" ]; then
-    cp "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so "${SO_STAGE_DIR}/"
-  fi
-
-  if [ "${EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED}" == "ON" ]; then
-    cp "${CMAKE_OUT}"/extension/android/libxnnpack_executorch_backend.so "${SO_STAGE_DIR}/"
-  fi
-
-  # libexecutorch.so links the NDK C++ runtime dynamically, so the AAR has to
+  # The native libraries link the NDK C++ runtime dynamically, so the AAR has to
   # carry it. An app that also pulls libc++_shared.so from another dependency
   # (fbjni ships one) has two files at the same path, which AGP treats as an
   # error rather than collapsing; the AAR sets jniLibs.pickFirsts for it.
@@ -104,6 +94,18 @@ build_android_native_library() {
   esac
   cp "${ANDROID_NDK}"/toolchains/llvm/prebuilt/*/sysroot/usr/lib/"${ANDROID_TRIPLE}"/libc++_shared.so \
     "${SO_STAGE_DIR}/"
+
+  # Standalone backend shared libraries, when they were asked for. Gate on the
+  # option rather than on the file existing, so a build that turned one off
+  # cannot pick up the .so a previous build left in CMAKE_OUT. Used by React
+  # Native ExecuTorch as opt-in artifacts.
+  if [ "${EXECUTORCH_BUILD_VULKAN_BACKEND_SHARED}" == "ON" ]; then
+    cp "${CMAKE_OUT}"/extension/android/libvulkan_executorch_backend.so "${SO_STAGE_DIR}/"
+  fi
+
+  if [ "${EXECUTORCH_BUILD_XNNPACK_BACKEND_SHARED}" == "ON" ]; then
+    cp "${CMAKE_OUT}"/extension/android/libxnnpack_executorch_backend.so "${SO_STAGE_DIR}/"
+  fi
 
   # Copy QNN related so library
   if [ -n "$QNN_SDK_ROOT" ] && [ "$ANDROID_ABI" == "arm64-v8a" ]; then
