@@ -94,7 +94,7 @@
       "name": "apple-framework-resources",
       "hidden": true,
       "cacheVariables": {
-        "EXECUTORCH_MLX_SWIFTPM_RESOURCES": "ON"
+        "EXECUTORCH_MLX_SWIFTPM_RESOURCES": "OFF"
       }
     },
     {
