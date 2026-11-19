@@ -59,7 +59,9 @@ $if OUTPUT_IS_INDICES:
   #define OUTPUT_IS_INDICES
 
 void main() {
-  const uint out_bufi = gl_GlobalInvocationID.y;
+  // Rows beyond the device's y workgroup limit are spilled into z.
+  const uint out_bufi =
+      gl_GlobalInvocationID.z * gl_NumWorkGroups.y + gl_GlobalInvocationID.y;
 
   if (out_of_bounds(out_bufi, outp)) {
     return;
